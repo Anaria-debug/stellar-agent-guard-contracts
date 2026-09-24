@@ -1,21 +1,18 @@
 # Description
 
-Closes #142
+Closes #141
 
-This PR adds a `policy_revision` counter to the policy engine to enable cheap change detection. Dashboards and SDKs that already poll the `status()` endpoint will now receive this counter for free, allowing them to easily detect drift or policy updates without needing to poll the full `policy()` read or listen to events.
+This PR adds a `context_index` field to the `auth_checked` event to unambiguously identify the specific context verdict in a multi-context authorization batch. When a batch authorization is processed via `__check_auth`, the engine evaluates all contexts and emits an `auth_checked` event for each one in order. The `context_index` maps each event to its corresponding `ContractContext` in the transaction payload.
 
 ### Changes
-*   **State:** Added `PolicyRevision` to persistent storage (`DataKey`).
-*   **Status Struct:** Added `policy_revision: u64` to the `Status` struct returned by the `status()` read function.
-*   **Engine:** `set_policy` and `revoke_policy` now retrieve, increment, and persist the new revision counter.
-*   **Specification:** Updated `SPEC.md` §7 to reflect the new `Status` field.
-*   **Tests:** Added `policy_revision_increments_across_set_and_revoke` to integration tests to verify the counter starts at 0 and increments exactly as specified.
+*   **Types:** Updated `EventAuthChecked` to include `context_index: u32`.
+*   **Engine:** Modified `decide` to return an `alloc::vec::Vec<Decision>` containing the verdict for each evaluated context. Removed `contracttype` from `Decision` and implemented standard traits to decouple the engine return type from the host `Env` macro constraints.
+*   **Lib:** Refactored `__check_auth` to iterate over all verdicts returned by the engine and emit individual, indexed `auth_checked` events.
+*   **Tests:** Added `batch_events_emit_in_order_with_context_index` to verify that a multi-context batch emits events with correct indexes (0, 1, 2, etc.) matching the batch order, even when the overall transaction fails and emits diagnostic events.
 
 ### Acceptance Criteria Checklist
-- [x] `Status` struct carries `policy_revision: u64` (0 = never set).
-- [x] Tests: 0 pre-first-set, increments across set→revoke→set visible via status.
+- [x] Emission behavior for N-context batch documented (events-per-context confirmed by test).
+- [x] `context_index: u32` (0-based) present in per-context events.
+- [x] Tests: 3-context batch with mixed verdicts -> indexed events in order.
 - [x] Lint, type-check, and tests all pass locally.
-- [x] PR description references the issue (Closes #142).
-
-### Reviewer Note
-The issue description mentioned the possibility of `PolicyRevision` already being implemented in events by a concurrent issue. Since it was not present in the codebase, the full incrementing logic and state storage was implemented here.
+- [x] PR description references the issue (Closes #141).
