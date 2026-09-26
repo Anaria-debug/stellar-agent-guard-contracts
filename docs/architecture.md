@@ -113,3 +113,28 @@ Instance keys auto-refresh TTL on every invocation; persistent keys are extended
 | `src/window.rs` | Genuinely rolling spend window (lazy prune, same-second coalescing, bounded backstop) |
 | `src/types.rs` | Policy model, storage keys, errors, parsed-call enum |
 | `src/integration_tests.rs` | Host-routed tests with real Ed25519 auth signatures |
+
+## Enforcement-Equivalent Upgrade Policy
+
+Contracts are immutable once deployed on Stellar. When new contract versions (`v2+`) are released, operators must determine whether and how to transition. Because the dashboard pins a single contract artifact hash and there is no native on-chain upgrade proxy primitive, upgrades require a deliberate redeployment and admin-driven state migration.
+
+### Upgrade Advisories & Categorization
+
+- **Security Fixes (Mandatory Redeploy Advisory):** Any vulnerability discovery or critical correctness fix requires a mandatory upgrade advisory. Operators should redeploy immediately once an audited patch is available.
+- **Additive Features (Optional Redeploy):** New query methods, non-breaking telemetry improvements, or auxiliary helpers that do not alter core enforcement semantics are optional. Operators can remain on their current version.
+- **Guarantee Changes / Semantics Shifts:** Changes to the core decision table or authorization guarantees require explicit equivalence verification. The new contract's security guarantees must strictly encompass or refine the old contract's guarantees (`old ⊆ new`).
+
+### Policy State Migration Checklist
+
+Because there is no on-chain state migration primitive, state moves entirely via admin re-entry (`export/reimport` by admin):
+
+1. **Export Current Policy:** Query the existing contract state using `policy()` and record the registered `admin`, `agent_pubkey`, and active `PolicyConfig` settings.
+2. **Deploy New Contract WASM:** Upload and deploy the new compiled contract bytecode.
+3. **Initialize New Contract:** Invoke `initialize` with the admin address and the agent's Ed25519 public key.
+4. **Set Policy:** Apply the exported `PolicyConfig` to the new contract via `set_policy`.
+5. **Rotate Keys (If Needed):** Update credentials or agent keys if key rotation accompanies the version transition.
+6. **Verify Status:** Run `status()` and pre-flight `check()` simulations to verify operational readiness before resuming agent traffic.
+
+### Window History Reset Note
+
+> **Important:** State moves by admin re-entry; **rolling window history resets on migration**. The newly deployed contract starts with a fresh rolling window (`WindowState` is uninitialized or empty). Operators should plan maintenance windows accordingly so that accumulated spend history in the old contract does not carry over or falsely restrict immediate throughput on the new instance.
