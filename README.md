@@ -82,6 +82,8 @@ non-custodial, no proxy wrappers, tested end-to-end on testnet.
 
 > ⚠️ **Disclaimer:** This is unaudited security tooling that gates real fund access. Do
 > not deploy to mainnet without an independent audit. See [SECURITY.md](SECURITY.md).
+> 
+> For contract updates, please review our [Enforcement-Equivalent Upgrade Policy](docs/architecture.md#enforcement-equivalent-upgrade-policy).
 
 ## Enforcement scope — read this before relying on the caps
 
