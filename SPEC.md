@@ -288,6 +288,8 @@ calls whose semantics and arguments are known:
 - `transfer` args: `(from, to, amount)` — the account is `from`; recipient = args[1], amount = args[2].
 - `transfer_from` args: `(from, spender, to, amount)` — the account is `from`; recipient = args[2], amount = args[3].
 
+Note on multi-asset batches: the window total is a unit-less sum across assets until per-asset caps land; operators should use single-asset policies for meaningful windows (see per-asset-caps issue tracking).
+
 Rules applied:
 
 1. **Recipient allowlist:** if `allow_any_recipient == false`, `recipient ∈ policy.recipients`

@@ -590,4 +590,26 @@ mod tests {
             Decision::Blocked(Error::SelfFunctionNotAllowed)
         ));
     }
+
+    #[test]
+    fn multi_asset_batch_unit_mixing_summation() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        // Register two different assets
+        p.assets = vec![&env, addr(&env, 1), addr(&env, 2)];
+        p.window_cap = 150;
+        p.per_tx_cap = 100;
+        let mut l = Ledger::empty(&env);
+        // Batch containing transfers against two different SACs
+        let ctx = vec![
+            &env,
+            transfer_ctx(&env, 1, 2, 40), // asset 1, amount 40
+            transfer_ctx(&env, 2, 2, 60), // asset 2, amount 60
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx);
+        assert!(matches!(d, Decision::Allowed));
+        // Documents current unit-mixing behavior: single window total is sum across assets (40 + 60 = 100)
+        assert_eq!(l.total, 100);
+    }
 }
