@@ -483,11 +483,12 @@ filtering by the SDK listener.
 
 | Event | Topics | Data | Emitted |
 |---|---|---|---|
-| `auth_checked` | `result: Symbol` (`allowed`/`blocked`), `reason: Symbol` | — | every `__check_auth` / `check` decision |
-| `heartbeat` | — | `at: u64` | on agent heartbeat (skipped when `now == LastHeartbeat`; §5) |
-| `frozen` / `unfrozen` | — | `by: Address` | admin freeze / unfreeze |
-| `policy_set` / `policy_revoked` | — | `by: Address` | admin policy changes |
-| `agent_rotated` | — | `by: Address`, `old_fingerprint: BytesN<8>`, `new_fingerprint: BytesN<8>` | admin agent-key rotation |
+| `auth_checked` | `result: Symbol` (`allowed`/`blocked`), `reason: Symbol` | (none) | every `__check_auth` / `check` decision |
+| `heartbeat` | (none) | `at: u64` | on agent heartbeat (skipped when `now == LastHeartbeat`; §5) |
+| `initialized` | (none) | `by: Address` | contract initialization |
+| `frozen` / `unfrozen` | (none) | `by: Address` | admin freeze / unfreeze |
+| `policy_set` / `policy_revoked` | (none) | `by: Address` | admin policy changes |
+| `agent_rotated` | (none) | `by: Address`, `old_fingerprint: BytesN<8>`, `new_fingerprint: BytesN<8>` | admin agent-key rotation |
 
 Reason symbols mirror `BlockReason`/`Error` naming so off-chain code maps one vocabulary.
 
