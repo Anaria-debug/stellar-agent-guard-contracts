@@ -455,6 +455,10 @@ impl PolicyEngine {
     /// copy and emits exactly the same `auth_checked` event as `check`. A
     /// submitted call may refresh persistent TTLs; simulation does not persist
     /// those rent bumps.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the policy engine's `decide` evaluation returns an empty list of verdicts.
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail {
         let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
