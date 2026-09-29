@@ -288,6 +288,8 @@ pub fn decide(
             ParsedCall::AssetTransfer { to, amount, .. } => {
                 if amount <= 0 {
                     Decision::Blocked(Error::InvalidAmount)
+                } else if contains_addr(&cfg.blocked_recipients, &to) {
+                    Decision::Blocked(Error::RecipientBlocked)
                 } else if !cfg.allow_any_recipient && !contains_addr(&cfg.recipients, &to) {
                     Decision::Blocked(Error::RecipientNotAllowed)
                 } else if cfg.per_tx_cap > 0 && amount > cfg.per_tx_cap {
@@ -410,6 +412,7 @@ mod tests {
             protocols: Vec::new(env),
             recipients: vec![env, addr(env, 2)],
             recipient_window_caps: Vec::new(env),
+            blocked_recipients: Vec::new(env),
             allow_any_recipient: false,
             active_from: 0,
             active_until: 0,
@@ -516,6 +519,51 @@ mod tests {
         let ctx2 = vec![&env, transfer_ctx(&env, 1, 99, 5)];
         let d2 = decide(&env, &sa, Some(&p2), &alive(), &mut l, 1000, ctx2.clone());
         assert!(matches!(d2.first().unwrap(), Decision::Allowed));
+    }
+
+    #[test]
+    fn blocked_recipient_wins_over_allowlist_and_escape_hatch() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let blocked_addr = addr(&env, 3);
+
+        // Listed in both allowlist and denylist -> blocked wins.
+        let mut p = base_policy(&env);
+        p.recipients = vec![&env, addr(&env, 2), blocked_addr.clone()];
+        p.blocked_recipients = vec![&env, blocked_addr.clone()];
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_ctx(&env, 1, 3, 5)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::RecipientBlocked)
+        ));
+
+        // allow_any_recipient true but address is blocked -> still blocked.
+        let mut p2 = base_policy(&env);
+        p2.allow_any_recipient = true;
+        p2.blocked_recipients = vec![&env, blocked_addr.clone()];
+        let d2 = decide(&env, &sa, Some(&p2), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d2.first().unwrap(),
+            Decision::Blocked(Error::RecipientBlocked)
+        ));
+
+        // A different non-blocked recipient passes under the escape hatch.
+        let ctx3 = vec![&env, transfer_ctx(&env, 1, 4, 5)];
+        let d3 = decide(&env, &sa, Some(&p2), &alive(), &mut l, 1000, ctx3);
+        assert!(matches!(d3.first().unwrap(), Decision::Allowed));
+    }
+
+    #[test]
+    fn empty_blocked_recipients_list_is_no_op() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_ctx(&env, 1, 2, 5)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
     }
 
     #[test]
