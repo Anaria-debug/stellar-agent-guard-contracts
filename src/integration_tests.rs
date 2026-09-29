@@ -744,6 +744,56 @@ fn allow_any_recipient_escape_hatch_still_capped() {
     h.transfer_expect_blocked(&other, 101); // but the cap still binds
 }
 
+/// Issue #47: the escape hatch skips *only* the recipient allowlist. With
+/// `allow_any_recipient = true` and an empty recipient list (so the list
+/// contents cannot be doing any work in either direction), an arbitrary
+/// recipient within caps is Allowed, while over-cap transfers are still
+/// blocked with the exact cap reason — a refactor that accidentally skipped
+/// cap enforcement under the flag would fail here.
+#[test]
+fn allow_any_recipient_with_empty_list_still_enforces_both_caps() {
+    let mut h = Harness::new();
+    let other = h.other.clone();
+    let mut p = h.base_policy();
+    p.allow_any_recipient = true;
+    p.recipients = soroban_sdk::Vec::new(&h.env); // empty: the flag alone admits
+    p.per_tx_cap = 100;
+    p.window_secs = 86_400;
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // Within both caps: pre-flight says Allowed and the real `__check_auth`
+    // path admits the transfer to an address on no list anywhere.
+    let verdict = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check(h.env.clone(), h.asset.clone(), other.clone(), 40)
+    });
+    assert_eq!(verdict, CheckResult::Allowed);
+    h.transfer(&other, 40); // window total 40
+
+    // Over per-tx cap: the exact reason is PerTxCapExceeded (rule order in
+    // `decide`: per-tx before window), and the on-chain path blocks.
+    let verdict = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check(h.env.clone(), h.asset.clone(), other.clone(), 101)
+    });
+    assert_eq!(
+        verdict,
+        CheckResult::Blocked(Symbol::new(&h.env, "per_tx_cap_exceeded"))
+    );
+    h.transfer_expect_blocked(&other, 101); // window must stay 40
+    h.transfer(&other, 60); // ok: window total exactly 100, proves 101 never counted
+
+    // Over window cap (per-tx fine): the exact reason is WindowCapExceeded.
+    let verdict = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check(h.env.clone(), h.asset.clone(), other.clone(), 1)
+    });
+    assert_eq!(
+        verdict,
+        CheckResult::Blocked(Symbol::new(&h.env, "window_cap_exceeded"))
+    );
+    h.transfer_expect_blocked(&other, 1);
+}
+
 #[test]
 fn dead_man_switch_freeze_and_admin_reversal() {
     let mut h = Harness::new();
