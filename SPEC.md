@@ -119,7 +119,8 @@ TTL on every write; see §9.5).
 | Key | Type | Kind | Notes |
 |---|---|---|---|
 | `Initialized` | `bool` | instance | one-time flag for `initialize` |
-| `Admin` | `Address` | instance | policy admin; set once at `initialize` |
+| `Admin` | `Address` | instance | policy admin; set once at `initialize`, rotated via §7.2 |
+| `PendingAdmin` | `Address` | instance | proposed admin awaiting `confirm_admin_rotation`; absent = no rotation pending |
 | `AgentPubkey` | `BytesN<32>` | instance | the agent's Ed25519 public key |
 | `Policy` | `PolicyConfig` | persistent | current policy (`None` = default-deny) |
 | `Window` | `WindowState` | persistent | rolling spend ledger for asset transfers (global + per-recipient) |
@@ -399,6 +400,19 @@ outcomes `CreateContractNotAllowed` and the `AssetOther` → `function_not_allow
 classified here but are **not** listed in §4 rule 7's inline reason list; §4.1's cost table
 does list gate 6 (`SelfFunctionNotAllowed`) but has no row for contract creation.
 
+### 6.6 Admin-rotation errors live outside the per-context path
+
+`propose_admin_rotation` / `confirm_admin_rotation` / `cancel_admin_rotation`
+(§7.2) are direct admin entrypoints, not authorizations evaluated by `decide`:
+they never produce per-context verdicts and never emit `auth_checked`. Two
+errors belong to them alone. `InvalidConfig` is raised when the current admin
+proposes itself (a no-op handover that would emit a misleading event trail).
+`NoPendingAdmin` is raised when `confirm_admin_rotation` or
+`cancel_admin_rotation` runs with no `PendingAdmin` stored. Neither error is
+reachable via `check()` pre-flight or `__check_auth` (see the §7.1 mapping);
+both fail the transaction frame that raised them, leaving admin, policy, and
+revision unchanged.
+
 ---
 
 ## 7. Public surface — exact signatures and auth placement
@@ -426,6 +440,7 @@ To close the CheckResult/Error duality gap, every contract `Error` variant maps 
 | 3 | `NotInitialized` | `not_initialized` | Yes | Pre-activation guard check. |
 | 4 | `InvalidConfig` | `invalid_config` | No | Admin op: `set_policy` validation error; policies are not passed into `check()`. |
 | 5 | `InvalidAmount` | `invalid_amount` | Yes | Checked directly in `check()` input arguments. |
+| 6 | `NoPendingAdmin` | `no_pending_admin` | No | Admin op: `confirm_admin_rotation` / `cancel_admin_rotation` with no `PendingAdmin` stored; rotation state is never a `check()` parameter. |
 | 10 | `AdminFrozen` | `admin_frozen` | Yes | Account-level gate evaluated in `check()`. |
 | 11 | `HeartbeatExpired` | `heartbeat_expired` | Yes | Account-level dead-man switch gate evaluated in `check()`. |
 | 12 | `NoPolicy` | `no_policy` | Yes | Account-level gate evaluated in `check()`. |
@@ -451,6 +466,17 @@ pub fn revoke_policy(env: Env)
 pub fn rotate_agent_key(env: Env, new_pubkey: BytesN<32>)
     // require_auth(Admin). Re-binds AgentPubkey. Admin never gains fund-moving
     // power; it can only replace the key the account will authenticate.
+pub fn propose_admin_rotation(env: Env, new_admin: Address)
+    // require_auth(Admin). Stores PendingAdmin; the current admin stays
+    // authoritative until confirmation. Self-proposal -> InvalidConfig.
+pub fn confirm_admin_rotation(env: Env)
+    // require_auth(PendingAdmin). Only the proposed admin can confirm: the
+    // confirmation is proof the new key is live (see §7.2). Sets Admin,
+    // clears PendingAdmin; no policy revision bump (policy unchanged).
+    // No pending rotation -> NoPendingAdmin.
+pub fn cancel_admin_rotation(env: Env)
+    // require_auth(Admin). Clears PendingAdmin. No pending rotation ->
+    // NoPendingAdmin.
 
 // ── Dead-man switch (see §5) ──────────────────────────────────────────────
 pub fn heartbeat(env: Env)
@@ -522,6 +548,7 @@ pub struct CheckDetail {
 pub enum Error {            // values stable; see tests/fixtures
     Unauthorized = 1, AlreadyInitialized = 2, NotInitialized = 3,
     InvalidConfig = 4, InvalidAmount = 5,
+    NoPendingAdmin = 6,
     AdminFrozen = 10, HeartbeatExpired = 11, NoPolicy = 12, Paused = 13,
     OutsideActiveWindow = 14,
     AssetNotAllowed = 20, RecipientNotAllowed = 21, PerTxCapExceeded = 22,
@@ -541,6 +568,36 @@ window cap applies to the queried recipient (no global `window_cap` and no
 per-recipient override). The configured and effective caps are `None` when
 disabled; v1 has no per-asset overrides, so the effective per-transaction cap
 equals the configured cap.
+
+### 7.2 Admin rotation is two-step (propose/confirm) — rationale
+
+`Admin` was immutable after `initialize`: losing the key froze policy management
+forever, and a compromised key could rewrite policy at will. Single-step rotation
+(`rotate_admin(new)` on the current admin's authority alone) fixes the mechanics
+but keeps the failure mode that matters operationally — a typo'd address hands
+policy management to an uncontrolled key with no recovery path. The two-step
+handover removes that failure mode instead of documenting around it:
+
+- **Propose** (`require_auth` current `Admin`) records intent in `PendingAdmin`
+  and changes nothing else. A proposal to a wrong address is inert: the current
+  admin is still authoritative and can overwrite or cancel it.
+- **Confirm** (`require_auth` *pending* admin) completes the handover only when
+  the incoming key demonstrates control of itself. A proposal to an address
+  nobody holds can never confirm, so typos cannot lock out policy management —
+  this is the property a double-entry single-step scheme cannot provide.
+- **Cancel** (`require_auth` current `Admin`) clears a stale proposal. A later
+  proposal overwrites an earlier one, so recovery from a typo is one
+  transaction either way.
+
+The handover moves policy-management power only: `confirm_admin_rotation` does
+not touch `Policy`, `Window`, `LastHeartbeat`, or `AdminFrozen`, and does not
+bump `PolicyRevision` (the policy did not change). The old admin loses all
+authority in the same write that installs the new one — there is no window in
+which both (or neither) can act. Rejected paths (`InvalidConfig` on
+self-proposal, `NoPendingAdmin` on confirm/cancel with nothing pending,
+`NotInitialized` pre-`initialize`) leave admin, policy, and revision unchanged
+(§6.6). The full trail (`admin_rotation_proposed` → `admin_rotated`, or
+`admin_rotation_cancelled`) is in §9 events.
 
 ---
 
@@ -599,6 +656,9 @@ filtering by the SDK listener.
 | `unfrozen` | (none) | `by: Address`, `rearmed_dms: bool` — whether `LastHeartbeat` was changed (DMS clock re-armed; §5) | admin unfreeze |
 | `policy_set` / `policy_revoked` | (none) | `by: Address` | admin policy changes |
 | `agent_rotated` | (none) | `by: Address`, `old_fingerprint: BytesN<8>`, `new_fingerprint: BytesN<8>` | admin agent-key rotation |
+| `admin_rotation_proposed` | (none) | `by: Address` (current admin), `proposed: Address` (pending admin) | admin rotation proposal (§7.2) |
+| `admin_rotated` | (none) | `old: Address` (outgoing admin), `new: Address` (incoming admin that confirmed) | admin rotation completion (§7.2) |
+| `admin_rotation_cancelled` | (none) | `by: Address` (current admin), `cancelled: Address` (pending admin) | admin rotation cancellation (§7.2) |
 
 Reason symbols mirror `BlockReason`/`Error` naming so off-chain code maps one vocabulary.
 
