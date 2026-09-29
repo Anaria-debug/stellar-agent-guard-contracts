@@ -17,7 +17,7 @@
 //!   approves) so admin calls can be enforced in the same env without key
 //!   material.
 
-use crate::types::{Error as GuardError, PolicyConfig};
+use crate::types::{CheckResult, Error as GuardError, PolicyConfig, ProtocolRule};
 use crate::{PolicyEngine, PolicyEngineClient};
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -29,9 +29,24 @@ use soroban_sdk::xdr::{
     ScBytes, ScSymbol, ScVal, SorobanAddressCredentials, SorobanAuthorizationEntry,
     SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials, WriteXdr,
 };
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, FromVal, IntoVal, Symbol, Val};
+use soroban_sdk::{
+    contract, contractimpl, vec, Address, BytesN, Env, FromVal, IntoVal, Symbol, Val,
+};
+use std::format;
 
 const SIG_EXPIRATION_LEDGER: u32 = 6_000_000;
+
+/// A `ScVal::Symbol` built from a plain string (event names / map keys).
+fn symbol_val(s: &str) -> ScVal {
+    ScVal::Symbol(ScSymbol::try_from(std::vec::Vec::from(s)).unwrap())
+}
+
+/// Off-chain reproduction of the contract's key fingerprint (SPEC §9):
+/// `sha256(pubkey)[0..8]`, as the `ScVal::Bytes` an event data map carries.
+fn fingerprint(pubkey: &[u8; 32]) -> ScVal {
+    let digest = Sha256::digest(pubkey);
+    ScVal::Bytes(ScBytes::try_from(digest[..8].to_vec()).unwrap())
+}
 
 /// Number of `heartbeat` events published by the last contract invocation.
 fn heartbeat_event_count(env: &Env) -> usize {
@@ -325,6 +340,36 @@ impl Harness {
                 xdr::ContractEventBody::V0(v0) => v0.topics.get(1) == Some(&want),
             })
     }
+
+    /// The `(old, new)` key fingerprints carried by the most recent
+    /// `agent_rotated` event (SPEC §9), as raw `ScVal`s. Panics if the event
+    /// is absent or malformed.
+    fn agent_rotated_fingerprints(&self) -> (ScVal, ScVal) {
+        let event_name = symbol_val("event_agent_rotated");
+        for event in self.env.events().all().events().iter().rev() {
+            let xdr::ContractEventBody::V0(v0) = &event.body;
+            if v0.topics.first() != Some(&event_name) {
+                continue;
+            }
+            let ScVal::Map(Some(map)) = &v0.data else {
+                panic!("agent_rotated data is not a map");
+            };
+            let mut old = None;
+            let mut new = None;
+            for entry in &map.0 {
+                if entry.key == symbol_val("old_fingerprint") {
+                    old = Some(entry.val.clone());
+                } else if entry.key == symbol_val("new_fingerprint") {
+                    new = Some(entry.val.clone());
+                }
+            }
+            return (
+                old.expect("agent_rotated is missing old_fingerprint"),
+                new.expect("agent_rotated is missing new_fingerprint"),
+            );
+        }
+        panic!("no agent_rotated event was emitted");
+    }
 }
 
 // ── Scenarios ────────────────────────────────────────────────────────────
@@ -357,6 +402,65 @@ fn allowed_transaction_succeeds() {
     assert!(h.emitted_allowed_auth());
     let st = h.status();
     assert!(!st.heartbeat_expired);
+}
+
+#[test]
+fn detailed_check_reports_exact_headroom_and_effective_caps() {
+    let mut h = Harness::new();
+    let mut policy = h.base_policy();
+    policy.per_tx_cap = 75;
+    policy.window_cap = 100;
+    h.install_policy(&policy);
+    h.set_time(1_000);
+    let recv = h.recv.clone();
+    h.transfer(&recv, 40);
+
+    let detail = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 10)
+    });
+    assert_eq!(detail.result, CheckResult::Allowed);
+    assert_eq!(detail.remaining_window, Some(60));
+    assert_eq!(detail.per_tx_cap, Some(75));
+    assert_eq!(detail.effective_per_tx_cap, Some(75));
+    assert_eq!(detail.effective_window_cap, Some(100));
+}
+
+#[test]
+fn detailed_check_reports_none_for_disabled_caps() {
+    let h = Harness::new();
+    h.install_policy(&h.base_policy());
+    let detail = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), h.recv.clone(), 10)
+    });
+    assert_eq!(detail.result, CheckResult::Allowed);
+    assert_eq!(detail.remaining_window, None);
+    assert_eq!(detail.per_tx_cap, None);
+    assert_eq!(detail.effective_per_tx_cap, None);
+    assert_eq!(detail.effective_window_cap, None);
+}
+
+#[test]
+fn blocked_detailed_check_reports_headroom_without_writing_window() {
+    let mut h = Harness::new();
+    let mut policy = h.base_policy();
+    policy.window_cap = 100;
+    h.install_policy(&policy);
+    h.set_time(1_000);
+    let recv = h.recv.clone();
+    h.transfer(&recv, 40);
+
+    let first = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 70)
+    });
+    assert_eq!(
+        first.result,
+        CheckResult::Blocked(Symbol::new(&h.env, "window_cap_exceeded"))
+    );
+    assert_eq!(first.remaining_window, Some(60));
+    let second = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
+    });
+    assert_eq!(second.remaining_window, Some(60));
 }
 
 #[test]
@@ -476,10 +580,69 @@ fn dead_man_switch_freeze_and_admin_reversal() {
     h.transfer_expect_blocked(&recv, 5);
     h.heartbeat_expect_blocked(); // silence cannot self-revive (SPEC §5)
 
-    // Admin unfreeze is the reversal path (SPEC §5).
+    // Admin unfreeze is the reversal path (SPEC §5). The DMS grace had
+    // elapsed, so the admin's signature re-arms the liveness clock — the
+    // event must carry `rearmed_dms: true` to make that side effect
+    // auditable (SPEC §5 recorded decision).
     h.unfreeze(); // sets LastHeartbeat = now (1_000_100)
+    assert_unfrozen_event_rearmed(&h.env, true);
     h.heartbeat(); // a subsequently-heartbeating agent keeps it alive
     h.transfer(&recv, 5); // revived
+}
+
+/// Reads the most recent `event_unfrozen` data map and asserts the value of
+/// its `rearmed_dms` field (SPEC §5 / §9).
+fn assert_unfrozen_event_rearmed(env: &Env, expected: bool) {
+    let want = symbol_val("event_unfrozen");
+    let all = env.events().all();
+    let events = all.events();
+    let event = events
+        .iter()
+        .rfind(|e| {
+            matches!(&e.body, xdr::ContractEventBody::V0(v0) if v0.topics.first() == Some(&want))
+        })
+        .expect("event_unfrozen not found");
+    let xdr::ContractEventBody::V0(v0) = &event.body;
+    let ScVal::Map(Some(map)) = &v0.data else {
+        panic!("event_unfrozen data must be a Map");
+    };
+    let entry = map
+        .0
+        .iter()
+        .find(|entry| entry.key == symbol_val("rearmed_dms"))
+        .expect("event_unfrozen must carry rearmed_dms");
+    let rearmed = match &entry.val {
+        ScVal::Bool(b) => *b,
+        _ => panic!("event_unfrozen rearmed_dms must be a Bool"),
+    };
+    assert_eq!(
+        rearmed, expected,
+        "event_unfrozen rearmed_dms mismatch (LastHeartbeat side effect)"
+    );
+}
+
+/// The admin brake cycle while the agent is live: a fresh heartbeat, then
+/// `freeze` + `unfreeze` in the same ledger second. `LastHeartbeat` already
+/// equals `now` at unfreeze time, so the event must carry `rearmed_dms:
+/// false` — the flag distinguishes the two jobs `unfreeze` performs (SPEC §5).
+#[test]
+fn unfreeze_while_dms_fresh_emits_rearmed_dms_false() {
+    let mut h = Harness::new();
+    let mut p = h.base_policy();
+    p.dms_grace_secs = 60;
+    h.set_time(1_000_000);
+    h.install_policy(&p); // LastHeartbeat = 1_000_000
+    h.set_time(1_000_010);
+    h.heartbeat(); // agent live: LastHeartbeat = 1_000_010, DMS fresh
+
+    // Admin brake cycle in the same second as the heartbeat: unfreeze writes
+    // `LastHeartbeat = now` but the value is already `now` — no re-arm.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    h.env.mock_all_auths();
+    client.freeze();
+    h.unfreeze();
+    assert_unfrozen_event_rearmed(&h.env, false);
+    assert_eq!(h.status().last_heartbeat, 1_000_010);
 }
 
 #[test]
@@ -544,6 +707,24 @@ fn wrong_signature_is_rejected_by_host_crypto() {
 
     // The registered agent still works afterwards.
     h.transfer(&recv, 5);
+}
+
+#[test]
+fn rotate_agent_key_event_carries_old_and_new_fingerprints() {
+    let h = Harness::new();
+    let old_pk = h.agent.verifying_key().to_bytes();
+    let new_pk = SigningKey::from_bytes(&[11u8; 32])
+        .verifying_key()
+        .to_bytes();
+
+    // First rotation: the `old` fingerprint is the key set at `initialize`.
+    PolicyEngineClient::new(&h.env, &h.guard)
+        .rotate_agent_key(&BytesN::from_array(&h.env, &new_pk));
+
+    let (old_fp, new_fp) = h.agent_rotated_fingerprints();
+    assert_eq!(old_fp, fingerprint(&old_pk));
+    assert_eq!(new_fp, fingerprint(&new_pk));
+    assert_ne!(old_fp, new_fp, "old and new keys must be distinguishable");
 }
 
 #[test]

@@ -3,6 +3,18 @@
 
 use soroban_sdk::{contracterror, contracttype, Address, Symbol, Vec};
 
+/// Warning threshold percentage for dead-man switch health evaluation (80%).
+pub const DMS_WARN_THRESHOLD_PERCENT: u64 = 80;
+
+/// Dead-man switch health status returned by `dms_health`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DmsHealthStatus {
+    Ok,
+    Warn,
+    Expired,
+}
+
 /// Hard bound on rolling-window entries. Above this, the engine merges the two
 /// oldest entries forward (conservative over-count) — see SPEC §3.1.
 pub const MAX_WINDOW_ENTRIES: usize = 8192;
@@ -26,7 +38,7 @@ pub struct SpendEntry {
 
 /// The policy an admin installs on the account. See SPEC §3/§4.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PolicyConfig {
     /// Per asset-transfer call cap; 0 = disabled.
     pub per_tx_cap: i128,
@@ -50,6 +62,32 @@ pub struct PolicyConfig {
     pub paused: bool,
     /// Dead-man switch grace (seconds); 0 = disabled.
     pub dms_grace_secs: u64,
+}
+
+/// Manual `Debug` implementation for `PolicyConfig` with stable field order.
+///
+/// Field order is the declaration order (as of SPEC §3 table) and must not be
+/// changed without updating the snapshot test in `tests/debug_policy_config.rs`.
+/// This is the *human-readable* format for logs, test fixtures, and dashboard
+/// inspect scripts — it is NOT the canonical encoding for `policy_hash`.
+/// Canonical encoding for hashing must be a separate, unambiguous serialization
+/// (e.g., XDR with deterministic field tags); see SPEC §8/§9 discussion.
+impl core::fmt::Debug for PolicyConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PolicyConfig")
+            .field("per_tx_cap", &self.per_tx_cap)
+            .field("window_secs", &self.window_secs)
+            .field("window_cap", &self.window_cap)
+            .field("assets", &self.assets)
+            .field("protocols", &self.protocols)
+            .field("recipients", &self.recipients)
+            .field("allow_any_recipient", &self.allow_any_recipient)
+            .field("active_from", &self.active_from)
+            .field("active_until", &self.active_until)
+            .field("paused", &self.paused)
+            .field("dms_grace_secs", &self.dms_grace_secs)
+            .finish()
+    }
 }
 
 #[contracttype]
@@ -100,6 +138,58 @@ pub struct Status {
 pub enum CheckResult {
     Allowed,
     Blocked(Symbol),
+}
+
+impl Error {
+    /// Convert an `Error` variant into its corresponding `BlockReason` symbol (as used in `CheckResult::Blocked`).
+    #[allow(clippy::must_use_candidate)]
+    pub fn to_block_reason(self) -> Symbol {
+        // Uses the existing reason() string which matches SPEC §7 / reason glossary.
+        Symbol::new(&soroban_sdk::Env::default(), self.reason())
+    }
+
+    /// Attempt to convert a `BlockReason` symbol back to an `Error` variant.
+    #[allow(clippy::must_use_candidate)]
+    pub fn from_block_reason(symbol: &Symbol) -> Option<Self> {
+        let env = soroban_sdk::Env::default();
+        let all_errors = [
+            Self::Unauthorized,
+            Self::AlreadyInitialized,
+            Self::NotInitialized,
+            Self::InvalidConfig,
+            Self::InvalidAmount,
+            Self::AdminFrozen,
+            Self::HeartbeatExpired,
+            Self::NoPolicy,
+            Self::Paused,
+            Self::OutsideActiveWindow,
+            Self::AssetNotAllowed,
+            Self::RecipientNotAllowed,
+            Self::PerTxCapExceeded,
+            Self::WindowCapExceeded,
+            Self::ProtocolNotAllowed,
+            Self::FunctionNotAllowed,
+            Self::UnknownContract,
+            Self::SelfFunctionNotAllowed,
+            Self::CreateContractNotAllowed,
+        ];
+        all_errors
+            .into_iter()
+            .find(|&err| symbol == &Symbol::new(&env, err.reason()))
+    }
+}
+
+/// Advisory result for a targeted asset transfer. All fields are calculated
+/// from the current policy and window snapshot; this type never represents a
+/// storage mutation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckDetail {
+    pub result: CheckResult,
+    pub remaining_window: Option<i128>,
+    pub per_tx_cap: Option<i128>,
+    pub effective_per_tx_cap: Option<i128>,
+    pub effective_window_cap: Option<i128>,
 }
 
 // Storage layout (SPEC §3). `Initialized`/`Admin`/`AgentPubkey` live in
@@ -156,6 +246,7 @@ pub enum Error {
 
 impl Error {
     /// Stable, human- and telemetry-readable reason name (no env needed).
+    #[allow(clippy::must_use_candidate)]
     pub fn reason(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",

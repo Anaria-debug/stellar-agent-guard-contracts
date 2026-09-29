@@ -20,8 +20,49 @@ pub enum Decision {
     Blocked(Error),
 }
 
+/// Return advisory cap metrics from an already-loaded ledger. The current
+/// policy has no per-asset overrides, so effective asset caps equal the
+/// configured caps.
+pub fn cap_metrics(
+    policy: &PolicyConfig,
+    ledger: &Ledger,
+) -> (Option<i128>, Option<i128>, Option<i128>) {
+    let window_cap = (policy.window_cap > 0).then_some(policy.window_cap);
+    let per_tx_cap = (policy.per_tx_cap > 0).then_some(policy.per_tx_cap);
+    let remaining = window_cap.map(|cap| cap.saturating_sub(ledger.total).max(0));
+    (remaining, per_tx_cap, window_cap)
+}
+
+/// Evaluate dead-man switch health given current timestamp, last heartbeat, and policy config.
+pub fn dms_health(
+    now: u64,
+    last_heartbeat: u64,
+    policy: &PolicyConfig,
+) -> crate::types::DmsHealthStatus {
+    if policy.dms_grace_secs == 0 {
+        return crate::types::DmsHealthStatus::Ok;
+    }
+    if last_heartbeat == 0 {
+        return crate::types::DmsHealthStatus::Expired;
+    }
+    let elapsed = now.saturating_sub(last_heartbeat);
+    if elapsed > policy.dms_grace_secs {
+        return crate::types::DmsHealthStatus::Expired;
+    }
+    let warn_threshold = policy
+        .dms_grace_secs
+        .saturating_mul(crate::types::DMS_WARN_THRESHOLD_PERCENT)
+        / 100;
+    if elapsed >= warn_threshold {
+        crate::types::DmsHealthStatus::Warn
+    } else {
+        crate::types::DmsHealthStatus::Ok
+    }
+}
+
 // ── Small contains helpers (soroban Vec has no `contains`) ───────────────
 
+#[allow(clippy::must_use_candidate)]
 pub fn contains_addr(list: &Vec<Address>, a: &Address) -> bool {
     for i in 0..list.len() {
         if let Some(x) = list.get(i) {
@@ -46,7 +87,25 @@ fn contains_sym(list: &Vec<Symbol>, s: &Symbol) -> bool {
 
 // ── Context parsing (SPEC §6) ────────────────────────────────────────────
 
+#[cfg(feature = "testutils")]
+#[allow(clippy::must_use_candidate)]
+pub fn parse_call(env: &Env, self_addr: &Address, ctx: &Context, cfg: &PolicyConfig) -> ParsedCall {
+    parse_call_inner(env, self_addr, ctx, cfg)
+}
+
+#[cfg(not(feature = "testutils"))]
+#[allow(clippy::must_use_candidate)]
 fn parse_call(env: &Env, self_addr: &Address, ctx: &Context, cfg: &PolicyConfig) -> ParsedCall {
+    parse_call_inner(env, self_addr, ctx, cfg)
+}
+
+#[allow(clippy::must_use_candidate)]
+fn parse_call_inner(
+    env: &Env,
+    self_addr: &Address,
+    ctx: &Context,
+    cfg: &PolicyConfig,
+) -> ParsedCall {
     match ctx {
         Context::Contract(ContractContext {
             contract,
@@ -69,6 +128,17 @@ fn parse_call(env: &Env, self_addr: &Address, ctx: &Context, cfg: &PolicyConfig)
                 } else {
                     (2u32, 3u32)
                 };
+                // Exact arity required: transfer = 3 args, transfer_from = 4 args.
+                // Extra trailing args or short arg lists are rejected -- we do not
+                // partially parse a call whose effective meaning we do not fully
+                // understand (SPEC section 6.2). Falling through to Unknown = default deny.
+                let expected_arity: u32 = if fn_name == &fn_transfer { 3 } else { 4 };
+                if args.len() != expected_arity {
+                    return ParsedCall::Unknown {
+                        contract: contract.clone(),
+                        fname: fn_name.clone(),
+                    };
+                }
                 let to_val = args.get(to_idx);
                 let amt_val = args.get(amt_idx);
                 if let (Some(to_val), Some(amt_val)) = (to_val, amt_val) {
@@ -608,5 +678,123 @@ mod tests {
             d.first().unwrap(),
             Decision::Blocked(Error::SelfFunctionNotAllowed)
         ));
+    }
+
+    fn transfer_ctx_with_extra_args(
+        env: &Env,
+        asset: u8,
+        to: u8,
+        amount: i128,
+        extra: u32,
+    ) -> Context {
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(addr(env, 9).into_val(env));
+        args.push_back(addr(env, to).into_val(env));
+        args.push_back(amount.into_val(env));
+        for i in 0..extra {
+            args.push_back(i128::from(i).into_val(env));
+        }
+        Context::Contract(ContractContext {
+            contract: addr(env, asset),
+            fn_name: Symbol::new(env, "transfer"),
+            args,
+        })
+    }
+
+    fn transfer_from_ctx_with_arg_count(
+        env: &Env,
+        asset: u8,
+        to: u8,
+        amount: i128,
+        count: u32,
+    ) -> Context {
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(addr(env, 9).into_val(env));
+        args.push_back(addr(env, 8).into_val(env));
+        args.push_back(addr(env, to).into_val(env));
+        args.push_back(amount.into_val(env));
+        if count < 4 {
+            let mut short: Vec<Val> = Vec::new(env);
+            for i in 0..count {
+                if let Some(v) = args.get(i) {
+                    short.push_back(v);
+                }
+            }
+            args = short;
+        } else {
+            for i in 4..count {
+                args.push_back(i128::from(i).into_val(env));
+            }
+        }
+        Context::Contract(ContractContext {
+            contract: addr(env, asset),
+            fn_name: Symbol::new(env, "transfer_from"),
+            args,
+        })
+    }
+
+    #[test]
+    fn arity_guard_transfer_4_args_is_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_ctx_with_extra_args(&env, 1, 2, 5, 1)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+    }
+
+    #[test]
+    fn arity_guard_transfer_2_args_is_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let mut args: Vec<Val> = Vec::new(&env);
+        args.push_back(addr(&env, 9).into_val(&env));
+        args.push_back(addr(&env, 2).into_val(&env));
+        let ctx = vec![
+            &env,
+            Context::Contract(ContractContext {
+                contract: addr(&env, 1),
+                fn_name: Symbol::new(&env, "transfer"),
+                args,
+            }),
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+    }
+
+    #[test]
+    fn arity_guard_transfer_from_5_args_is_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 5)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+    }
+
+    #[test]
+    fn arity_guard_transfer_from_3_args_is_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 3)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+    }
+
+    #[test]
+    fn arity_guard_transfer_from_4_args_is_allowed() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 4)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d, Decision::Allowed));
     }
 }

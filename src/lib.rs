@@ -21,13 +21,14 @@ mod window;
 #[cfg(test)]
 mod integration_tests;
 
-use engine::{contains_addr, decide, AccountState, Decision};
+use engine::{cap_metrics, contains_addr, decide, AccountState, Decision};
 use soroban_sdk::auth::{Context, ContractContext, CustomAccountInterface};
 use soroban_sdk::{
     contract, contractevent, contractimpl, panic_with_error, vec, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, TryFromVal, Val,
 };
-use types::{CheckResult, DataKey, Error, PolicyConfig, Status, WindowState};
+pub use types::{CheckDetail, Error, PolicyConfig};
+use types::{CheckResult, DataKey, Status, WindowState};
 use window::Ledger;
 
 // ── Contract events (SPEC §9). Each event is its own type; topic layout
@@ -65,10 +66,16 @@ struct EventFrozen {
     by: Address,
 }
 
+/// Admin unfreeze: data `by` (the admin address that acted) plus
+/// `rearmed_dms: bool` — whether the call also re-armed the dead-man-switch
+/// clock by changing `LastHeartbeat` (SPEC §5: the admin's signature is the
+/// liveness attestation, so an unfreeze of a DMS-expired account silently
+/// restarts the grace window; the flag makes that side effect auditable).
 #[contractevent]
 #[derive(Clone)]
 struct EventUnfrozen {
     by: Address,
+    rearmed_dms: bool,
 }
 
 #[contractevent]
@@ -83,10 +90,15 @@ struct EventPolicyRevoked {
     by: Address,
 }
 
+/// Agent key rotation: data `by` (the admin that acted) plus truncated
+/// fingerprints of the outgoing and incoming agent keys, so an auditor can
+/// reconstruct the old→new linkage without carrying full pubkeys (SPEC §9).
 #[contractevent]
 #[derive(Clone)]
 struct EventAgentRotated {
     by: Address,
+    old_fingerprint: BytesN<8>,
+    new_fingerprint: BytesN<8>,
 }
 
 // ── Persistent-storage helpers (SPEC §3) ────────────────────────────────
@@ -218,8 +230,12 @@ fn emit_initialized(env: &Env, by: &Address) {
 fn emit_frozen(env: &Env, by: &Address) {
     EventFrozen { by: by.clone() }.publish(env);
 }
-fn emit_unfrozen(env: &Env, by: &Address) {
-    EventUnfrozen { by: by.clone() }.publish(env);
+fn emit_unfrozen(env: &Env, by: &Address, rearmed_dms: bool) {
+    EventUnfrozen {
+        by: by.clone(),
+        rearmed_dms,
+    }
+    .publish(env);
 }
 fn emit_policy_set(env: &Env, by: &Address) {
     EventPolicySet { by: by.clone() }.publish(env);
@@ -227,8 +243,26 @@ fn emit_policy_set(env: &Env, by: &Address) {
 fn emit_policy_revoked(env: &Env, by: &Address) {
     EventPolicyRevoked { by: by.clone() }.publish(env);
 }
-fn emit_agent_rotated(env: &Env, by: &Address) {
-    EventAgentRotated { by: by.clone() }.publish(env);
+/// Compact key fingerprint: the first 8 bytes of `SHA-256(pubkey)`. Rendered
+/// as 16 lowercase hex characters off-chain (greppable, small event payload);
+/// deliberately truncating so events never carry a full pubkey.
+fn key_fingerprint(env: &Env, pubkey: &BytesN<32>) -> BytesN<8> {
+    let digest: [u8; 32] = env
+        .crypto()
+        .sha256(&Bytes::from_array(env, &pubkey.to_array()))
+        .into();
+    let mut fingerprint = [0u8; 8];
+    fingerprint.copy_from_slice(&digest[..8]);
+    BytesN::from_array(env, &fingerprint)
+}
+
+fn emit_agent_rotated(env: &Env, by: &Address, old: &BytesN<32>, new: &BytesN<32>) {
+    EventAgentRotated {
+        by: by.clone(),
+        old_fingerprint: key_fingerprint(env, old),
+        new_fingerprint: key_fingerprint(env, new),
+    }
+    .publish(env);
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────
@@ -298,10 +332,16 @@ impl PolicyEngine {
     /// power; it can only replace the key the account will authenticate.
     pub fn rotate_agent_key(env: Env, new_pubkey: BytesN<32>) {
         let admin = Self::admin_or_panic(&env);
+        // Post-initialize the key always exists; the fingerprint needs the old
+        // key before the storage slot is overwritten.
+        let old_pubkey: Option<BytesN<32>> = env.storage().instance().get(&DataKey::AgentPubkey);
+        let Some(old_pubkey) = old_pubkey else {
+            panic_with_error!(&env, Error::NotInitialized);
+        };
         env.storage()
             .instance()
             .set(&DataKey::AgentPubkey, &new_pubkey);
-        emit_agent_rotated(&env, &admin);
+        emit_agent_rotated(&env, &admin, &old_pubkey, &new_pubkey);
     }
 
     // ── Dead-man switch / freeze (SPEC §5) ───────────────────────────────
@@ -332,13 +372,20 @@ impl PolicyEngine {
     }
 
     /// Admin liveness attestation: clears the admin freeze and restarts the
-    /// heartbeat clock.
+    /// heartbeat clock. One call, two jobs (SPEC §5 recorded decision): the
+    /// brake release and the liveness attestation are combined on purpose —
+    /// when the DMS grace was already elapsed, this re-arms the liveness clock
+    /// on the admin's authority, and the emitted event carries
+    /// `rearmed_dms: bool` so telemetry can surface exactly that side effect
+    /// (`true` = `LastHeartbeat` changed, `false` = it was already `now`).
     pub fn unfreeze(env: Env) {
         let admin = Self::admin_or_panic(&env);
         persist_set(&env, &DataKey::AdminFrozen, &false);
         let now = env.ledger().timestamp();
+        let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+        let rearmed_dms = last != now;
         persist_set(&env, &DataKey::LastHeartbeat, &now);
-        emit_unfrozen(&env, &admin);
+        emit_unfrozen(&env, &admin, rearmed_dms);
     }
 
     // ── Read / advisory (no auth — safe reads only, nothing confidential) ─
@@ -346,6 +393,17 @@ impl PolicyEngine {
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn policy(env: Env) -> Option<PolicyConfig> {
         persist_get(&env, &DataKey::Policy)
+    }
+
+    /// Evaluates dead-man switch health (`Ok`, `Warn` at ≥80% elapsed, or `Expired`).
+    #[allow(clippy::must_use_candidate)] // public read surface
+    pub fn dms_health(env: Env) -> crate::types::DmsHealthStatus {
+        let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+            return crate::types::DmsHealthStatus::Ok;
+        };
+        let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+        let now = env.ledger().timestamp();
+        engine::dms_health(now, last, &cfg)
     }
 
     #[allow(clippy::must_use_candidate)] // public read surface
@@ -378,6 +436,14 @@ impl PolicyEngine {
     /// This function panics if the policy engine's `decide` evaluation returns an empty list of verdicts.
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn check(env: Env, asset: Address, to: Address, amount: i128) -> CheckResult {
+        Self::check_detailed(env, asset, to, amount).result
+    }
+
+    /// Pre-flight decision plus current cap headroom for the targeted asset.
+    /// This path only reads storage, mutates a local ledger copy, and emits
+    /// exactly the same `auth_checked` event as `check`.
+    #[allow(clippy::must_use_candidate)] // public read surface
+    pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail {
         let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
             emit_auth(&env, false, Some(Error::NoPolicy), 0);
             return CheckResult::Blocked(Symbol::new(&env, Error::NoPolicy.reason()));
@@ -387,6 +453,11 @@ impl PolicyEngine {
         let now = env.ledger().timestamp();
         let self_addr = env.current_contract_address();
         let mut ledger = load_ledger(&env);
+        if cfg.window_cap > 0 {
+            ledger.prune(now, cfg.window_secs);
+        }
+        let (remaining_window, per_tx_cap, effective_window_cap) = cap_metrics(&cfg, &ledger);
+        let effective_per_tx_cap = per_tx_cap;
         let call = transfer_context(&env, &asset, &to, amount);
         let verdicts = decide(
             &env,
@@ -409,6 +480,13 @@ impl PolicyEngine {
                 emit_auth(&env, false, Some(*e), 0);
                 CheckResult::Blocked(Symbol::new(&env, e.reason()))
             }
+        };
+        CheckDetail {
+            result,
+            remaining_window,
+            per_tx_cap,
+            effective_per_tx_cap,
+            effective_window_cap,
         }
     }
 }
@@ -513,4 +591,17 @@ impl CustomAccountInterface for PolicyEngine {
             Err(first_error.unwrap())
         }
     }
+}
+
+// ── Test utilities (exposed via `testutils` feature) ──────────────────────
+#[cfg(feature = "testutils")]
+#[allow(clippy::must_use_candidate, clippy::len_without_is_empty)]
+pub mod testutils {
+    pub use crate::engine::{contains_addr, decide, parse_call, AccountState, Decision};
+    pub use crate::types::{
+        CheckResult, DataKey, Error, PolicyConfig, ProtocolRule, Status, WindowState,
+    };
+    pub use crate::window::Ledger;
+    pub use soroban_sdk::auth::{Context, ContractContext};
+    pub use soroban_sdk::{vec, Address, BytesN, Env, IntoVal, Symbol, TryFromVal, Val, Vec};
 }
