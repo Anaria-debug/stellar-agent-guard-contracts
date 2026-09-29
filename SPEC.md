@@ -378,6 +378,25 @@ transfers only. Recipient allowlists bind SAC asset transfers only.
 
 ---
 
+### 6.5 Scenario matrix — decision rows × call kinds
+
+The §4 decision table and the §6 classifications above are two halves of one truth table:
+7 decision rows × 6 call kinds (self, asset transfer, asset other-fn, protocol,
+create-contract, unknown). That table is written out in full, cell by cell, in
+[`docs/scenario-matrix.md`](docs/scenario-matrix.md), together with a **coverage map** that
+names the test pinning each cell and enumerates the cells that no test pins yet (currently
+the entire `outside_active_window` row, the `AssetOther` and `CreateContract`
+classification arms, and most of the transaction-level gates × non-SAC kinds).
+
+Read it before changing anything under §4 or §6: it is the shortest path from "I am
+touching this gate" to "which test will catch me", and it is the shortest path from
+"is this tested?" to a citation instead of a guess. Note that the two `parse_call`-time
+outcomes `CreateContractNotAllowed` and the `AssetOther` → `function_not_allowed` arm are
+classified here but are **not** listed in §4 rule 7's inline reason list; §4.1's cost table
+does list gate 6 (`SelfFunctionNotAllowed`) but has no row for contract creation.
+
+---
+
 ## 7. Public surface — exact signatures and auth placement
 
 Auth placement rule used throughout: **the authority that can change a thing is the authority
