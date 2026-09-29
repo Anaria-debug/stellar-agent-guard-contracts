@@ -122,24 +122,25 @@ TTL on every write; see §9.5).
 | `Admin` | `Address` | instance | policy admin; set once at `initialize` |
 | `AgentPubkey` | `BytesN<32>` | instance | the agent's Ed25519 public key |
 | `Policy` | `PolicyConfig` | persistent | current policy (`None` = default-deny) |
-| `Window` | `WindowState` | persistent | rolling spend ledger for asset transfers |
+| `Window` | `WindowState` | persistent | rolling spend ledger for asset transfers (global + per-recipient) |
 | `LastHeartbeat` | `u64` | persistent | unix seconds of last agent heartbeat (0 = never) |
 | `AdminFrozen` | `bool` | persistent | admin-initiated freeze flag |
 
 ```rust
 #[contracttype]
 pub struct PolicyConfig {
-    pub per_tx_cap: i128,                 // per asset-transfer call; 0 = disabled
-    pub window_secs: u64,                 // rolling window width in seconds (default 86_400)
-    pub window_cap: i128,                 // rolling cap within window_secs; 0 = disabled
-    pub assets: Vec<Address>,             // SAC token contracts whose transfers get parsed/enforced
-    pub protocols: Vec<ProtocolRule>,     // allowlisted non-asset contracts the account may call
-    pub recipients: Vec<Address>,         // allowed SAC transfer destinations
-    pub allow_any_recipient: bool,        // escape hatch: skip recipient allowlist (still capped)
-    pub active_from: u64,                 // unix seconds; 0 = no restriction
-    pub active_until: u64,                // unix seconds; 0 = no restriction
-    pub paused: bool,                     // admin kill switch
-    pub dms_grace_secs: u64,              // dead-man switch grace; 0 = disabled
+    pub per_tx_cap: i128,                    // per asset-transfer call; 0 = disabled
+    pub window_secs: u64,                    // rolling window width in seconds (default 86_400)
+    pub window_cap: i128,                    // rolling cap within window_secs; 0 = disabled
+    pub assets: Vec<Address>,                // SAC token contracts whose transfers get parsed/enforced
+    pub protocols: Vec<ProtocolRule>,        // allowlisted non-asset contracts the account may call
+    pub recipients: Vec<Address>,            // allowed SAC transfer destinations
+    pub recipient_window_caps: Vec<RecipientCap>, // per-recipient rolling cap overrides; 0 = fall back to global
+    pub allow_any_recipient: bool,           // escape hatch: skip recipient allowlist (still capped)
+    pub active_from: u64,                    // unix seconds; 0 = no restriction
+    pub active_until: u64,                   // unix seconds; 0 = no restriction
+    pub paused: bool,                        // admin kill switch
+    pub dms_grace_secs: u64,                 // dead-man switch grace; 0 = disabled
 }
 
 #[contracttype]
@@ -149,10 +150,25 @@ pub struct ProtocolRule {
 }
 
 #[contracttype]
-pub struct WindowState {
-    pub total: i128,                      // cached rolling total
-    pub entries: Vec<SpendEntry>,         // chronological; pruned lazily on access
+pub struct RecipientCap {
+    pub recipient: Address,
+    pub cap: i128,                        // per-recipient rolling cap within window_secs; 0 = disabled / global fallback
 }
+
+#[contracttype]
+pub struct WindowState {
+    pub total: i128,                      // cached rolling global total
+    pub entries: Vec<SpendEntry>,         // chronological global spend entries; pruned lazily on access
+    pub recipients: Vec<RecipientWindowState>, // per-recipient rolling ledgers for recipients with override caps
+}
+
+#[contracttype]
+pub struct RecipientWindowState {
+    pub recipient: Address,
+    pub total: i128,                      // cached rolling total for this recipient
+    pub entries: Vec<SpendEntry>,          // chronological entries for this recipient
+}
+
 #[contracttype]
 pub struct SpendEntry { pub ts: u64, pub amount: i128 }
 ```
@@ -191,9 +207,12 @@ Implementation (exact, lazy, bounded):
   must remain live; see [issue #85](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/85)
   for the long-lived-account rent/TTL model.
 
-**Invariant (window):** for every authorization decision, `total` after any admission equals the
-sum of `entries[i].amount` over entries with `ts > now - window_secs`, and a new asset transfer
-is admitted only if that running total plus the transfer amount ≤ `window_cap`.
+**Invariant (window):** for every authorization decision, the global `total` after any admission equals the
+sum of `entries[i].amount` over global entries with `ts > now - window_secs`, and a new asset transfer
+is admitted only if the running total (plus amounts already staged in the same request) ≤ the
+effective cap for that transfer. Per-recipient overrides maintain the same invariant in their own
+`RecipientWindowState`; recipients without an override use the global cap. Both the global cap
+and any matching per-recipient cap must be satisfied.
 
 ---
 
@@ -322,9 +341,14 @@ Rules applied:
 1. **Recipient allowlist:** if `allow_any_recipient == false`, `recipient ∈ policy.recipients`
    or block `RecipientNotAllowed`.
 2. **Per-tx cap:** if `per_tx_cap != 0`, `amount <= per_tx_cap` or block `PerTxCapExceeded`.
-3. **Rolling window (§3.1):** if `window_cap != 0`, prune expired entries, then
-   `total + amount <= window_cap` or block `WindowCapExceeded`; on admission, update
-   `total`/`entries`.
+3. **Rolling window (§3.1):**
+   - Global window: if `window_cap != 0`, prune expired entries, then
+     `total + amount <= window_cap` or block `WindowCapExceeded`.
+   - Per-recipient window: if `recipient` has an entry in `policy.recipient_window_caps` with
+     `cap > 0`, use that cap against the recipient's own rolling ledger; otherwise fall back to
+     the global window cap. If the effective cap is exceeded, block `WindowCapExceeded`.
+   - On admission, update the global ledger and, when a per-recipient cap applies, the
+     recipient's ledger.
 4. Amount validity: `amount > 0` or block `InvalidAmount`.
 
 An asset contract listed in `assets` invoked with any other function (e.g. `mint`, `burn`,
@@ -351,6 +375,25 @@ to weaken an allowlist that already exists.
 are *transaction-level* gates applied before classification, so they bind every call the
 account makes, SAC or protocol. Spend caps and rolling-window accounting bind SAC asset
 transfers only. Recipient allowlists bind SAC asset transfers only.
+
+---
+
+### 6.5 Scenario matrix — decision rows × call kinds
+
+The §4 decision table and the §6 classifications above are two halves of one truth table:
+7 decision rows × 6 call kinds (self, asset transfer, asset other-fn, protocol,
+create-contract, unknown). That table is written out in full, cell by cell, in
+[`docs/scenario-matrix.md`](docs/scenario-matrix.md), together with a **coverage map** that
+names the test pinning each cell and enumerates the cells that no test pins yet (currently
+the entire `outside_active_window` row, the `AssetOther` and `CreateContract`
+classification arms, and most of the transaction-level gates × non-SAC kinds).
+
+Read it before changing anything under §4 or §6: it is the shortest path from "I am
+touching this gate" to "which test will catch me", and it is the shortest path from
+"is this tested?" to a citation instead of a guess. Note that the two `parse_call`-time
+outcomes `CreateContractNotAllowed` and the `AssetOther` → `function_not_allowed` arm are
+classified here but are **not** listed in §4 rule 7's inline reason list; §4.1's cost table
+does list gate 6 (`SelfFunctionNotAllowed`) but has no row for contract creation.
 
 ---
 
@@ -412,16 +455,18 @@ pub fn heartbeat(env: Env)
 pub fn freeze(env: Env)      // require_auth(Admin); sets AdminFrozen = true
 pub fn unfreeze(env: Env)    // require_auth(Admin); clears AdminFrozen, LastHeartbeat = now
 
-// ── Read / advisory (no auth — safe reads only, nothing confidential) ─────
+// ── Read / advisory (no auth; non-confidential state; TTL effects in §9.5) ──
 pub fn policy(env: Env) -> Option<PolicyConfig>       // current policy
 pub fn status(env: Env) -> Status                     // frozen? admin_frozen? last_heartbeat? now?
 pub fn dms_health(env: Env) -> DmsHealth                  // ok, warn (>=80%), or expired
 pub fn check(env: Env, asset: Address, to: Address, amount: i128) -> CheckResult
-    // Pure pre-flight replica of the §6.2 decision path (same code, no writes):
-    // lets agents/SDK simulate an asset transfer before signing. Emits the same
-    // events as an in-path decision so telemetry sees one vocabulary.
+    // Pure pre-flight replica of the §6.2 decision path: it does not change
+    // spend accounting, but a submitted call may refresh TTLs under §9.5.
+    // Simulation before signing does not persist those rent bumps.
 pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail
-  // Same zero-write pre-flight, with remaining_window and effective cap metrics.
+  // Same pre-flight, with remaining_window and effective cap metrics.
+  // `remaining_window` reflects the effective cap for the queried recipient
+  // (per-recipient override if configured, otherwise global cap).
 
 // ── Enforcement (host-invoked; not callable by anyone) ────────────────────
 impl CustomAccountInterface for PolicyEngine {
@@ -431,7 +476,7 @@ impl CustomAccountInterface for PolicyEngine {
                     auth_contexts: Vec<Context>) -> Result<(), Error>;
     // 1. ed25519_verify(AgentPubkey, signature_payload, signatures) or Unauthorized.
     // 2. Decision table §4 + classification §6 over every context.
-    // 3. Events (§9) + storage writes only on admission.
+    // 3. Events (§9) + TTL refreshes (§9.5); spend-accounting writes only on admission.
 }
 ```
 
@@ -481,25 +526,50 @@ pub enum Error {            // values stable; see tests/fixtures
 }
 ```
 
-`check_detailed` loads and prunes only an in-memory copy of the rolling ledger.
-It writes no ledger state and emits the same `auth_checked` event, with the same
+`check_detailed` loads and prunes only an in-memory copy of the rolling ledger;
+it does not change spend accounting. A submitted invocation may refresh persistent
+entry TTLs under §9.5 and emits the same `auth_checked` event, with the same
 `allowed`/`blocked` result and reason, as `check`. `remaining_window` is the
-capacity available before the requested transfer; it is `None` when the rolling
-window cap is disabled. The configured and effective caps are `None` when
-disabled; v1 has no per-asset overrides, so effective caps equal configured caps.
+capacity available before the requested transfer; it is `None` when no effective
+window cap applies to the queried recipient (no global `window_cap` and no
+per-recipient override). The configured and effective caps are `None` when
+disabled; v1 has no per-asset overrides, so the effective per-transaction cap
+equals the configured cap.
 
 ---
 
 ## 8. Config validation (`set_policy`)
 
+> **Starter configs.** Copy-paste `PolicyConfig` presets for common operator personas
+> (day-trader, payments bot, watch-only, max security) — each with rationale, explicit
+> "what it does NOT protect against", and unaudited/mainnet/DMS-grace warnings — are in
+> [`docs/policy-templates.md`](docs/policy-templates.md). A CI test installs every preset
+> documented there, so the examples cannot rot into invalid configs.
+
 - All amounts `>= 0`; `window_secs` and `dms_grace_secs` are `u64` (no negatives possible).
 - `window_cap != 0` requires `window_secs != 0`.
+- A per-recipient cap `> 0` requires `window_secs != 0`.
 - `active_until == 0 || active_until > active_from`.
 - Assets, protocols, recipients, and per-protocol fn lists must be non-empty for their
   respective vectors to matter (empty `assets` = no SAC transfer is ever allowed; empty
   `recipients` with `allow_any_recipient == false` = no recipient allowed).
-- Duplicate addresses within a list are rejected.
-- Self-address may not appear in `assets`/`protocols`.
+- Duplicate addresses within a list are rejected (`assets`, `recipients`, `protocols`).
+- Duplicate recipients within `recipient_window_caps` are rejected.
+- `recipients` and `recipient_window_caps` are each bounded to `MAX_RECIPIENT_ENTRIES` (256)
+  entries to keep allowlist scans and per-recipient storage predictable.
+- The contract's own address may not appear in **any** of the three address lists:
+  - `assets` — the guard is not an SAC; self-calls are governed by the fixed §6.1 rule, not
+    by policy, so a self-entry would be a nonsensical allowlist.
+  - `protocols` — same: allowlisting the account to call itself through the policy path is
+    meaningless (and §6.1 already decides what self-calls are allowed).
+  - `recipients` — the account paying itself is a no-op loop (a self-debit/re-credit of the
+    same SAC balance) with no purpose; allowing it adds no capability while making a
+    mis-pasted recipient address look like a deliberate policy. Rejected (recommended:
+    catches typos) rather than allowed-with-documentation. The same rule applies to
+    `recipient_window_caps` entries.
+  The self-address is known pre-`initialize` (`env.current_contract_address()` is a
+  deployment-time constant), and `set_policy` can only run post-initialize, so the check
+  always compares against the real deployed contract ID.
 
 Invalid config → `InvalidConfig`, policy unchanged (fail-closed, never partially applied).
 
@@ -529,6 +599,34 @@ off-chain. Rotations record both endpoints (outgoing and incoming) so an auditor
 never repeated in event data (it is already public at `initialize`). SDK/dashboard decoders must
 render the `BytesN<8>` data fields as hex — a cross-repo follow-up tracked in those repositories.
 
+### 9.5 Persistent storage TTL liveness
+
+`Policy`, `Window`, `LastHeartbeat`, `AdminFrozen`, and `PolicyRevision` are persistent ledger
+entries. A successful write extends its entry to `env.storage().max_ttl()` ledgers. A successful
+read refreshes the accessed entry to that same TTL when its remaining TTL is below half of
+`max_ttl()`. The extension target is a TTL duration relative to the current ledger sequence, not
+an absolute sequence number. This thresholded read refresh avoids paying rent on every read while
+keeping frequently accessed guard state away from archival. Because of this refresh, submitting a
+read call such as `policy`, `status`, or `check` can write TTL metadata and charge rent when the
+threshold is crossed; an RPC simulation (`send=no`) does not persist that change. A rejected
+authorization transaction rolls back its TTL updates along with its other state changes.
+
+This is an activity-based liveness policy, not a promise that untouched state never expires. If
+an entry is left untouched for its full maximum TTL, Soroban archives it. A transaction that
+accesses archived persistent data must restore that entry in its footprint before contract
+execution; RPC simulation normally supplies the restore footprint. If restoration is not
+included or its rent cannot be funded, the transaction fails before a guard decision can approve
+the spend. Once restored, a successful read refreshes the entry. Operators requiring liveness
+through inactivity longer than the maximum TTL must arrange a keeper/restore transaction before
+expiry; the contract cannot run a background extension itself.
+
+The executable TTL regression test shortens the test ledger's persistent TTL, advances ledger
+sequence past expiry, and verifies that archived `Policy`, `Window`, `LastHeartbeat`, and
+`AdminFrozen` entries restore with their original values. It also checks that a pre-expiry spend
+still counts against `window_cap` after restoration and that an expired dead-man clock remains
+expired. See [issue #43](https://github.com/aigbagbobila/stellar-agent-guard-contracts/issues/43)
+and the operator [rent/TTL guide](docs/rent-and-ttl.md).
+
 ---
 
 ## 10. Threat model (what this does and does not do)
@@ -536,8 +634,9 @@ render the `BytesN<8>` data fields as hex — a cross-repo follow-up tracked in 
 Guarded against, on-chain and unbypassable (a compromised agent key cannot exceed policy —
 spend caps, allowlists, freeze, default-deny all execute inside `__check_auth` before any value
 moves):
-- runaway/overspend loops (per-tx + rolling window caps)
+- runaway/overspend loops (per-tx + global/per-recipient rolling window caps)
 - payment to unauthorized recipients (recipient allowlist on asset transfers)
+- per-recipient overspend (per-recipient rolling window caps)
 - calls to unauthorized protocols/functions (protocol allowlist + default-deny)
 - agent disappearance (dead-man switch) and operator-initiated halt (freeze/pause)
 
