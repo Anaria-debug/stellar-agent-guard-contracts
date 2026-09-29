@@ -916,6 +916,68 @@ fn revoke_policy_is_instant_default_deny() {
     h.transfer_expect_blocked(&recv, 5);
 }
 
+/// SPEC §8: the contract's own address is rejected in **all three** policy
+/// lists. An `assets`/`protocols` self-entry is a nonsensical allowlist (the
+/// account's self-calls are governed by the fixed §6.1 rule, not policy), and
+/// a `recipients` self-entry is a pay-itself no-op loop that almost certainly
+/// signals a mis-pasted address — rejected as `InvalidConfig` (fail-closed)
+/// rather than admitted as a meaningless allowlist entry.
+#[test]
+fn self_address_rejected_in_every_list() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // Every case must fail `set_policy` with `InvalidConfig` (fail-closed:
+    // the previously installed policy, if any, stays unchanged).
+    //
+    // `set_policy` returns `()` and signals rejection by panicking through
+    // `panic_with_error!`, so the SDK generates no `try_set_policy` client
+    // method to assert on; `catch_unwind` + `AssertUnwindSafe` is this crate's
+    // established way to assert a rejected call (same as
+    // `transfer_expect_blocked` / `heartbeat_expect_blocked`). Asserting only
+    // "it panicked" would also pass for an unrelated panic, so each case
+    // additionally asserts the fail-closed invariant: the rejected policy was
+    // never written to storage.
+    let expect_invalid = |cfg: &PolicyConfig, list: &str| {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_policy(cfg);
+        }));
+        assert!(
+            res.is_err(),
+            "self-address in `{list}` must fail set_policy with InvalidConfig"
+        );
+        assert!(
+            client.policy().is_none(),
+            "self-address in `{list}` must leave the policy uninstalled (fail-closed)"
+        );
+    };
+
+    // assets: the guard itself listed as an SAC token.
+    let mut p = h.base_policy();
+    p.assets = soroban_sdk::vec![&h.env, h.guard.clone()];
+    expect_invalid(&p, "assets");
+
+    // protocols: the guard itself listed as an allowlisted protocol contract.
+    let mut p = h.base_policy();
+    let rule = ProtocolRule {
+        contract: h.guard.clone(),
+        fns: None,
+    };
+    p.protocols = soroban_sdk::vec![&h.env, rule];
+    expect_invalid(&p, "protocols");
+
+    // recipients: the guard transferring to itself — a no-op loop.
+    let mut p = h.base_policy();
+    p.recipients = soroban_sdk::vec![&h.env, h.guard.clone()];
+    expect_invalid(&p, "recipients");
+
+    // Sanity: the same env still installs a self-free policy cleanly, proving
+    // the rejections above came from the self-address rule and not from an
+    // unrelated validation defect in the harness.
+    client.set_policy(&h.base_policy());
+    assert!(client.policy().is_some());
+}
+
 #[test]
 fn error_and_block_reason_round_trip() {
     let all_errors = [
