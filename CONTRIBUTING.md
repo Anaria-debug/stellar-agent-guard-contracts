@@ -104,7 +104,12 @@ src/
   types.rs           # Policy model, storage keys, errors, parsed-call enum
   integration_tests.rs # Host-routed tests incl. real Ed25519 auth signatures
 examples/
-  agent_pubkey.rs    # Derive raw Ed25519 pubkey from a Stellar secret key
+  agent_pubkey.rs    # Derive raw Ed25519 pubkey (hex) from a Stellar secret key,
+                     #   off-chain only: deterministic SEP-0023/RFC 8032
+                     #   derivation, but it does NOT prove the agent runtime
+                     #   signs with that key (see the file's trust-boundary docs)
+  agent-loop.md      # Narrative example of the 24/7 agent runtime loop
+                     #   (heartbeat, pre-flight, blocked-reason handling, DMS)
 tools/
   agent-tx/          # Sign+submit helper for the custom-account address
 tests/fixtures/      # Real testnet evidence (tx hashes, contract IDs, events)
