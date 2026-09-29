@@ -157,6 +157,7 @@ starts the dead-man-switch clock at install time (a fresh policy gets full grace
 | `assets` | `Vec<Address>` | SAC token contracts whose transfers get parsed and enforced |
 | `protocols` | `Vec<ProtocolRule>` | allowlisted non-asset contracts (`contract` + optional `fns: Option<Vec<Symbol>>`) |
 | `recipients` | `Vec<Address>` | allowed SAC transfer destinations |
+| `recipient_window_caps` | `Vec<RecipientCap>` | per-recipient rolling-window cap overrides; recipients not listed use the global `window_cap` |
 | `allow_any_recipient` | `bool` | escape hatch: skip the recipient allowlist (caps still apply) |
 | `active_from` / `active_until` | `u64` | active window (unix seconds); `0` = unrestricted |
 | `paused` | `bool` | admin kill switch |
@@ -176,9 +177,12 @@ stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3
     "window_cap": "150", "window_secs": 60 }'
 # → Event: EventPolicySet (event_policy_set)
 ```
-Other validation rules (SPEC §8): negative caps, `window_cap > 0` with `window_secs == 0`,
-duplicate assets/recipients/protocol contracts, empty per-protocol fn lists, or the
-self-address in `assets`/`protocols`/`recipients` all fail with `InvalidConfig`.
+Other validation rules (SPEC §8): negative caps, `window_cap > 0` or a positive
+`recipient_window_caps` entry with `window_secs == 0`, duplicate
+assets/recipients/protocol contracts, duplicate recipients in
+`recipient_window_caps`, more than 256 recipients or per-recipient cap entries,
+empty per-protocol fn lists, or the self-address in
+`assets`/`protocols`/`recipients` all fail with `InvalidConfig`.
 
 **Not sure where to start?** Copy-paste presets for common operator personas —
 day-trader agent, payments bot, watch-only + heartbeat, max security — each with
