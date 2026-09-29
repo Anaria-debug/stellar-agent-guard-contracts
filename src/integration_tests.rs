@@ -173,6 +173,7 @@ impl Harness {
             protocols: soroban_sdk::Vec::new(&self.env),
             recipients: soroban_sdk::vec![&self.env, self.recv.clone()],
             recipient_window_caps: soroban_sdk::Vec::new(&self.env),
+            blocked_recipients: soroban_sdk::Vec::new(&self.env),
             allow_any_recipient: false,
             active_from: 0,
             active_until: 0,
@@ -635,6 +636,44 @@ fn recipient_allowlist_blocked() {
 }
 
 #[test]
+fn blocked_recipient_wins_over_escape_hatch() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let other = h.other.clone();
+    let mut p = h.base_policy();
+    // With the escape hatch on, any recipient would be allowed — except the
+    // explicit denylist. `other` is neither allowed nor in the blocklist by
+    // default, so it would pass under `allow_any_recipient`.
+    p.allow_any_recipient = true;
+    p.blocked_recipients = soroban_sdk::vec![&h.env, other.clone()];
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // Denylist beats the escape hatch.
+    h.transfer_expect_blocked(&other, 5);
+    // Non-blocked recipients still pass through the escape hatch.
+    h.transfer(&recv, 5);
+}
+
+#[test]
+fn blocked_recipients_contradiction_rejected_at_set_policy() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    let mut p = h.base_policy();
+    p.recipients = soroban_sdk::vec![&h.env, h.recv.clone(), h.other.clone()];
+    p.blocked_recipients = soroban_sdk::vec![&h.env, h.other.clone()];
+
+    h.env.mock_all_auths();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_policy(&p);
+    }));
+    assert!(
+        res.is_err(),
+        "contradictory recipient config must be rejected"
+    );
+}
+
+#[test]
 fn allow_any_recipient_escape_hatch_still_capped() {
     let mut h = Harness::new();
     let other = h.other.clone();
@@ -994,6 +1033,7 @@ fn error_and_block_reason_round_trip() {
         GuardError::OutsideActiveWindow,
         GuardError::AssetNotAllowed,
         GuardError::RecipientNotAllowed,
+        GuardError::RecipientBlocked,
         GuardError::PerTxCapExceeded,
         GuardError::WindowCapExceeded,
         GuardError::ProtocolNotAllowed,
@@ -1107,6 +1147,7 @@ fn policy_config_debug_snapshot() {
                 cap: 10_000,
             },
         ],
+        blocked_recipients: vec![&env],
         allow_any_recipient: false,
         active_from: 1_700_000_000,
         active_until: 1_800_000_000,
@@ -1124,6 +1165,7 @@ fn policy_config_debug_snapshot() {
         "protocols",
         "recipients",
         "recipient_window_caps",
+        "blocked_recipients",
         "allow_any_recipient",
         "active_from",
         "active_until",

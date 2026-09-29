@@ -82,6 +82,9 @@ pub struct PolicyConfig {
     /// Per-recipient rolling-window cap overrides; recipients not listed here
     /// use the global `window_cap`. Storage bounded by `MAX_RECIPIENT_ENTRIES`.
     pub recipient_window_caps: Vec<RecipientCap>,
+    /// Denied SAC transfer destinations. Checked before the allowlist and
+    /// before `allow_any_recipient`; an empty list leaves behavior unchanged.
+    pub blocked_recipients: Vec<Address>,
     /// Escape hatch: skip the recipient allowlist (caps still apply).
     pub allow_any_recipient: bool,
     /// Active window start (unix seconds); 0 = unrestricted.
@@ -112,6 +115,7 @@ impl core::fmt::Debug for PolicyConfig {
             .field("protocols", &self.protocols)
             .field("recipients", &self.recipients)
             .field("recipient_window_caps", &self.recipient_window_caps)
+            .field("blocked_recipients", &self.blocked_recipients)
             .field("allow_any_recipient", &self.allow_any_recipient)
             .field("active_from", &self.active_from)
             .field("active_until", &self.active_until)
@@ -196,6 +200,7 @@ impl Error {
             Self::OutsideActiveWindow,
             Self::AssetNotAllowed,
             Self::RecipientNotAllowed,
+            Self::RecipientBlocked,
             Self::PerTxCapExceeded,
             Self::WindowCapExceeded,
             Self::ProtocolNotAllowed,
@@ -274,6 +279,7 @@ pub enum Error {
     UnknownContract = 26,
     SelfFunctionNotAllowed = 27,
     CreateContractNotAllowed = 28,
+    RecipientBlocked = 29,
 }
 
 impl Error {
@@ -293,6 +299,7 @@ impl Error {
             Self::OutsideActiveWindow => "outside_active_window",
             Self::AssetNotAllowed => "asset_not_allowed",
             Self::RecipientNotAllowed => "recipient_not_allowed",
+            Self::RecipientBlocked => "recipient_blocked",
             Self::PerTxCapExceeded => "per_tx_cap_exceeded",
             Self::WindowCapExceeded => "window_cap_exceeded",
             Self::ProtocolNotAllowed => "protocol_not_allowed",

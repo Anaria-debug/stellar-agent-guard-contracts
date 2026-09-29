@@ -325,6 +325,7 @@ fn audit_event_payloads_and_topics() {
         protocols: vec![&h.env],
         recipients: vec![&h.env],
         recipient_window_caps: vec![&h.env],
+        blocked_recipients: vec![&h.env],
         allow_any_recipient: false,
         active_from: 0,
         active_until: 0,

@@ -136,6 +136,7 @@ pub struct PolicyConfig {
     pub protocols: Vec<ProtocolRule>,        // allowlisted non-asset contracts the account may call
     pub recipients: Vec<Address>,            // allowed SAC transfer destinations
     pub recipient_window_caps: Vec<RecipientCap>, // per-recipient rolling cap overrides; 0 = fall back to global
+    pub blocked_recipients: Vec<Address>,    // denied SAC transfer destinations (checked first)
     pub allow_any_recipient: bool,           // escape hatch: skip recipient allowlist (still capped)
     pub active_from: u64,                    // unix seconds; 0 = no restriction
     pub active_until: u64,                   // unix seconds; 0 = no restriction
@@ -336,12 +337,15 @@ calls whose semantics and arguments are known:
 
 **Exact arity required; extra args deny -- we do not partially parse.** A call whose argument list does not match the SAC schema exactly (`transfer` = 3, `transfer_from` = 4) is rejected with `UnknownContract` and never reaches the cap/allowlist evaluation. We only enforce what we fully understand; a context carrying extra trailing values is treated as a call we cannot reason about (conservative default-deny).
 
-Rules applied:
+Rules applied (in order; the denylist is checked before the allowlist/escape hatch):
 
-1. **Recipient allowlist:** if `allow_any_recipient == false`, `recipient ∈ policy.recipients`
+1. **Recipient denylist:** if `recipient ∈ policy.blocked_recipients`, block
+   `RecipientBlocked`. The denylist wins over both the allowlist and
+   `allow_any_recipient`.
+2. **Recipient allowlist:** if `allow_any_recipient == false`, `recipient ∈ policy.recipients`
    or block `RecipientNotAllowed`.
-2. **Per-tx cap:** if `per_tx_cap != 0`, `amount <= per_tx_cap` or block `PerTxCapExceeded`.
-3. **Rolling window (§3.1):**
+3. **Per-tx cap:** if `per_tx_cap != 0`, `amount <= per_tx_cap` or block `PerTxCapExceeded`.
+4. **Rolling window (§3.1):**
    - Global window: if `window_cap != 0`, prune expired entries, then
      `total + amount <= window_cap` or block `WindowCapExceeded`.
    - Per-recipient window: if `recipient` has an entry in `policy.recipient_window_caps` with
@@ -349,7 +353,7 @@ Rules applied:
      the global window cap. If the effective cap is exceeded, block `WindowCapExceeded`.
    - On admission, update the global ledger and, when a per-recipient cap applies, the
      recipient's ledger.
-4. Amount validity: `amount > 0` or block `InvalidAmount`.
+5. Amount validity: `amount > 0` or block `InvalidAmount`.
 
 An asset contract listed in `assets` invoked with any other function (e.g. `mint`, `burn`,
 `set_admin`, `clawback` — none of which the account should ever call as authorizer) is blocked
@@ -435,7 +439,8 @@ To close the CheckResult/Error duality gap, every contract `Error` variant maps 
 | 25 | `FunctionNotAllowed` | `function_not_allowed` | No | Auth-path only: restricted functions apply to auth contexts, not `check()`. |
 | 26 | `UnknownContract` | `unknown_contract` | No | Auth-path only: unlisted contracts are encountered in auth contexts. |
 | 27 | `SelfFunctionNotAllowed` | `self_function_not_allowed` | No | Auth-path only: self-calls are part of `__check_auth` context dispatch. |
-| 28 | `CreateContractNotAllowed` | `create_contract_not_allowed` | No | Auth-path only: contract creation host functions occur in auth contexts.
+| 28 | `CreateContractNotAllowed` | `create_contract_not_allowed` | No | Auth-path only: contract creation host functions occur in auth contexts. |
+| 29 | `RecipientBlocked` | `recipient_blocked` | Yes | Recipient is on the explicit denylist.
 
 // ── Policy management (admin only) ────────────────────────────────────────
 pub fn set_policy(env: Env, config: PolicyConfig)
@@ -523,6 +528,7 @@ pub enum Error {            // values stable; see tests/fixtures
     WindowCapExceeded = 23, ProtocolNotAllowed = 24, FunctionNotAllowed = 25,
     UnknownContract = 26, SelfFunctionNotAllowed = 27,
     CreateContractNotAllowed = 28,
+    RecipientBlocked = 29,
 }
 ```
 
@@ -553,20 +559,24 @@ equals the configured cap.
 - Assets, protocols, recipients, and per-protocol fn lists must be non-empty for their
   respective vectors to matter (empty `assets` = no SAC transfer is ever allowed; empty
   `recipients` with `allow_any_recipient == false` = no recipient allowed).
-- Duplicate addresses within a list are rejected (`assets`, `recipients`, `protocols`).
+- Duplicate addresses within a list are rejected (`assets`, `recipients`,
+  `blocked_recipients`, `protocols`).
 - Duplicate recipients within `recipient_window_caps` are rejected.
-- `recipients` and `recipient_window_caps` are each bounded to `MAX_RECIPIENT_ENTRIES` (256)
-  entries to keep allowlist scans and per-recipient storage predictable.
-- The contract's own address may not appear in **any** of the three address lists:
+- `recipients`, `blocked_recipients`, and `recipient_window_caps` are each bounded to
+  `MAX_RECIPIENT_ENTRIES` (256) entries to keep allowlist/denylist scans and
+  per-recipient storage predictable.
+- `recipients` and `blocked_recipients` must not intersect — a contradictory config is
+  rejected.
+- The contract's own address may not appear in **any** of the address lists:
   - `assets` — the guard is not an SAC; self-calls are governed by the fixed §6.1 rule, not
     by policy, so a self-entry would be a nonsensical allowlist.
   - `protocols` — same: allowlisting the account to call itself through the policy path is
     meaningless (and §6.1 already decides what self-calls are allowed).
-  - `recipients` — the account paying itself is a no-op loop (a self-debit/re-credit of the
-    same SAC balance) with no purpose; allowing it adds no capability while making a
-    mis-pasted recipient address look like a deliberate policy. Rejected (recommended:
-    catches typos) rather than allowed-with-documentation. The same rule applies to
-    `recipient_window_caps` entries.
+  - `recipients` and `blocked_recipients` — the account paying itself is a no-op loop (a
+    self-debit/re-credit of the same SAC balance) with no purpose; allowing it adds no
+    capability while making a mis-pasted recipient address look like a deliberate policy.
+    Rejected (recommended: catches typos) rather than allowed-with-documentation.
+  - The same rule applies to `recipient_window_caps` entries.
   The self-address is known pre-`initialize` (`env.current_contract_address()` is a
   deployment-time constant), and `set_policy` can only run post-initialize, so the check
   always compares against the real deployed contract ID.
