@@ -493,6 +493,12 @@ disabled; v1 has no per-asset overrides, so effective caps equal configured caps
 
 ## 8. Config validation (`set_policy`)
 
+> **Starter configs.** Copy-paste `PolicyConfig` presets for common operator personas
+> (day-trader, payments bot, watch-only, max security) — each with rationale, explicit
+> "what it does NOT protect against", and unaudited/mainnet/DMS-grace warnings — are in
+> [`docs/policy-templates.md`](docs/policy-templates.md). A CI test installs every preset
+> documented there, so the examples cannot rot into invalid configs.
+
 - All amounts `>= 0`; `window_secs` and `dms_grace_secs` are `u64` (no negatives possible).
 - `window_cap != 0` requires `window_secs != 0`.
 - `active_until == 0 || active_until > active_from`.

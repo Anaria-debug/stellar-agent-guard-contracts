@@ -180,6 +180,12 @@ Other validation rules (SPEC §8): negative caps, `window_cap > 0` with `window_
 duplicate assets/recipients/protocol contracts, empty per-protocol fn lists, or the
 self-address in `assets`/`protocols`/`recipients` all fail with `InvalidConfig`.
 
+**Not sure where to start?** Copy-paste presets for common operator personas —
+day-trader agent, payments bot, watch-only + heartbeat, max security — each with
+rationale, explicit "what it does NOT protect against", and unaudited/mainnet/DMS-grace
+warnings, are in [`docs/policy-templates.md`](docs/policy-templates.md). A CI test
+installs every preset documented there, so the examples stay valid.
+
 ### `revoke_policy`
 ```rust
 pub fn revoke_policy(env: Env)
@@ -549,6 +555,10 @@ Stellar Agent Guard operates across three dedicated repositories:
 - `examples/agent-loop.md` — the steady-state **24/7 agent runtime loop**: heartbeat
   cadence formula (`interval ≤ grace / 3`), pre-flight `check()`, blocked-reason
   handling table, and stop conditions, with tested `agent-tx` commands.
+- `docs/policy-templates.md` — copy-paste **policy presets** for common operator
+  personas (day-trader, payments bot, watch-only, max security), each with rationale
+  and explicit "what it does NOT protect against"; kept installable by
+  `src/policy_preset_tests.rs`, which installs every preset via `set_policy` in CI.
 - `tests/fixtures/README.md` — the real testnet evidence for the five scenarios,
   with a machine-readable scenario index in
   [`tests/fixtures/index.json`](tests/fixtures/index.json) (scenario → tx hash →

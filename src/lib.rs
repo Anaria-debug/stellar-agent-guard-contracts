@@ -21,6 +21,9 @@ mod window;
 #[cfg(test)]
 mod integration_tests;
 
+#[cfg(test)]
+mod policy_preset_tests;
+
 use engine::{cap_metrics, contains_addr, decide, AccountState, Decision};
 use soroban_sdk::auth::{Context, ContractContext, CustomAccountInterface};
 use soroban_sdk::{
