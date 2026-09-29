@@ -442,11 +442,21 @@ impl PolicyEngine {
     /// Pre-flight decision plus current cap headroom for the targeted asset.
     /// This path only reads storage, mutates a local ledger copy, and emits
     /// exactly the same `auth_checked` event as `check`.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the policy engine's `decide` evaluation returns an empty list of verdicts.
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail {
         let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
             emit_auth(&env, false, Some(Error::NoPolicy), 0);
-            return CheckResult::Blocked(Symbol::new(&env, Error::NoPolicy.reason()));
+            return CheckDetail {
+                result: CheckResult::Blocked(Symbol::new(&env, Error::NoPolicy.reason())),
+                remaining_window: None,
+                per_tx_cap: None,
+                effective_per_tx_cap: None,
+                effective_window_cap: None,
+            };
         };
         let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
         let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
@@ -471,7 +481,7 @@ impl PolicyEngine {
             now,
             vec![&env, call],
         );
-        match verdicts.first().unwrap() {
+        let result = match verdicts.first().unwrap() {
             Decision::Allowed => {
                 emit_auth(&env, true, None, 0);
                 CheckResult::Allowed

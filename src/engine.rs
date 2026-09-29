@@ -741,7 +741,10 @@ mod tests {
         let mut l = Ledger::empty(&env);
         let ctx = vec![&env, transfer_ctx_with_extra_args(&env, 1, 2, 5, 1)];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
-        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
     }
 
     #[test]
@@ -762,7 +765,10 @@ mod tests {
             }),
         ];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
-        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
     }
 
     #[test]
@@ -773,7 +779,10 @@ mod tests {
         let mut l = Ledger::empty(&env);
         let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 5)];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
-        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
     }
 
     #[test]
@@ -784,7 +793,10 @@ mod tests {
         let mut l = Ledger::empty(&env);
         let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 3)];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
-        assert!(matches!(d, Decision::Blocked(Error::UnknownContract)));
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
     }
 
     #[test]
@@ -795,6 +807,6 @@ mod tests {
         let mut l = Ledger::empty(&env);
         let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 4)];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
-        assert!(matches!(d, Decision::Allowed));
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
     }
 }
