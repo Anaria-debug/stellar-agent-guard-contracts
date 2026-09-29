@@ -96,7 +96,7 @@ This boundary is an inherent property of the platform (the auth context does not
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 30 tests, isolated (no network)
+cargo test                                      # 45 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only)
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
@@ -254,6 +254,14 @@ pub fn unfreeze(env: Env)    // admin only — clears AdminFrozen, LastHeartbeat
 `unfreeze` is the admin's liveness attestation that revives a dead-man-frozen account.
 Both are admin-only (`require_auth(Admin)`). Verified live (simulation): `freeze` emits
 `EventFrozen`, `unfreeze` emits `EventUnfrozen`.
+
+> ⚠️ **`unfreeze` re-arms the dead-man switch.** One call does two jobs: it clears
+> `AdminFrozen` *and* sets `LastHeartbeat = now` on the admin's authority. If the DMS
+> grace had already elapsed when you unfreeze, you have just silently restarted the
+> liveness clock — the account will not self-freeze again until the grace lapses once
+> more. The emitted `event_unfrozen` carries `rearmed_dms: bool` (`true` = the call
+> changed `LastHeartbeat`, i.e. the clock was re-armed; `false` = it was already
+> `now`) so telemetry and audits can surface exactly that side effect. See [SPEC §5](SPEC.md#5-dead-man-switch--precise-definition).
 
 The real Phase-1 unfreeze — the DMS-reversal transaction verified on-chain (tx
 `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5`):
@@ -569,11 +577,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-30 tests (unit + integration) cover the policy decision engine — including the regression
+45 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `30 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `45 passed; 0 failed`.
 
 ```bash
 cargo test
