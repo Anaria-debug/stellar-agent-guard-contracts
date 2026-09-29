@@ -1085,10 +1085,7 @@ fn admin_rotation_old_admin_replay_fails() {
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&next_admin);
     }));
-    assert!(
-        res.is_err(),
-        "old-admin proposal must fail after handover"
-    );
+    assert!(res.is_err(), "old-admin proposal must fail after handover");
 
     // The new admin is authoritative.
     h.env.mock_all_auths();
@@ -1194,8 +1191,7 @@ fn admin_rotation_self_proposal_overwrite_and_cancel() {
     let second = Address::generate(&h.env);
     client.propose_admin_rotation(&first);
     client.propose_admin_rotation(&second);
-    let (by, proposed) =
-        h.admin_rotation_event("event_admin_rotation_proposed", "by", "proposed");
+    let (by, proposed) = h.admin_rotation_event("event_admin_rotation_proposed", "by", "proposed");
     assert_eq!(by, addr_val(&old_admin));
     assert_eq!(proposed, addr_val(&second));
     client.confirm_admin_rotation();
