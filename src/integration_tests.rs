@@ -1026,25 +1026,28 @@ fn admin_rotation_two_step_handover_keeps_policy_and_agent() {
 
     // Step 1: the current admin proposes. Nothing changes yet — the old admin
     // stays fully authoritative, so a typo'd proposal locks out nothing.
+    // NOTE: the event lookup must come before any other host call
+    // (`stored_admins` included): the test env reports only the most recent
+    // top-level call's events.
     h.env.mock_all_auths();
     PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&new_admin);
-    let (stored, pending) = h.stored_admins();
-    assert_eq!(stored, Some(old_admin.clone()));
-    assert_eq!(pending, Some(new_admin.clone()));
     let (by, proposed) = h.admin_rotation_event("event_admin_rotation_proposed", "by", "proposed");
     assert_eq!(by, addr_val(&old_admin));
     assert_eq!(proposed, addr_val(&new_admin));
+    let (stored, pending) = h.stored_admins();
+    assert_eq!(stored, Some(old_admin.clone()));
+    assert_eq!(pending, Some(new_admin.clone()));
 
     // Step 2: the pending admin confirms (mocked auth stands in for the new
     // key's signature). Authority flips atomically; the slot is cleared.
     h.env.mock_all_auths();
     PolicyEngineClient::new(&h.env, &h.guard).confirm_admin_rotation();
-    let (stored, pending) = h.stored_admins();
-    assert_eq!(stored, Some(new_admin.clone()));
-    assert!(pending.is_none());
     let (old, new) = h.admin_rotation_event("event_admin_rotated", "old", "new");
     assert_eq!(old, addr_val(&old_admin));
     assert_eq!(new, addr_val(&new_admin));
+    let (stored, pending) = h.stored_admins();
+    assert_eq!(stored, Some(new_admin.clone()));
+    assert!(pending.is_none());
 
     // In-flight policy is untouched: same policy, same revision — and the
     // registered agent key still spends, proving the handover moved no
