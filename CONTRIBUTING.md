@@ -13,7 +13,7 @@ We welcome contributions! Here's how to get started.
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 
-# Run tests (30 unit + integration tests, no network needed)
+# Run tests (31 unit + integration tests, no network needed)
 cargo test
 
 # Lint (clippy all + pedantic are denied via [lints.clippy])
@@ -29,6 +29,23 @@ cargo build --release --target wasm32v1-none
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
 
+The `stellar` CLI cannot sign Soroban authorization entries whose address is a
+contract. Heartbeat testing uses the guard contract's own address, so the CLI
+cannot submit a heartbeat; use `agent-tx` for this path. See the
+[`agent-tx` usage guide](tools/agent-tx/README.md) for commands and options.
+
+## Clean Build Artifacts
+
+```bash
+# Clean root workspace (contract + all members)
+cargo clean
+
+# Clean agent-tx tool specifically
+cargo clean --manifest-path tools/agent-tx/Cargo.toml
+```
+
+This removes all `target/` directories and `*.wasm` artifacts. The `.gitignore` is configured to exclude these from version control.
+
 ## Coding Standards
 
 1. **No `unwrap()` / `expect()` / indexing without bounds in contract code** —
@@ -36,9 +53,15 @@ cargo build --release --manifest-path tools/agent-tx/Cargo.toml
    authorization path must be deliberate `panic_with_error!` calls that surface
    as stable `Error` reasons (SPEC §7), never accidental traps.
 2. **Every policy change must update SPEC.md and the tests together** — the
-   decision table (SPEC §4/§6) and the enforcement-scope statement (SPEC §2 /
-   README) must stay word-for-word consistent with the code; that consistency is
-   a review requirement, not a nicety.
+   decision table (SPEC §4/§6) and the enforcement-scope statement (SPEC §2)
+   must stay word-for-word consistent with the code; that consistency is
+   a review requirement, not a nicety. Scope *wording* itself is single-sourced:
+   edit the canonical paragraph in SPEC §2 only — the README and
+   `docs/enforcement-scope.md` carry short excerpts plus a
+   `full statement: SPEC §2` link that auto-follows (re-sync an excerpt only if
+   the quoted sentence itself changes). Copies in sibling repositories
+   (`stellar-agent-guard-sdk`, `stellar-agent-guard-dashboard`) are out of scope
+   here; they are tracked in their own issue trackers.
 3. **`clippy::all` and `clippy::pedantic` clean** — enforced in CI with
    `-D warnings`.
 4. **`cargo fmt` clean** — enforced in CI.
@@ -47,7 +70,13 @@ cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 6. **Testnet-proof pattern:** behavior that changes what `__check_auth` admits
    or blocks should add a unit/integration test **and**, where it is a user-
    visible enforcement change, be recorded in the testnet proof plan
-   (`tests/fixtures/README.md`) per the Phase-1 exit-criteria pattern.
+   (`tests/fixtures/README.md` **and** its machine-readable twin
+   `tests/fixtures/index.json`) per the Phase-1 exit-criteria pattern. The two
+   files are cross-checked by `tests/fixtures_index.rs`, so editing one without
+   the other fails `cargo test`.
+7. **Denial-reason messages:** `docs/reason-glossary.md` is the canonical
+   message-content source for SDK/UI work — map new user-facing denial text to
+   its agent/operator/auditor columns instead of inventing new phrasing.
 
 ## Commit Discipline (strict)
 
@@ -70,6 +99,14 @@ cargo build --release --manifest-path tools/agent-tx/Cargo.toml
    and — for enforcement changes — how it was verified (tests, and testnet
    evidence where applicable).
 
+## Keeping your PR mergeable
+
+This repo has a security-sensitive backlog and several PRs touching `engine.rs` in parallel; merge conflicts pile up fast. Keep your branch cheap to rebase:
+
+- **One logical unit per PR.** A bug fix, a doc change, a workflow --- each its own branch and PR. Small branches have a small conflict surface.
+- **Rebase onto `main` early and often**, not just once before opening the PR.
+- **Draft PRs get a nudge, not a close.** A draft that hasn't moved in 14 days gets a warning comment; if it's still stalled 7 days later it's closed (see `.github/workflows/stale.yml`). Issues are never auto-closed --- the backlog is curated by maintainers.
+
 ## Project Structure
 
 ```
@@ -80,7 +117,12 @@ src/
   types.rs           # Policy model, storage keys, errors, parsed-call enum
   integration_tests.rs # Host-routed tests incl. real Ed25519 auth signatures
 examples/
-  agent_pubkey.rs    # Derive raw Ed25519 pubkey from a Stellar secret key
+  agent_pubkey.rs    # Derive raw Ed25519 pubkey (hex) from a Stellar secret key,
+                     #   off-chain only: deterministic SEP-0023/RFC 8032
+                     #   derivation, but it does NOT prove the agent runtime
+                     #   signs with that key (see the file's trust-boundary docs)
+  agent-loop.md      # Narrative example of the 24/7 agent runtime loop
+                     #   (heartbeat, pre-flight, blocked-reason handling, DMS)
 tools/
   agent-tx/          # Sign+submit helper for the custom-account address
 tests/fixtures/      # Real testnet evidence (tx hashes, contract IDs, events)
@@ -93,3 +135,10 @@ Scoped issues with Summary / Acceptance Criteria / Tech Stack live in the
 [issue tracker](https://github.com/aigbagbobila/stellar-agent-guard-contracts/issues);
 each carries one `complexity: trivial|small|medium|large` label. Good first
 tasks for the Drips Stellar Wave contributor sprints.
+
+## Dependency drift check
+
+When bumping `soroban-sdk` version in `Cargo.toml`, you **must** re-verify
+SPEC §1.1 quotes against the new SDK source (`src/auth.rs`, `src/custom_account.rs`).
+Update the version comment in `Cargo.toml` and the SPEC §1.1 header accordingly.
+This is the mechanical ratchet preventing silent auth-semantics drift.

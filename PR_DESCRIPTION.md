@@ -1,18 +1,15 @@
 # Description
 
-Closes #40
+Closes #21
 
-This PR adds a permissionless helper `refresh_deadman` that allows anyone to explicitly record and emit an event (`dms_auto_frozen`) when the dead-man switch has expired. Because the dead-man switch is deliberately lazy, the account previously became frozen silently without any on-chain event. This helper provides observability for operators.
+This PR verifies that rejected SAC transfers never mutate rolling-window state, including invalid amounts rejected in per-context enforcement.
 
 ### Changes
-*   **Types:** Added `AutoFrozenAt` to `DataKey` in `src/types.rs`.
-*   **Lib:** Added `EventDmsAutoFrozen` and `refresh_deadman()` to explicitly record `AutoFrozenAt` and emit `dms_auto_frozen` if the grace has elapsed.
-*   **SPEC:** Updated §3, §5, §7, and §9 to document the new `refresh_deadman` visibility mechanism, noting that it does not weaken the core lazy evaluation (rule #2).
-*   **Tests:** Added `refresh_deadman_records_auto_freeze_and_emits_event` to verify the no-op behavior when not expired, and correct recording and emitting when expired.
+* **Tests:** Added zero and negative amount cases that assert `InvalidAmount` and compare the complete ledger against its pre-call snapshot.
+* **Regression coverage:** Reused full-ledger snapshot assertions for per-transaction cap, rolling-window cap, and recipient-denied rejections.
 
 ### Acceptance Criteria Checklist
-- [x] Design note in SPEC §5: mechanism, why it doesn't weaken freeze semantics, auth placement.
-- [x] Implementation + tests: silent expiry → helper call records + emits → subsequent spends still blocked identically. Helper no-ops when not expired.
-- [x] No change to the rule #2 truth: expiry requires no flag to take effect.
-- [x] Lint, type-check, and tests all pass locally.
-- [x] PR description references the issue (Closes #40).
+- [x] Amounts 0 and < 0 return `InvalidAmount` without changing window state.
+- [x] Cap-exceeded and recipient-denied cases assert unchanged ledger state.
+- [ ] Formatting, lint, type-check, and tests pass locally.
+- [x] PR description references the issue (Closes #21).
