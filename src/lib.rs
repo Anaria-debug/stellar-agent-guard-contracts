@@ -1,4 +1,5 @@
 #![no_std]
+#![deny(missing_docs)]
 
 //! stellar-agent-guard-contracts — a Soroban **custom account** that enforces
 //! agent spend policy inside `__check_auth`. See SPEC.md.
@@ -36,75 +37,83 @@ pub use types::{
 use types::{CheckResult, DataKey, Status, WindowState, MAX_RECIPIENT_ENTRIES};
 use window::Ledger;
 
-// ── Contract events (SPEC §9). Each event is its own type; topic layout
-//    follows the SPEC table exactly so the Phase-2 listener can filter on one
-//    vocabulary without decoding payloads it does not need.
+mod event_types {
+    #![allow(missing_docs)] // Soroban contractevent emits undocumented static metadata.
 
-/// Every decision: topic[0]=result (`allowed`/`blocked`), topic[1]=reason.
-#[contractevent]
-#[derive(Clone)]
-struct EventAuthChecked {
-    #[topic]
-    result: Symbol,
-    #[topic]
-    reason: Symbol,
-    context_index: u32,
+    use super::*;
+
+    // ── Contract events (SPEC §9). Each event is its own type; topic layout
+    //    follows the SPEC table exactly so the Phase-2 listener can filter on one
+    //    vocabulary without decoding payloads it does not need.
+
+    /// Every decision: topic[0]=result (`allowed`/`blocked`), topic[1]=reason.
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventAuthChecked {
+        #[topic]
+        pub(super) result: Symbol,
+        #[topic]
+        pub(super) reason: Symbol,
+        pub(super) context_index: u32,
+    }
+
+    /// Agent heartbeat: data `at` (unix seconds).
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventHeartbeat {
+        pub(super) at: u64,
+    }
+
+    /// Admin lifecycle events: data `by` (the admin address that acted).
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventInitialized {
+        pub(super) by: Address,
+    }
+
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventFrozen {
+        pub(super) by: Address,
+    }
+
+    /// Admin unfreeze: data `by` (the admin address that acted) plus
+    /// `rearmed_dms: bool` — whether the call also re-armed the dead-man-switch
+    /// clock by changing `LastHeartbeat` (SPEC §5: the admin's signature is the
+    /// liveness attestation, so an unfreeze of a DMS-expired account silently
+    /// restarts the grace window; the flag makes that side effect auditable).
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventUnfrozen {
+        pub(super) by: Address,
+        pub(super) rearmed_dms: bool,
+    }
+
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventPolicySet {
+        pub(super) by: Address,
+    }
+
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventPolicyRevoked {
+        pub(super) by: Address,
+    }
+
+    /// Agent key rotation: data `by` (the admin that acted) plus truncated
+    /// fingerprints of the outgoing and incoming agent keys, so an auditor can
+    /// reconstruct the old→new linkage without carrying full pubkeys (SPEC §9).
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventAgentRotated {
+        pub(super) by: Address,
+        pub(super) old_fingerprint: BytesN<8>,
+        pub(super) new_fingerprint: BytesN<8>,
+    }
 }
 
-/// Agent heartbeat: data `at` (unix seconds).
-#[contractevent]
-#[derive(Clone)]
-struct EventHeartbeat {
-    at: u64,
-}
-
-/// Admin lifecycle events: data `by` (the admin address that acted).
-#[contractevent]
-#[derive(Clone)]
-struct EventInitialized {
-    by: Address,
-}
-
-#[contractevent]
-#[derive(Clone)]
-struct EventFrozen {
-    by: Address,
-}
-
-/// Admin unfreeze: data `by` (the admin address that acted) plus
-/// `rearmed_dms: bool` — whether the call also re-armed the dead-man-switch
-/// clock by changing `LastHeartbeat` (SPEC §5: the admin's signature is the
-/// liveness attestation, so an unfreeze of a DMS-expired account silently
-/// restarts the grace window; the flag makes that side effect auditable).
-#[contractevent]
-#[derive(Clone)]
-struct EventUnfrozen {
-    by: Address,
-    rearmed_dms: bool,
-}
-
-#[contractevent]
-#[derive(Clone)]
-struct EventPolicySet {
-    by: Address,
-}
-
-#[contractevent]
-#[derive(Clone)]
-struct EventPolicyRevoked {
-    by: Address,
-}
-
-/// Agent key rotation: data `by` (the admin that acted) plus truncated
-/// fingerprints of the outgoing and incoming agent keys, so an auditor can
-/// reconstruct the old→new linkage without carrying full pubkeys (SPEC §9).
-#[contractevent]
-#[derive(Clone)]
-struct EventAgentRotated {
-    by: Address,
-    old_fingerprint: BytesN<8>,
-    new_fingerprint: BytesN<8>,
-}
+use event_types::*;
 
 // ── Persistent-storage helpers (SPEC §3) ────────────────────────────────
 // Admin / AgentPubkey / Initialized live in instance storage (auto-TTL on
@@ -346,371 +355,420 @@ fn emit_agent_rotated(env: &Env, by: &Address, old: &BytesN<32>, new: &BytesN<32
 
 // ── Contract ─────────────────────────────────────────────────────────────
 
-#[contract]
-pub struct PolicyEngine;
+// Soroban macros emit undocumented ABI metadata. Keep their lint exception
+// scoped to this module, with contract types and implementations co-located.
+mod policy_engine_type {
+    #![allow(missing_docs)]
+    use super::*;
 
-#[contractimpl]
-#[allow(clippy::needless_pass_by_value)] // contract ABI requires owned args
-impl PolicyEngine {
-    // ── Lifecycle ────────────────────────────────────────────────────────
+    /// Soroban custom account that enforces an agent's configured spending policy.
+    #[contract]
+    pub struct PolicyEngine;
 
-    /// Registers the policy `admin` and the agent's Ed25519 public key.
-    /// One-time; the account is default-deny until a policy is installed.
-    pub fn initialize(env: Env, admin: Address, agent_pubkey: BytesN<32>) {
-        let already: Option<bool> = env.storage().instance().get(&DataKey::Initialized);
-        if already.unwrap_or(false) {
-            panic_with_error!(&env, Error::AlreadyInitialized);
-        }
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::AgentPubkey, &agent_pubkey);
-        env.storage().instance().set(&DataKey::Initialized, &true);
-        persist_set(&env, &DataKey::AdminFrozen, &false);
-        persist_set(&env, &DataKey::LastHeartbeat, &0u64);
-        emit_initialized(&env, &admin);
-    }
+    #[contractimpl]
+    #[allow(clippy::needless_pass_by_value)] // contract ABI requires owned args
+    impl PolicyEngine {
+        // ── Lifecycle ────────────────────────────────────────────────────────
 
-    // ── Policy management (admin only) ───────────────────────────────────
-
-    fn admin_or_panic(env: &Env) -> Address {
-        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
-        match admin {
-            Some(a) => {
-                a.require_auth();
-                a
+        /// Registers the policy `admin` and the agent's Ed25519 public key.
+        /// One-time; the account is default-deny until a policy is installed.
+        ///
+        /// # Authorization
+        /// Requires the admin address to authorize this one-time initialization.
+        pub fn initialize(env: Env, admin: Address, agent_pubkey: BytesN<32>) {
+            let already: Option<bool> = env.storage().instance().get(&DataKey::Initialized);
+            if already.unwrap_or(false) {
+                panic_with_error!(&env, Error::AlreadyInitialized);
             }
-            None => panic_with_error!(env, Error::NotInitialized),
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Admin, &admin);
+            env.storage()
+                .instance()
+                .set(&DataKey::AgentPubkey, &agent_pubkey);
+            env.storage().instance().set(&DataKey::Initialized, &true);
+            persist_set(&env, &DataKey::AdminFrozen, &false);
+            persist_set(&env, &DataKey::LastHeartbeat, &0u64);
+            emit_initialized(&env, &admin);
         }
-    }
 
-    /// Installs a new policy. Resets the rolling window and starts the
-    /// dead-man-switch clock at install time (a fresh policy gets full grace).
-    pub fn set_policy(env: Env, config: PolicyConfig) {
-        let admin = Self::admin_or_panic(&env);
-        validate_config(&env, &config).unwrap_or_else(|e| panic_with_error!(&env, e));
-        persist_set(&env, &DataKey::Policy, &config);
-        increment_revision(&env);
-        save_ledger(&env, &Ledger::empty(&env));
-        let now = env.ledger().timestamp();
-        persist_set(&env, &DataKey::LastHeartbeat, &now);
-        emit_policy_set(&env, &admin);
-    }
+        // ── Policy management (admin only) ───────────────────────────────────
 
-    /// Removes the policy and window → immediate default-deny.
-    pub fn revoke_policy(env: Env) {
-        let admin = Self::admin_or_panic(&env);
-        env.storage().persistent().remove(&DataKey::Policy);
-        env.storage().persistent().remove(&DataKey::Window);
-        increment_revision(&env);
-        emit_policy_revoked(&env, &admin);
-    }
-
-    /// Re-binds the agent's Ed25519 public key. Admin never gains fund-moving
-    /// power; it can only replace the key the account will authenticate.
-    pub fn rotate_agent_key(env: Env, new_pubkey: BytesN<32>) {
-        let admin = Self::admin_or_panic(&env);
-        // Post-initialize the key always exists; the fingerprint needs the old
-        // key before the storage slot is overwritten.
-        let old_pubkey: Option<BytesN<32>> = env.storage().instance().get(&DataKey::AgentPubkey);
-        let Some(old_pubkey) = old_pubkey else {
-            panic_with_error!(&env, Error::NotInitialized);
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::AgentPubkey, &new_pubkey);
-        emit_agent_rotated(&env, &admin, &old_pubkey, &new_pubkey);
-    }
-
-    // ── Dead-man switch / freeze (SPEC §5) ───────────────────────────────
-
-    /// Records a heartbeat. Routes through `__check_auth` (self-call): the
-    /// host verifies the registered agent's signature and the engine applies
-    /// the account gates, so a heartbeat after the grace window expired — or
-    /// while admin-frozen — is rejected.
-    pub fn heartbeat(env: Env) {
-        env.current_contract_address().require_auth();
-        let now = env.ledger().timestamp();
-        // Redundant same-second heartbeat: `LastHeartbeat` is already `now`, so
-        // the write (with its TTL extension) and the event carry no new
-        // information — the first heartbeat of this second already extended the
-        // entry's TTL. Skip both rather than pay for a no-op write (SPEC §5).
-        let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
-        if now == last {
-            return;
+        fn admin_or_panic(env: &Env) -> Address {
+            let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+            match admin {
+                Some(a) => {
+                    a.require_auth();
+                    a
+                }
+                None => panic_with_error!(env, Error::NotInitialized),
+            }
         }
-        persist_set(&env, &DataKey::LastHeartbeat, &now);
-        emit_heartbeat(&env, now);
-    }
 
-    pub fn freeze(env: Env) {
-        let admin = Self::admin_or_panic(&env);
-        persist_set(&env, &DataKey::AdminFrozen, &true);
-        emit_frozen(&env, &admin);
-    }
-
-    /// Admin liveness attestation: clears the admin freeze and restarts the
-    /// heartbeat clock. One call, two jobs (SPEC §5 recorded decision): the
-    /// brake release and the liveness attestation are combined on purpose —
-    /// when the DMS grace was already elapsed, this re-arms the liveness clock
-    /// on the admin's authority, and the emitted event carries
-    /// `rearmed_dms: bool` so telemetry can surface exactly that side effect
-    /// (`true` = `LastHeartbeat` changed, `false` = it was already `now`).
-    pub fn unfreeze(env: Env) {
-        let admin = Self::admin_or_panic(&env);
-        persist_set(&env, &DataKey::AdminFrozen, &false);
-        let now = env.ledger().timestamp();
-        let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
-        let rearmed_dms = last != now;
-        persist_set(&env, &DataKey::LastHeartbeat, &now);
-        emit_unfrozen(&env, &admin, rearmed_dms);
-    }
-
-    // ── Read / advisory (no auth; non-confidential state; TTL effects in §9.5) ─
-
-    #[allow(clippy::must_use_candidate)] // public read surface
-    pub fn policy(env: Env) -> Option<PolicyConfig> {
-        persist_get(&env, &DataKey::Policy)
-    }
-
-    /// Evaluates dead-man switch health (`Ok`, `Warn` at ≥80% elapsed, or `Expired`).
-    #[allow(clippy::must_use_candidate)] // public read surface
-    pub fn dms_health(env: Env) -> crate::types::DmsHealthStatus {
-        let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
-            return crate::types::DmsHealthStatus::Ok;
-        };
-        let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
-        let now = env.ledger().timestamp();
-        engine::dms_health(now, last, &cfg)
-    }
-
-    #[allow(clippy::must_use_candidate)] // public read surface
-    pub fn status(env: Env) -> Status {
-        let has_policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy).is_some();
-        let policy_revision = persist_get::<u64>(&env, &DataKey::PolicyRevision).unwrap_or(0);
-        let admin_frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
-        let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
-        let now = env.ledger().timestamp();
-        let grace =
-            persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
-        Status {
-            has_policy,
-            policy_revision,
-            admin_frozen,
-            heartbeat_expired: grace > 0
-                && last_heartbeat != 0
-                && now.saturating_sub(last_heartbeat) > grace,
-            last_heartbeat,
-            now,
+        /// Installs a new policy. Resets the rolling window and starts the
+        /// dead-man-switch clock at install time (a fresh policy gets full grace).
+        ///
+        /// # Authorization
+        /// Requires the configured admin's authorization.
+        pub fn set_policy(env: Env, config: PolicyConfig) {
+            let admin = Self::admin_or_panic(&env);
+            validate_config(&env, &config).unwrap_or_else(|e| panic_with_error!(&env, e));
+            persist_set(&env, &DataKey::Policy, &config);
+            increment_revision(&env);
+            save_ledger(&env, &Ledger::empty(&env));
+            let now = env.ledger().timestamp();
+            persist_set(&env, &DataKey::LastHeartbeat, &now);
+            emit_policy_set(&env, &admin);
         }
-    }
 
-    /// Preflight / simulate a transfer (`check`): permissionless pre-flight
-    /// of the asset-transfer decision path.
-    ///
-    /// Search aliases for SDK discoverability: "preflight", "simulate",
-    /// `simulate_transfer`, `simulate-transfer`. These are documentation
-    /// aliases only — the on-chain ABI is frozen as `check` (and
-    /// `check_detailed`); there is no `simulate_transfer` entrypoint.
-    ///
-    /// Lets agents/SDKs simulate a transfer before signing. A submitted call
-    /// may refresh persistent TTLs; simulation does not persist those rent
-    /// bumps. Emits the same `auth_checked` event as an in-path decision.
-    ///
-    /// # Example
-    ///
-    /// Mirrors the live Phase-1 testnet invocation (permissionless read,
-    /// simulation only; this account is DMS-frozen, so the honest answer
-    /// today is blocked):
-    ///
-    /// ```text
-    /// stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
-    ///   --network testnet --source-account guard_admin --send=no -- \
-    ///   check --asset CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7 \
-    ///   --to GDUYLFVFLVISVOM5FK5KTBA446VQQ7NBRRFMLNLKLISKL26LJGKUVRRX --amount 50
-    /// # → {"Blocked":"heartbeat_expired"}
-    /// ```
-    #[allow(clippy::must_use_candidate)] // public read surface
-    pub fn check(env: Env, asset: Address, to: Address, amount: i128) -> CheckResult {
-        Self::check_detailed(env, asset, to, amount).result
-    }
+        /// Removes the policy and window → immediate default-deny.
+        ///
+        /// # Authorization
+        /// Requires the configured admin's authorization.
+        pub fn revoke_policy(env: Env) {
+            let admin = Self::admin_or_panic(&env);
+            env.storage().persistent().remove(&DataKey::Policy);
+            env.storage().persistent().remove(&DataKey::Window);
+            increment_revision(&env);
+            emit_policy_revoked(&env, &admin);
+        }
 
-    /// Preflight / simulate a transfer with headroom (`check_detailed`):
-    /// pre-flight decision plus current cap headroom for the targeted asset.
-    /// Part of the `check` preflight / simulate alias family (documentation
-    /// aliases only; the ABI is frozen — there is no `simulate_transfer`
-    /// entrypoint).
-    ///
-    /// This path does not change spend accounting: it mutates a local ledger
-    /// copy and emits exactly the same `auth_checked` event as `check`. A
-    /// submitted call may refresh persistent TTLs; simulation does not persist
-    /// those rent bumps.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if the policy engine's `decide` evaluation returns an empty list of verdicts.
-    #[allow(clippy::must_use_candidate)] // public read surface
-    pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail {
-        let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
-            emit_auth(&env, false, Some(Error::NoPolicy), 0);
-            return CheckDetail {
-                result: CheckResult::Blocked(Symbol::new(&env, Error::NoPolicy.reason())),
-                remaining_window: None,
-                per_tx_cap: None,
-                effective_per_tx_cap: None,
-                effective_window_cap: None,
+        /// Re-binds the agent's Ed25519 public key. Admin never gains fund-moving
+        /// power; it can only replace the key the account will authenticate.
+        ///
+        /// # Authorization
+        /// Requires the configured admin's authorization.
+        pub fn rotate_agent_key(env: Env, new_pubkey: BytesN<32>) {
+            let admin = Self::admin_or_panic(&env);
+            // Post-initialize the key always exists; the fingerprint needs the old
+            // key before the storage slot is overwritten.
+            let old_pubkey: Option<BytesN<32>> =
+                env.storage().instance().get(&DataKey::AgentPubkey);
+            let Some(old_pubkey) = old_pubkey else {
+                panic_with_error!(&env, Error::NotInitialized);
             };
-        };
-        let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
-        let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
-        let now = env.ledger().timestamp();
-        let self_addr = env.current_contract_address();
-        let mut ledger = load_ledger(&env);
-        if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
-            ledger.prune(now, cfg.window_secs);
+            env.storage()
+                .instance()
+                .set(&DataKey::AgentPubkey, &new_pubkey);
+            emit_agent_rotated(&env, &admin, &old_pubkey, &new_pubkey);
         }
-        let (remaining_window, per_tx_cap, effective_window_cap) = cap_metrics(&cfg, &ledger, &to);
-        let effective_per_tx_cap = per_tx_cap;
-        let call = transfer_context(&env, &asset, &to, amount);
-        let verdicts = decide(
-            &env,
-            &self_addr,
-            Some(&cfg),
-            &AccountState {
-                admin_frozen: frozen,
+
+        // ── Dead-man switch / freeze (SPEC §5) ───────────────────────────────
+
+        /// Records a heartbeat. Routes through `__check_auth` (self-call): the
+        /// host verifies the registered agent's signature and the engine applies
+        /// the account gates, so a heartbeat after the grace window expired — or
+        /// while admin-frozen — is rejected.
+        ///
+        /// # Authorization
+        /// Requires the current account's custom-agent authorization.
+        pub fn heartbeat(env: Env) {
+            env.current_contract_address().require_auth();
+            let now = env.ledger().timestamp();
+            // Redundant same-second heartbeat: `LastHeartbeat` is already `now`, so
+            // the write (with its TTL extension) and the event carry no new
+            // information — the first heartbeat of this second already extended the
+            // entry's TTL. Skip both rather than pay for a no-op write (SPEC §5).
+            let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+            if now == last {
+                return;
+            }
+            persist_set(&env, &DataKey::LastHeartbeat, &now);
+            emit_heartbeat(&env, now);
+        }
+
+        /// Immediately freezes policy-authorized calls until the admin unfreezes.
+        ///
+        /// # Authorization
+        /// Requires the configured admin's authorization.
+        pub fn freeze(env: Env) {
+            let admin = Self::admin_or_panic(&env);
+            persist_set(&env, &DataKey::AdminFrozen, &true);
+            emit_frozen(&env, &admin);
+        }
+
+        /// Admin liveness attestation: clears the admin freeze and restarts the
+        /// heartbeat clock. One call, two jobs (SPEC §5 recorded decision): the
+        /// brake release and the liveness attestation are combined on purpose —
+        /// when the DMS grace was already elapsed, this re-arms the liveness clock
+        /// on the admin's authority, and the emitted event carries
+        /// `rearmed_dms: bool` so telemetry can surface exactly that side effect
+        /// (`true` = `LastHeartbeat` changed, `false` = it was already `now`).
+        ///
+        /// # Authorization
+        /// Requires the configured admin's authorization.
+        pub fn unfreeze(env: Env) {
+            let admin = Self::admin_or_panic(&env);
+            persist_set(&env, &DataKey::AdminFrozen, &false);
+            let now = env.ledger().timestamp();
+            let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+            let rearmed_dms = last != now;
+            persist_set(&env, &DataKey::LastHeartbeat, &now);
+            emit_unfrozen(&env, &admin, rearmed_dms);
+        }
+
+        // ── Read / advisory (no auth; non-confidential state; TTL effects in §9.5) ─
+
+        #[allow(clippy::must_use_candidate)] // public read surface
+        /// Returns the current policy, or `None` when the account is default-deny.
+        /// This permissionless read can refresh the stored policy's TTL.
+        pub fn policy(env: Env) -> Option<PolicyConfig> {
+            persist_get(&env, &DataKey::Policy)
+        }
+
+        /// Evaluates dead-man switch health (`Ok`, `Warn` at ≥80% elapsed, or `Expired`).
+        /// Permissionless; this read may refresh stored state TTLs.
+        #[allow(clippy::must_use_candidate)] // public read surface
+        pub fn dms_health(env: Env) -> crate::types::DmsHealthStatus {
+            let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+                return crate::types::DmsHealthStatus::Ok;
+            };
+            let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+            let now = env.ledger().timestamp();
+            engine::dms_health(now, last, &cfg)
+        }
+
+        #[allow(clippy::must_use_candidate)] // public read surface
+        /// Returns current policy, freeze, heartbeat, and ledger-time status.
+        /// This permissionless read may refresh state-entry TTLs.
+        pub fn status(env: Env) -> Status {
+            let has_policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy).is_some();
+            let policy_revision = persist_get::<u64>(&env, &DataKey::PolicyRevision).unwrap_or(0);
+            let admin_frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
+            let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+            let now = env.ledger().timestamp();
+            let grace =
+                persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
+            Status {
+                has_policy,
+                policy_revision,
+                admin_frozen,
+                heartbeat_expired: grace > 0
+                    && last_heartbeat != 0
+                    && now.saturating_sub(last_heartbeat) > grace,
                 last_heartbeat,
-            },
-            &mut ledger,
-            now,
-            vec![&env, call],
-        );
-        let result = match verdicts.first().unwrap() {
-            Decision::Allowed => {
-                emit_auth(&env, true, None, 0);
-                CheckResult::Allowed
+                now,
             }
-            Decision::Blocked(e) => {
-                emit_auth(&env, false, Some(*e), 0);
-                CheckResult::Blocked(Symbol::new(&env, e.reason()))
+        }
+
+        /// Preflight / simulate a transfer (`check`): permissionless pre-flight
+        /// of the asset-transfer decision path.
+        /// No authorization is required.
+        ///
+        /// Search aliases for SDK discoverability: "preflight", "simulate",
+        /// `simulate_transfer`, `simulate-transfer`. These are documentation
+        /// aliases only — the on-chain ABI is frozen as `check` (and
+        /// `check_detailed`); there is no `simulate_transfer` entrypoint.
+        ///
+        /// Lets agents/SDKs simulate a transfer before signing. A submitted call
+        /// may refresh persistent TTLs; simulation does not persist those rent
+        /// bumps. Emits the same `auth_checked` event as an in-path decision.
+        ///
+        /// # Example
+        ///
+        /// Mirrors the live Phase-1 testnet invocation (permissionless read,
+        /// simulation only; this account is DMS-frozen, so the honest answer
+        /// today is blocked):
+        ///
+        /// ```text
+        /// stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
+        ///   --network testnet --source-account guard_admin --send=no -- \
+        ///   check --asset CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7 \
+        ///   --to GDUYLFVFLVISVOM5FK5KTBA446VQQ7NBRRFMLNLKLISKL26LJGKUVRRX --amount 50
+        /// # → {"Blocked":"heartbeat_expired"}
+        /// ```
+        #[allow(clippy::must_use_candidate)] // public read surface
+        pub fn check(env: Env, asset: Address, to: Address, amount: i128) -> CheckResult {
+            Self::check_detailed(env, asset, to, amount).result
+        }
+
+        /// Preflight / simulate a transfer with headroom (`check_detailed`):
+        /// pre-flight decision plus current cap headroom for the targeted asset.
+        /// Permissionless; no authorization is required.
+        /// Part of the `check` preflight / simulate alias family (documentation
+        /// aliases only; the ABI is frozen — there is no `simulate_transfer`
+        /// entrypoint).
+        ///
+        /// This path does not change spend accounting: it mutates a local ledger
+        /// copy and emits exactly the same `auth_checked` event as `check`. A
+        /// submitted call may refresh persistent TTLs; simulation does not persist
+        /// those rent bumps.
+        ///
+        /// # Panics
+        ///
+        /// This function panics if the policy engine's `decide` evaluation returns an empty list of verdicts.
+        #[allow(clippy::must_use_candidate)] // public read surface
+        pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail {
+            let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+                emit_auth(&env, false, Some(Error::NoPolicy), 0);
+                return CheckDetail {
+                    result: CheckResult::Blocked(Symbol::new(&env, Error::NoPolicy.reason())),
+                    remaining_window: None,
+                    per_tx_cap: None,
+                    effective_per_tx_cap: None,
+                    effective_window_cap: None,
+                };
+            };
+            let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
+            let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+            let now = env.ledger().timestamp();
+            let self_addr = env.current_contract_address();
+            let mut ledger = load_ledger(&env);
+            if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
+                ledger.prune(now, cfg.window_secs);
             }
-        };
-        CheckDetail {
-            result,
-            remaining_window,
-            per_tx_cap,
-            effective_per_tx_cap,
-            effective_window_cap,
+            let (remaining_window, per_tx_cap, effective_window_cap) =
+                cap_metrics(&cfg, &ledger, &to);
+            let effective_per_tx_cap = per_tx_cap;
+            let call = transfer_context(&env, &asset, &to, amount);
+            let verdicts = decide(
+                &env,
+                &self_addr,
+                Some(&cfg),
+                &AccountState {
+                    admin_frozen: frozen,
+                    last_heartbeat,
+                },
+                &mut ledger,
+                now,
+                vec![&env, call],
+            );
+            let result = match verdicts.first().unwrap() {
+                Decision::Allowed => {
+                    emit_auth(&env, true, None, 0);
+                    CheckResult::Allowed
+                }
+                Decision::Blocked(e) => {
+                    emit_auth(&env, false, Some(*e), 0);
+                    CheckResult::Blocked(Symbol::new(&env, e.reason()))
+                }
+            };
+            CheckDetail {
+                result,
+                remaining_window,
+                per_tx_cap,
+                effective_per_tx_cap,
+                effective_window_cap,
+            }
         }
     }
-}
 
-/// Build the auth `Context` of a SAC `transfer` call for pre-flight checks.
-fn transfer_context(env: &Env, asset: &Address, to: &Address, amount: i128) -> Context {
-    let mut args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(env);
-    args.push_back(asset.clone().into_val(env)); // from
-    args.push_back(to.clone().into_val(env));
-    args.push_back(amount.into_val(env));
-    Context::Contract(ContractContext {
-        contract: asset.clone(),
-        fn_name: Symbol::new(env, "transfer"),
-        args,
-    })
-}
+    /// Build the auth `Context` of a SAC `transfer` call for pre-flight checks.
+    fn transfer_context(env: &Env, asset: &Address, to: &Address, amount: i128) -> Context {
+        let mut args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(env);
+        args.push_back(asset.clone().into_val(env)); // from
+        args.push_back(to.clone().into_val(env));
+        args.push_back(amount.into_val(env));
+        Context::Contract(ContractContext {
+            contract: asset.clone(),
+            fn_name: Symbol::new(env, "transfer"),
+            args,
+        })
+    }
 
-// ── Custom account enforcement (SPEC §7) ─────────────────────────────────
-//
-// The host calls `__check_auth` for every authorization this account must
-// approve. The account verifies the agent's Ed25519 signature over the
-// transaction auth payload, then evaluates the policy decision table over
-// every auth context. `Ok(())` approves; `Err` rejects the whole transaction.
+    // ── Custom account enforcement (SPEC §7) ─────────────────────────────────
+    //
+    // The host calls `__check_auth` for every authorization this account must
+    // approve. The account verifies the agent's Ed25519 signature over the
+    // transaction auth payload, then evaluates the policy decision table over
+    // every auth context. `Ok(())` approves; `Err` rejects the whole transaction.
 
-#[contractimpl]
-#[allow(clippy::needless_pass_by_value)] // trait + contract ABI require owned args
-impl CustomAccountInterface for PolicyEngine {
-    type Signature = BytesN<64>;
-    type Error = Error;
+    #[contractimpl]
+    #[allow(clippy::needless_pass_by_value)] // trait + contract ABI require owned args
+    impl CustomAccountInterface for PolicyEngine {
+        type Signature = BytesN<64>;
+        type Error = Error;
 
-    fn __check_auth(
-        env: Env,
-        signature_payload: soroban_sdk::crypto::Hash<32>,
-        signatures: Self::Signature,
-        auth_contexts: soroban_sdk::Vec<Context>,
-    ) -> Result<(), Error> {
-        // 1. Agent key registered (initialize done).
-        let agent: Option<BytesN<32>> = env.storage().instance().get(&DataKey::AgentPubkey);
-        let Some(agent) = agent else {
-            for i in 0..auth_contexts.len() {
-                emit_auth(&env, false, Some(Error::NotInitialized), i);
-            }
-            return Err(Error::NotInitialized);
-        };
+        /// Authorizes all contexts in a transaction after verifying the registered agent signature.
+        /// The host invokes this method; callers cannot invoke it as a normal contract entrypoint.
+        fn __check_auth(
+            env: Env,
+            signature_payload: soroban_sdk::crypto::Hash<32>,
+            signatures: Self::Signature,
+            auth_contexts: soroban_sdk::Vec<Context>,
+        ) -> Result<(), Error> {
+            // 1. Agent key registered (initialize done).
+            let agent: Option<BytesN<32>> = env.storage().instance().get(&DataKey::AgentPubkey);
+            let Some(agent) = agent else {
+                for i in 0..auth_contexts.len() {
+                    emit_auth(&env, false, Some(Error::NotInitialized), i);
+                }
+                return Err(Error::NotInitialized);
+            };
 
-        // 2. Verify the agent's Ed25519 signature over the auth payload. The
-        //    host crypto function traps the frame on a bad signature, so a
-        //    wrong key can never reach policy evaluation.
-        let message: Bytes = signature_payload.into();
-        env.crypto().ed25519_verify(&agent, &message, &signatures);
+            // 2. Verify the agent's Ed25519 signature over the auth payload. The
+            //    host crypto function traps the frame on a bad signature, so a
+            //    wrong key can never reach policy evaluation.
+            let message: Bytes = signature_payload.into();
+            env.crypto().ed25519_verify(&agent, &message, &signatures);
 
-        // 3. Policy snapshot + gate evaluation over every context.
-        let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
-            for i in 0..auth_contexts.len() {
-                emit_auth(&env, false, Some(Error::NoPolicy), i);
-            }
-            return Err(Error::NoPolicy);
-        };
-        let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
-        let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
-        let now = env.ledger().timestamp();
-        let self_addr = env.current_contract_address();
+            // 3. Policy snapshot + gate evaluation over every context.
+            let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+                for i in 0..auth_contexts.len() {
+                    emit_auth(&env, false, Some(Error::NoPolicy), i);
+                }
+                return Err(Error::NoPolicy);
+            };
+            let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
+            let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+            let now = env.ledger().timestamp();
+            let self_addr = env.current_contract_address();
 
-        let mut ledger = load_ledger(&env);
-        let verdicts = decide(
-            &env,
-            &self_addr,
-            Some(&cfg),
-            &AccountState {
-                admin_frozen: frozen,
-                last_heartbeat,
-            },
-            &mut ledger,
-            now,
-            auth_contexts,
-        );
+            let mut ledger = load_ledger(&env);
+            let verdicts = decide(
+                &env,
+                &self_addr,
+                Some(&cfg),
+                &AccountState {
+                    admin_frozen: frozen,
+                    last_heartbeat,
+                },
+                &mut ledger,
+                now,
+                auth_contexts,
+            );
 
-        let mut all_passed = true;
-        let mut first_error = None;
-        for (i, v) in verdicts.iter().enumerate() {
-            match v {
-                Decision::Allowed => emit_auth(&env, true, None, u32::try_from(i).unwrap()),
-                Decision::Blocked(e) => {
-                    all_passed = false;
-                    if first_error.is_none() {
-                        first_error = Some(*e);
+            let mut all_passed = true;
+            let mut first_error = None;
+            for (i, v) in verdicts.iter().enumerate() {
+                match v {
+                    Decision::Allowed => emit_auth(&env, true, None, u32::try_from(i).unwrap()),
+                    Decision::Blocked(e) => {
+                        all_passed = false;
+                        if first_error.is_none() {
+                            first_error = Some(*e);
+                        }
+                        emit_auth(&env, false, Some(*e), u32::try_from(i).unwrap());
                     }
-                    emit_auth(&env, false, Some(*e), u32::try_from(i).unwrap());
                 }
             }
-        }
 
-        if all_passed {
-            // 4. Persist window changes made by the decision.
-            let had_window = persist_get::<WindowState>(&env, &DataKey::Window).is_some();
-            let has_entries = ledger.len() > 0 || ledger_has_recipient_entries(&ledger);
-            if had_window || has_entries {
-                save_ledger(&env, &ledger);
+            if all_passed {
+                // 4. Persist window changes made by the decision.
+                let had_window = persist_get::<WindowState>(&env, &DataKey::Window).is_some();
+                let has_entries = ledger.len() > 0 || ledger_has_recipient_entries(&ledger);
+                if had_window || has_entries {
+                    save_ledger(&env, &ledger);
+                }
+                Ok(())
+            } else {
+                Err(first_error.unwrap())
             }
-            Ok(())
-        } else {
-            Err(first_error.unwrap())
         }
     }
 }
 
+/// The Soroban custom-account contract type.
+pub use policy_engine_type::PolicyEngine;
+/// Generated typed client for invoking [`PolicyEngine`].
+pub use policy_engine_type::PolicyEngineClient;
+
 // ── Test utilities (exposed via `testutils` feature) ──────────────────────
+/// Test-only access to the decision engine and Soroban helpers.
 #[cfg(feature = "testutils")]
 #[allow(clippy::must_use_candidate, clippy::len_without_is_empty)]
 pub mod testutils {
+    #![allow(missing_docs)] // Test-only helper re-exports are not contract API.
+
     pub use crate::engine::{contains_addr, decide, parse_call, AccountState, Decision};
     pub use crate::types::{
         CheckResult, DataKey, Error, PolicyConfig, ProtocolRule, RecipientCap,

@@ -1,5 +1,6 @@
 //! Shared types: policy model, storage keys, errors, and the pure parsed-call
 //! representation that the decision engine operates on.
+#![allow(missing_docs)] // Soroban type/error macros synthesize undocumented conversion metadata.
 
 use soroban_sdk::{contracterror, contracttype, Address, Symbol, Vec};
 
@@ -10,8 +11,11 @@ pub const DMS_WARN_THRESHOLD_PERCENT: u64 = 80;
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DmsHealthStatus {
+    /// Grace period is below the warning threshold.
     Ok,
+    /// Grace period is at least 80% elapsed but has not expired.
     Warn,
+    /// Grace period has elapsed.
     Expired,
 }
 
@@ -39,9 +43,11 @@ pub struct WindowState {
 }
 
 /// Rolling spend ledger for a single recipient.
+#[allow(missing_docs)] // contracttype synthesizes private conversion metadata
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientWindowState {
+    /// Account receiving transfers tracked by this ledger.
     pub recipient: Address,
     /// Cached rolling total (sum of non-expired entries).
     pub total: i128,
@@ -65,9 +71,11 @@ pub struct ProtocolCallEntry {
 }
 
 /// Per-recipient rolling-window cap override.
+#[allow(missing_docs)]
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientCap {
+    /// Recipient to which this override applies.
     pub recipient: Address,
     /// Rolling cap for this recipient within `window_secs`; 0 = disabled / fall back to global.
     pub cap: i128,
@@ -138,9 +146,12 @@ impl core::fmt::Debug for PolicyConfig {
     }
 }
 
+#[allow(missing_docs)]
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A protocol contract and optional function allowlist.
 pub struct ProtocolRule {
+    /// Contract permitted for non-SAC calls.
     pub contract: Address,
     /// `None` = any function; `Some` = per-function allowlist.
     pub fns: Option<Vec<Symbol>>,
@@ -173,18 +184,27 @@ pub enum ParsedCall {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
+    /// Whether a policy is currently installed.
     pub has_policy: bool,
+    /// Monotonic revision incremented by policy install/revoke.
     pub policy_revision: u64,
+    /// Whether the administrator has frozen the account.
     pub admin_frozen: bool,
+    /// Whether the configured heartbeat grace has elapsed.
     pub heartbeat_expired: bool,
+    /// Unix timestamp of the last heartbeat, or zero if none.
     pub last_heartbeat: u64,
+    /// Ledger unix timestamp used for this snapshot.
     pub now: u64,
 }
 
+/// Permissionless policy decision returned by `check`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckResult {
+    /// The target transfer passes the current policy snapshot.
     Allowed,
+    /// The transfer is blocked with a stable reason symbol.
     Blocked(Symbol),
 }
 
@@ -232,13 +252,20 @@ impl Error {
 /// Advisory result for a targeted asset transfer. All fields are calculated
 /// from the current policy and window snapshot; this type never represents a
 /// storage mutation.
+#[allow(missing_docs)]
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Advisory outcome and cap headroom for a targeted transfer check.
 pub struct CheckDetail {
+    /// Policy decision for the requested transfer.
     pub result: CheckResult,
+    /// Remaining global or recipient window allowance, if enabled.
     pub remaining_window: Option<i128>,
+    /// Configured per-transfer cap, if enabled.
     pub per_tx_cap: Option<i128>,
+    /// Effective per-transfer cap for this recipient, if enabled.
     pub effective_per_tx_cap: Option<i128>,
+    /// Effective rolling cap for this recipient, if enabled.
     pub effective_window_cap: Option<i128>,
 }
 
@@ -267,33 +294,56 @@ pub enum DataKey {
     PolicyRevision,
 }
 
+/// Stable contract errors and decision reasons exposed by the ABI.
+#[allow(missing_docs)] // individual ABI variants are described below
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
     // Generic / lifecycle (1..=9)
+    /// Required signer did not authorize the operation.
     Unauthorized = 1,
+    /// Initialization has already been completed.
     AlreadyInitialized = 2,
+    /// Required contract state has not been initialized.
     NotInitialized = 3,
+    /// Policy configuration violates a validation rule.
     InvalidConfig = 4,
+    /// Requested transfer amount is invalid.
     InvalidAmount = 5,
     // Account-level gates (10..=19)
+    /// Admin emergency freeze is active.
     AdminFrozen = 10,
+    /// Agent heartbeat grace period has elapsed.
     HeartbeatExpired = 11,
+    /// No policy is installed (default-deny).
     NoPolicy = 12,
+    /// Policy is administratively paused.
     Paused = 13,
+    /// Current ledger time is outside the configured active interval.
     OutsideActiveWindow = 14,
     // Per-call decisions (20..=29)
+    /// Transfer asset is absent from the asset allowlist.
     AssetNotAllowed = 20,
+    /// Transfer destination is absent from the recipient allowlist.
     RecipientNotAllowed = 21,
+    /// Transfer exceeds its per-call cap.
     PerTxCapExceeded = 22,
+    /// Transfer exceeds a rolling-window cap.
     WindowCapExceeded = 23,
+    /// Called protocol contract is not allowlisted.
     ProtocolNotAllowed = 24,
+    /// Called function is not allowlisted for its protocol.
     FunctionNotAllowed = 25,
+    /// Call targets an unknown contract.
     UnknownContract = 26,
+    /// Account self-call is not permitted by the fixed self-call policy.
     SelfFunctionNotAllowed = 27,
+    /// Account-authorized contract creation is disabled.
     CreateContractNotAllowed = 28,
+    /// Transfer destination is explicitly blocked.
     RecipientBlocked = 29,
+    /// Rolling protocol-call count would exceed its configured limit.
     ProtocolCallRateExceeded = 30,
 }
 
