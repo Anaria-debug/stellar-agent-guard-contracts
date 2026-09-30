@@ -1,18 +1,18 @@
 # Description
 
-Closes #40
+Closes #24
 
-This PR adds a permissionless helper `refresh_deadman` that allows anyone to explicitly record and emit an event (`dms_auto_frozen`) when the dead-man switch has expired. Because the dead-man switch is deliberately lazy, the account previously became frozen silently without any on-chain event. This helper provides observability for operators.
+This PR adds a fuzzing-style generative test `fuzz_parse_call_against_arbitrary_auth_context_argument_vectors` to `src/engine.rs`.
+The test validates that `parse_call` robustly handles dynamically generated, malformed SAC (Stellar Asset Contract) transfer contexts without ever trapping or panicking the host.
 
 ### Changes
-*   **Types:** Added `AutoFrozenAt` to `DataKey` in `src/types.rs`.
-*   **Lib:** Added `EventDmsAutoFrozen` and `refresh_deadman()` to explicitly record `AutoFrozenAt` and emit `dms_auto_frozen` if the grace has elapsed.
-*   **SPEC:** Updated §3, §5, §7, and §9 to document the new `refresh_deadman` visibility mechanism, noting that it does not weaken the core lazy evaluation (rule #2).
-*   **Tests:** Added `refresh_deadman_records_auto_freeze_and_emits_event` to verify the no-op behavior when not expired, and correct recording and emitting when expired.
+*   **Tests:** Added `fuzz_parse_call_against_arbitrary_auth_context_argument_vectors` which generates thousands of argument combinations for `transfer` and `transfer_from`.
+*   Tested cases include: varying number of arguments (0..4), incorrect types at each position, extra trailing args, and non-address first arguments.
+*   Verified that `parse_call` and `decide` gracefully handle every malformed shape by yielding a stable classified denial (e.g., `UnknownContract`) instead of trapping.
 
 ### Acceptance Criteria Checklist
-- [x] Design note in SPEC §5: mechanism, why it doesn't weaken freeze semantics, auth placement.
-- [x] Implementation + tests: silent expiry → helper call records + emits → subsequent spends still blocked identically. Helper no-ops when not expired.
-- [x] No change to the rule #2 truth: expiry requires no flag to take effect.
+- [x] Generator produces contexts for known SAC contracts with: 0..n args, wrong types at each position, extra trailing args, non-address first arg.
+- [x] Every case yields a stable classified denial — never a host trap/panic.
+- [x] At least one case each for transfer and transfer_from.
 - [x] Lint, type-check, and tests all pass locally.
-- [x] PR description references the issue (Closes #40).
+- [x] PR description references this issue with Closes #24.

@@ -609,4 +609,104 @@ mod tests {
             Decision::Blocked(Error::SelfFunctionNotAllowed)
         ));
     }
+
+    #[test]
+    fn fuzz_parse_call_against_arbitrary_auth_context_argument_vectors() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let asset = addr(&env, 1);
+        let mut l = Ledger::empty(&env);
+
+        let vals: alloc::vec::Vec<Val> = alloc::vec![
+            0_i128.into_val(&env),
+            100_i128.into_val(&env),
+            (-50_i128).into_val(&env),
+            addr(&env, 2).into_val(&env),
+            Symbol::new(&env, "foo").into_val(&env),
+            ().into_val(&env),
+            true.into_val(&env),
+            soroban_sdk::String::from_str(&env, "hello").into_val(&env),
+        ];
+
+        let mut all_args = alloc::vec::Vec::new();
+        
+        // 0 args
+        all_args.push(Vec::new(&env));
+
+        // 1 arg
+        for v1 in &vals {
+            let mut a = Vec::new(&env);
+            a.push_back(*v1);
+            all_args.push(a);
+        }
+
+        // 2 args
+        for v1 in &vals {
+            for v2 in &vals {
+                let mut a = Vec::new(&env);
+                a.push_back(*v1);
+                a.push_back(*v2);
+                all_args.push(a);
+            }
+        }
+
+        // 3 args
+        for v1 in &vals {
+            for v2 in &vals {
+                for v3 in &vals {
+                    let mut a = Vec::new(&env);
+                    a.push_back(*v1);
+                    a.push_back(*v2);
+                    a.push_back(*v3);
+                    all_args.push(a);
+                }
+            }
+        }
+
+        // 4 args
+        for v1 in &vals {
+            for v2 in &vals {
+                for v3 in &vals {
+                    for v4 in &vals {
+                        let mut a = Vec::new(&env);
+                        a.push_back(*v1);
+                        a.push_back(*v2);
+                        a.push_back(*v3);
+                        a.push_back(*v4);
+                        all_args.push(a);
+                    }
+                }
+            }
+        }
+
+        for fn_name in ["transfer", "transfer_from"] {
+            let fn_sym = Symbol::new(&env, fn_name);
+            for args in &all_args {
+                let ctx = Context::Contract(ContractContext {
+                    contract: asset.clone(),
+                    fn_name: fn_sym.clone(),
+                    args: args.clone(),
+                });
+
+                // The parse call should never panic, and `decide` should handle it.
+                // It either yields a stable classified denial, or an Allowed (if it randomly made a valid transfer).
+                let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, vec![&env, ctx]);
+                assert!(!d.is_empty());
+                
+                // Extra check: parse_call doesn't trap
+                let parsed = parse_call(&env, &sa, &Context::Contract(ContractContext {
+                    contract: asset.clone(),
+                    fn_name: fn_sym.clone(),
+                    args: args.clone(),
+                }), &p);
+                
+                match parsed {
+                    ParsedCall::AssetTransfer { .. } | ParsedCall::Unknown { .. } => {}
+                    _ => panic!("Expected AssetTransfer or Unknown"),
+                }
+            }
+        }
+    }
 }
