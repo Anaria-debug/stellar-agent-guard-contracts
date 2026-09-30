@@ -17,7 +17,10 @@
 //!   approves) so admin calls can be enforced in the same env without key
 //!   material.
 
-use crate::types::{CheckResult, DataKey, Error as GuardError, PolicyConfig, ProtocolRule};
+use crate::types::{
+    CheckResult, DataKey, Error as GuardError, PolicyConfig, PolicyRuleId, ProtocolRule,
+    RecipientCap, ValidationOutcome,
+};
 use crate::{PolicyEngine, PolicyEngineClient};
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -87,6 +90,72 @@ fn heartbeat_event_count(env: &Env) -> usize {
             matches!(&e.body, xdr::ContractEventBody::V0(v0) if v0.topics.first() == Some(&want))
         })
         .count()
+}
+
+/// Number of events named `name` emitted by the **most recent** top-level
+/// invocation (SPEC §9).
+///
+/// `env.events().all()` exposes one invocation's event log, not a cumulative
+/// history: a new top-level call replaces it. Assert event content directly
+/// after the call that should have produced it.
+fn event_count(env: &Env, name: &str) -> usize {
+    let want = symbol_val(name);
+    env.events()
+        .all()
+        .events()
+        .iter()
+        .filter(|e| matches!(&e.body, xdr::ContractEventBody::V0(v0) if v0.topics.first() == Some(&want)))
+        .count()
+}
+
+/// Was an event named `name` emitted by the most recent invocation with exactly
+/// this topic list?
+///
+/// `#[contractevent]` prepends the event name to the topic list, so `expected`
+/// starts with the event name itself — this asserts the full SPEC §9 topic
+/// layout, not just that "something" was emitted.
+fn has_event_with_topics(env: &Env, name: &str, expected: &[&str]) -> bool {
+    let want = symbol_val(name);
+    env.events()
+        .all()
+        .events()
+        .iter()
+        .filter(|e| matches!(&e.body, xdr::ContractEventBody::V0(v0) if v0.topics.first() == Some(&want)))
+        .any(|e| {
+            let xdr::ContractEventBody::V0(v0) = &e.body;
+            v0.topics.len() == expected.len()
+                && expected
+                    .iter()
+                    .enumerate()
+                    .all(|(i, topic)| v0.topics.get(i) == Some(&symbol_val(topic)))
+        })
+}
+
+/// The `revision` field of the only event named `name` in the most recent
+/// invocation's log (SPEC §9). Panics when the event is absent, carries no
+/// map, or has no `revision`.
+fn last_event_revision(env: &Env, name: &str) -> u64 {
+    let want = symbol_val(name);
+    let all = env.events().all();
+    let found = all
+        .events()
+        .iter()
+        .rev()
+        .find(|e| matches!(&e.body, xdr::ContractEventBody::V0(v0) if v0.topics.first() == Some(&want)))
+        .unwrap_or_else(|| panic!("no `{name}` event was emitted"));
+    let xdr::ContractEventBody::V0(v0) = &found.body;
+    let ScVal::Map(Some(map)) = &v0.data else {
+        panic!("`{name}` data must be a Map");
+    };
+    let entry = map
+        .0
+        .iter()
+        .find(|e| e.key == symbol_val("revision"))
+        .unwrap_or_else(|| panic!("`{name}` data must carry revision"));
+    match entry.val {
+        ScVal::U64(revision) => revision,
+        ref other => panic!("`{name}` revision must be a U64, got {other:?}"),
+    }
 }
 
 // ── Test contracts ───────────────────────────────────────────────────────
@@ -428,6 +497,18 @@ impl Harness {
 
     fn status(&self) -> crate::types::Status {
         PolicyEngineClient::new(&self.env, &self.guard).status()
+    }
+
+    /// The persisted rolling-window ledger (SPEC §3), or `None` when the
+    /// `Window` entry does not exist at all. Read as the contract so it sees
+    /// exactly the bytes `__check_auth` would load.
+    fn stored_window(&self) -> Option<crate::types::WindowState> {
+        self.env.as_contract(&self.guard, || {
+            self.env
+                .storage()
+                .persistent()
+                .get::<DataKey, crate::types::WindowState>(&DataKey::Window)
+        })
     }
 
     /// Did the guard emit an `auth_checked` event with `result = allowed`?
@@ -1336,6 +1417,207 @@ fn revoke_policy_is_instant_default_deny() {
     h.transfer_expect_blocked(&recv, 5);
 }
 
+// ── revoke_policy mid-flight (issue #95) ────────────────────────────────
+//
+// SPEC §7 documents `revoke_policy` as "Removes Policy and Window ->\n// default-deny immediately", and SPEC §3's storage table makes `Window` the\n// account's only rolling spend ledger. The behaviour those two statements\n// jointly promise is *not* pinned by any test, and the interesting part is\n// precisely the interaction an admin could exploit: because the window is\n// **cleared** (not merely paused), an admin cycling revoke -> set_policy starts\n// the account on a fresh window, so spend history does not survive the cycle.\n// That is admin-attested by design (SPEC §7: "fresh window on every policy\n// change"), so the tests below pin it as intentional rather than let it read\n// as an accident.
+//
+// SPEC §4 rule 3 is the gate the cleared policy falls through to: with no\n// `Policy` stored, every context blocks with `Reason::NoPolicy`.
+
+/// Issue #95 (a): after a mid-flight revoke, the next authorization is blocked
+/// with `NoPolicy` — not merely blocked, and not blocked for some unrelated
+/// reason such as a full window. Asserted on both the enforced auth path (the
+/// agent's signature is valid, so only policy can reject it) and the
+/// permissionless pre-flight, which returns the reason as a typed value and
+/// therefore pins *which* gate fired rather than merely "it was denied".
+#[test]
+fn revoke_policy_blocks_subsequent_auth_with_no_policy() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    // An *enabled* window with real spend, so a `WindowCapExceeded` block
+    // would be the competing explanation and the assertion below is meaningful.
+    p.window_secs = 60;
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+    h.transfer(&recv, 80);
+    assert_eq!(h.stored_window().map(|w| w.total), Some(80));
+
+    h.env.mock_all_auths();
+    h.revoke_policy();
+    assert!(
+        PolicyEngineClient::new(&h.env, &h.guard).policy().is_none(),
+        "revoke must remove the stored policy (SPEC §7)"
+    );
+
+    // Enforced path: a correctly-signed transfer cannot authorize.
+    h.transfer_expect_blocked(&recv, 5);
+
+    // Pre-flight: the structured reason is `no_policy` (SPEC §4 rule 3), not
+    // `window_cap_exceeded` — the window was cleared along with the policy.
+    let detail = PolicyEngineClient::new(&h.env, &h.guard).check_detailed(&h.asset, &recv, &5);
+    assert_eq!(
+        detail.result,
+        CheckResult::Blocked(Symbol::new(&h.env, "no_policy"))
+    );
+
+    // SPEC §9: the pre-flight commits its `auth_checked` event with the full
+    // topic layout — `blocked` at index 1, the reason at index 2.
+    assert!(
+        has_event_with_topics(
+            &h.env,
+            "event_auth_checked",
+            &["event_auth_checked", "blocked", "no_policy"],
+        ),
+        "post-revoke pre-flight must emit auth_checked(blocked, no_policy)"
+    );
+}
+
+/// Issue #95 (b): the rolling window does not survive a revoke, and a
+/// subsequent `set_policy` therefore starts genuinely empty.
+///
+/// This is the assertion that would catch the uncleared-window defect the
+/// issue asks about: if `revoke_policy` left `Window` behind (or `set_policy`
+/// failed to reset it), the re-installed policy would inherit the 80 already
+/// spent, and the full 80-unit transfer below would be blocked by a 100-unit
+/// cap (80 + 80 > 100). It is admitted only when the ledger really is empty.
+#[test]
+fn revoke_policy_clears_the_window_even_after_spend() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_secs = 60;
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+    h.transfer(&recv, 80);
+
+    // Precondition: real spend is on the ledger, so "the window was cleared"
+    // is a claim about something that existed.
+    let spent = h
+        .stored_window()
+        .expect("an enabled window persists its ledger");
+    assert_eq!(spent.total, 80);
+    assert!(!spent.entries.is_empty());
+
+    h.env.mock_all_auths();
+    h.revoke_policy();
+    assert!(
+        h.stored_window().is_none(),
+        "revoke must remove the Window entry, not merely stop reading it (SPEC §7)"
+    );
+
+    // Re-install the identical policy. `set_policy` writes a fresh empty
+    // ledger (SPEC §7: "Resets Policy and Window"), so the account is live
+    // again on a window that does not remember the 80.
+    h.set_time(1_010);
+    h.install_policy(&p);
+
+    let fresh = h
+        .stored_window()
+        .expect("set_policy persists a fresh ledger");
+    assert_eq!(
+        fresh.total, 0,
+        "the re-installed window must not inherit prior spend"
+    );
+    assert!(
+        fresh.entries.is_empty(),
+        "no spend entries may survive revoke"
+    );
+    assert!(
+        fresh.recipients.is_empty(),
+        "no per-recipient ledger may survive revoke"
+    );
+
+    // Behavioural proof, not just a storage assertion: the full 80 is
+    // admissible again (a surviving 80 would make this 160 > 100 and block).
+    h.transfer(&recv, 80);
+    // …and the window is genuinely live again, not merely disabled: the next
+    // 80 no longer fits.
+    h.transfer_expect_blocked(&recv, 80);
+}
+
+/// Issue #95 (c): both lifecycle steps emit their event, carrying the
+/// `PolicyRevision` each step produced (SPEC §9, issue #38), so the whole
+/// cycle is auditable from the event log alone.
+///
+/// Each assertion runs immediately after the call that should have produced
+/// it, because `env.events().all()` exposes one invocation's log rather than a
+/// cumulative history.
+#[test]
+fn revoke_then_set_policy_emits_both_lifecycle_events() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_secs = 60;
+    p.window_cap = 100;
+
+    // Step 1: the first set_policy emits `policy_set` at revision 1.
+    h.install_policy(&p);
+    assert_eq!(
+        event_count(&h.env, "event_policy_set"),
+        1,
+        "set_policy emits exactly one policy_set event"
+    );
+    assert_eq!(
+        last_event_revision(&h.env, "event_policy_set"),
+        1,
+        "the first set_policy is revision 1 (SPEC §3)"
+    );
+
+    h.set_time(1_000);
+    h.transfer(&recv, 80);
+
+    // Step 2: the revoke emits `policy_revoked` at revision 2, and nothing else
+    // — a `policy_set` here would mean the two lifecycle events are conflated.
+    h.env.mock_all_auths();
+    h.revoke_policy();
+    assert_eq!(
+        event_count(&h.env, "event_policy_revoked"),
+        1,
+        "revoke_policy emits exactly one policy_revoked event"
+    );
+    assert_eq!(
+        event_count(&h.env, "event_policy_set"),
+        0,
+        "revoke_policy must not also emit a policy_set event"
+    );
+    assert_eq!(
+        last_event_revision(&h.env, "event_policy_revoked"),
+        2,
+        "revoke_policy increments the revision counter (SPEC §3, issue #38)"
+    );
+    // SPEC §9: neither lifecycle event carries topic fields — the name alone
+    // is the topic, so `by`/`revision` are data. An extra topic here would mean
+    // the layout drifted from the documented table.
+    assert!(
+        has_event_with_topics(&h.env, "event_policy_revoked", &["event_policy_revoked"]),
+        "event_policy_revoked must carry exactly one topic (SPEC §9)"
+    );
+
+    // Step 3: the post-revoke set_policy emits `policy_set` at revision 3 — the
+    // counter keeps marching across the revoke and is never reset.
+    h.set_time(1_010);
+    h.install_policy(&p);
+    assert_eq!(
+        event_count(&h.env, "event_policy_set"),
+        1,
+        "the post-revoke set_policy emits exactly one policy_set event"
+    );
+    assert_eq!(
+        last_event_revision(&h.env, "event_policy_set"),
+        3,
+        "the post-revoke set_policy advances the counter again (issue #38)"
+    );
+    assert!(
+        has_event_with_topics(&h.env, "event_policy_set", &["event_policy_set"]),
+        "event_policy_set must carry exactly one topic (SPEC §9)"
+    );
+
+    // The cycle is over and the account is enforcing again.
+    h.transfer(&recv, 10);
+}
+
 /// SPEC §8: the contract's own address is rejected in **all three** policy
 /// lists. An `assets`/`protocols` self-entry is a nonsensical allowlist (the
 /// account's self-calls are governed by the fixed §6.1 rule, not policy), and
@@ -1653,31 +1935,39 @@ fn batch_events_emit_in_order_with_context_index() {
 
     assert_eq!(auth_events.len(), 3);
 
-    let build_map = |idx: u32| {
-        let key = soroban_sdk::xdr::ScVal::Symbol(
-            soroban_sdk::xdr::ScSymbol::try_from(std::vec::Vec::from("context_index")).unwrap(),
-        );
-        let val = soroban_sdk::xdr::ScVal::U32(idx);
-        soroban_sdk::xdr::ScVal::Map(Some(soroban_sdk::xdr::ScMap(
-            soroban_sdk::xdr::VecM::try_from(std::vec::Vec::from([soroban_sdk::xdr::ScMapEntry {
-                key,
-                val,
-            }]))
+    let build_map = |idx: u32, revision: u64| {
+        use soroban_sdk::xdr::{ScMap, ScMapEntry, ScSymbol, ScVal as XdrScVal, VecM};
+        let entry = |key: &str, val: XdrScVal| ScMapEntry {
+            key: XdrScVal::Symbol(ScSymbol::try_from(std::vec::Vec::from(key)).unwrap()),
+            val,
+        };
+        // `auth_checked` data: {context_index, revision} (issue #38: the
+        // policy revision in force at decision time joins the event to the
+        // policy generation that produced it).
+        XdrScVal::Map(Some(ScMap(
+            VecM::try_from(std::vec::Vec::from([
+                entry("context_index", XdrScVal::U32(idx)),
+                entry("revision", XdrScVal::U64(revision)),
+            ]))
             .unwrap(),
         )))
     };
 
+    // The policy was installed once, so every decision in this batch runs
+    // under revision 1 (issue #38).
+    let revision = 1;
+
     // ctx1: allowed
     assert_eq!(auth_events[0].0.get(1).unwrap(), &want_allowed);
-    assert_eq!(auth_events[0].1, build_map(0)); // context_index
+    assert_eq!(auth_events[0].1, build_map(0, revision));
 
     // ctx2: blocked, PerTxCapExceeded
     assert_eq!(auth_events[1].0.get(1).unwrap(), &want_blocked);
-    assert_eq!(auth_events[1].1, build_map(1));
+    assert_eq!(auth_events[1].1, build_map(1, revision));
 
     // ctx3: allowed (even though the batch fails, decide evaluates all contexts and emits for all)
     assert_eq!(auth_events[2].0.get(1).unwrap(), &want_allowed);
-    assert_eq!(auth_events[2].1, build_map(2));
+    assert_eq!(auth_events[2].1, build_map(2, revision));
 }
 
 #[test]
@@ -2127,4 +2417,502 @@ fn heartbeat_event_uses_grace_current_at_emission_not_a_stale_one() {
     h.heartbeat();
     let (third_at, third_expiry) = last_heartbeat_payload(&h.env).expect("third heartbeat event");
     assert_eq!((third_at, third_expiry), (1_020, 0));
+}
+
+// ── Issue #35: `validate_policy` per-rule identifiability ─────────────────
+//
+// SPEC §8 validation rules reject a candidate policy at `set_policy`, but the
+// on-chain surface collapses every rejection into the single stable
+// `InvalidConfig` code. The `validate_policy` read is the identifiable
+// counterpart: it dry-runs the same rules over a *candidate* config and names
+// the first failing rule in §8 order, so SDKs and dashboards can preflight a
+// policy without paying a rejected on-chain call. Each test pins one rule via
+// the dry-run read and re-asserts the on-chain path stays fail-closed for the
+// same config (panic + policy never installed).
+
+/// Dry-run names the exact rule, and `set_policy` still rejects fail-closed.
+fn assert_rejects_with(h: &Harness, cfg: &PolicyConfig, want: &PolicyRuleId) {
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    assert_eq!(
+        client.validate_policy(cfg),
+        ValidationOutcome::Invalid(want.clone()),
+        "validate_policy must identify the failing rule"
+    );
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_policy(cfg);
+    }));
+    assert!(res.is_err(), "set_policy must still reject this config");
+    assert!(
+        client.policy().is_none(),
+        "a rejected config must never be installed (fail-closed)"
+    );
+}
+
+#[test]
+fn validate_policy_reports_amount_sign() {
+    let h = Harness::new();
+
+    let mut p = h.base_policy();
+    p.per_tx_cap = -1;
+    assert_rejects_with(&h, &p, &PolicyRuleId::AmountSign);
+
+    let mut p = h.base_policy();
+    p.window_cap = -1;
+    assert_rejects_with(&h, &p, &PolicyRuleId::AmountSign);
+}
+
+#[test]
+fn validate_policy_reports_window_requires_width() {
+    let h = Harness::new();
+
+    // Global form: a spend cap with no window to spend within.
+    let mut p = h.base_policy();
+    p.window_secs = 0;
+    p.window_cap = 100;
+    assert_rejects_with(&h, &p, &PolicyRuleId::WindowRequiresWidth);
+
+    // Per-recipient form: an override cap with no window is the same rule.
+    let mut p = h.base_policy();
+    p.window_secs = 0;
+    p.recipient_window_caps = soroban_sdk::vec![
+        &h.env,
+        RecipientCap {
+            recipient: h.recv.clone(),
+            cap: 50,
+        },
+    ];
+    assert_rejects_with(&h, &p, &PolicyRuleId::WindowRequiresWidth);
+}
+
+#[test]
+fn validate_policy_reports_active_window_order() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.active_from = 100;
+    p.active_until = 100; // end equal to start is not "after"
+    assert_rejects_with(&h, &p, &PolicyRuleId::ActiveWindowOrder);
+}
+
+#[test]
+fn validate_policy_reports_self_address_in_list() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // assets
+    let mut p = h.base_policy();
+    p.assets = soroban_sdk::vec![&h.env, h.guard.clone()];
+    assert_eq!(
+        client.validate_policy(&p),
+        ValidationOutcome::Invalid(PolicyRuleId::SelfAddressInList)
+    );
+
+    // protocols
+    let mut p = h.base_policy();
+    p.protocols = soroban_sdk::vec![
+        &h.env,
+        ProtocolRule {
+            contract: h.guard.clone(),
+            fns: None,
+        },
+    ];
+    assert_eq!(
+        client.validate_policy(&p),
+        ValidationOutcome::Invalid(PolicyRuleId::SelfAddressInList)
+    );
+
+    // recipients
+    let mut p = h.base_policy();
+    p.recipients = soroban_sdk::vec![&h.env, h.guard.clone()];
+    assert_eq!(
+        client.validate_policy(&p),
+        ValidationOutcome::Invalid(PolicyRuleId::SelfAddressInList)
+    );
+
+    // recipient_window_caps
+    let mut p = h.base_policy();
+    p.recipient_window_caps = soroban_sdk::vec![
+        &h.env,
+        RecipientCap {
+            recipient: h.guard.clone(),
+            cap: 10,
+        },
+    ];
+    assert_eq!(
+        client.validate_policy(&p),
+        ValidationOutcome::Invalid(PolicyRuleId::SelfAddressInList)
+    );
+
+    // blocked_recipients
+    let mut p = h.base_policy();
+    p.blocked_recipients = soroban_sdk::vec![&h.env, h.guard.clone()];
+    assert_eq!(
+        client.validate_policy(&p),
+        ValidationOutcome::Invalid(PolicyRuleId::SelfAddressInList)
+    );
+}
+
+#[test]
+fn validate_policy_reports_duplicate_address_in_list() {
+    let h = Harness::new();
+
+    let mut p = h.base_policy();
+    p.assets = soroban_sdk::vec![&h.env, h.asset.clone(), h.asset.clone()];
+    assert_rejects_with(&h, &p, &PolicyRuleId::DuplicateAddressInList);
+
+    let mut p = h.base_policy();
+    p.recipients = soroban_sdk::vec![&h.env, h.recv.clone(), h.recv.clone()];
+    assert_rejects_with(&h, &p, &PolicyRuleId::DuplicateAddressInList);
+}
+
+#[test]
+fn validate_policy_reports_duplicate_recipient_cap() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.recipient_window_caps = soroban_sdk::vec![
+        &h.env,
+        RecipientCap {
+            recipient: h.recv.clone(),
+            cap: 10,
+        },
+        RecipientCap {
+            recipient: h.recv.clone(),
+            cap: 20,
+        },
+    ];
+    assert_rejects_with(&h, &p, &PolicyRuleId::DuplicateRecipientCap);
+}
+
+#[test]
+fn validate_policy_reports_recipient_list_too_long() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // Bound is inclusive: exactly the limit is still valid.
+    let mut at_limit = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..256u32 {
+        at_limit.push_back(Address::generate(&h.env));
+    }
+    let mut p = h.base_policy();
+    p.blocked_recipients = at_limit;
+    assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
+
+    // One more exceeds it; the dry run names the list-length rule.
+    let mut p = h.base_policy();
+    p.blocked_recipients = soroban_sdk::vec![&h.env];
+    for _ in 0..257u32 {
+        p.blocked_recipients.push_back(Address::generate(&h.env));
+    }
+    assert_rejects_with(&h, &p, &PolicyRuleId::RecipientListTooLong);
+}
+
+#[test]
+fn policy_asset_protocol_and_recipient_limits_are_inclusive_and_fail_closed() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    let baseline = h.base_policy();
+    client.set_policy(&baseline);
+
+    let mut assets = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..crate::types::MAX_POLICY_ASSETS {
+        assets.push_back(Address::generate(&h.env));
+    }
+    let mut at_limit = baseline.clone();
+    at_limit.assets = assets.clone();
+    assert_eq!(client.validate_policy(&at_limit), ValidationOutcome::Valid);
+    client.set_policy(&at_limit);
+    assert_eq!(client.policy(), Some(at_limit.clone()));
+    assets.push_back(Address::generate(&h.env));
+    let mut over_limit = at_limit.clone();
+    over_limit.assets = assets;
+    assert_rejects_preserving_policy(
+        &h.env,
+        &h.guard,
+        &over_limit,
+        &at_limit,
+        &PolicyRuleId::AssetListTooLong,
+    );
+
+    let mut protocols = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..crate::types::MAX_POLICY_PROTOCOLS {
+        protocols.push_back(ProtocolRule {
+            contract: Address::generate(&h.env),
+            fns: None,
+        });
+    }
+    let mut at_limit = baseline.clone();
+    at_limit.protocols = protocols.clone();
+    assert_eq!(client.validate_policy(&at_limit), ValidationOutcome::Valid);
+    client.set_policy(&at_limit);
+    assert_eq!(client.policy(), Some(at_limit.clone()));
+    protocols.push_back(ProtocolRule {
+        contract: Address::generate(&h.env),
+        fns: None,
+    });
+    let mut over_limit = at_limit.clone();
+    over_limit.protocols = protocols;
+    assert_rejects_preserving_policy(
+        &h.env,
+        &h.guard,
+        &over_limit,
+        &at_limit,
+        &PolicyRuleId::ProtocolListTooLong,
+    );
+
+    let mut recipients = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..crate::types::MAX_RECIPIENT_ENTRIES {
+        recipients.push_back(Address::generate(&h.env));
+    }
+    let mut at_limit = baseline;
+    at_limit.recipients = recipients.clone();
+    assert_eq!(client.validate_policy(&at_limit), ValidationOutcome::Valid);
+    client.set_policy(&at_limit);
+    assert_eq!(client.policy(), Some(at_limit.clone()));
+    recipients.push_back(Address::generate(&h.env));
+    let mut over_limit = at_limit.clone();
+    over_limit.recipients = recipients;
+    assert_rejects_preserving_policy(
+        &h.env,
+        &h.guard,
+        &over_limit,
+        &at_limit,
+        &PolicyRuleId::RecipientListTooLong,
+    );
+}
+
+fn assert_rejects_preserving_policy(
+    env: &Env,
+    guard: &Address,
+    candidate: &PolicyConfig,
+    installed: &PolicyConfig,
+    rule: &PolicyRuleId,
+) {
+    let client = PolicyEngineClient::new(env, guard);
+    assert_eq!(
+        client.validate_policy(candidate),
+        ValidationOutcome::Invalid(rule.clone())
+    );
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_policy(candidate);
+    }));
+    assert!(
+        res.is_err(),
+        "over-limit policy must fail with InvalidConfig"
+    );
+    assert_eq!(client.policy(), Some(installed.clone()));
+}
+
+#[test]
+fn validate_policy_reports_recipient_cap_sign() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.recipient_window_caps = soroban_sdk::vec![
+        &h.env,
+        RecipientCap {
+            recipient: h.recv.clone(),
+            cap: -5,
+        },
+    ];
+    assert_rejects_with(&h, &p, &PolicyRuleId::RecipientCapSign);
+}
+
+#[test]
+fn validate_policy_reports_recipient_allow_and_blocked() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.blocked_recipients = soroban_sdk::vec![&h.env, h.recv.clone()];
+    assert_rejects_with(&h, &p, &PolicyRuleId::RecipientAllowAndBlocked);
+}
+
+#[test]
+fn validate_policy_reports_protocol_contract_duplicate() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    let rule = ProtocolRule {
+        contract: h.asset.clone(),
+        fns: None,
+    };
+    p.protocols = soroban_sdk::vec![&h.env, rule.clone(), rule];
+    assert_rejects_with(&h, &p, &PolicyRuleId::ProtocolContractDuplicate);
+}
+
+#[test]
+fn validate_policy_reports_protocol_fn_list_invalid() {
+    let h = Harness::new();
+
+    // An explicit `Some` fn list may not be empty.
+    let mut p = h.base_policy();
+    p.protocols = soroban_sdk::vec![
+        &h.env,
+        ProtocolRule {
+            contract: h.asset.clone(),
+            fns: Some(soroban_sdk::Vec::new(&h.env)),
+        },
+    ];
+    assert_rejects_with(&h, &p, &PolicyRuleId::ProtocolFnListInvalid);
+
+    // ...nor contain duplicate fn names.
+    let mut p = h.base_policy();
+    let fns = soroban_sdk::vec![
+        &h.env,
+        Symbol::new(&h.env, "transfer"),
+        Symbol::new(&h.env, "transfer"),
+    ];
+    p.protocols = soroban_sdk::vec![
+        &h.env,
+        ProtocolRule {
+            contract: h.asset.clone(),
+            fns: Some(fns),
+        },
+    ];
+    assert_rejects_with(&h, &p, &PolicyRuleId::ProtocolFnListInvalid);
+}
+
+#[test]
+fn validate_policy_accepts_valid_config_and_ignores_installed_policy() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // No policy installed: the candidate is judged on its own merits.
+    assert_eq!(
+        client.validate_policy(&h.base_policy()),
+        ValidationOutcome::Valid
+    );
+
+    // Install one, then dry-run the same candidate plus a broken one: the
+    // verdict is about the *argument*, never the installed policy...
+    h.install_policy(&h.base_policy());
+    assert_eq!(
+        client.validate_policy(&h.base_policy()),
+        ValidationOutcome::Valid
+    );
+    let mut broken = h.base_policy();
+    broken.window_cap = -1;
+    assert_eq!(
+        client.validate_policy(&broken),
+        ValidationOutcome::Invalid(PolicyRuleId::AmountSign)
+    );
+
+    // ...and a rejected dry-run never disturbs the installed policy.
+    assert_eq!(client.policy().unwrap().window_cap, 0);
+}
+
+// ── Issue #34: sane upper bounds on `window_secs` / `dms_grace_secs` ─────
+
+/// SPEC §8 (issue #34): both duration fields are `u64`, so a seconds/millis
+/// mix-up or `u64::MAX` would read as a valid config while silently disabling
+/// pruning (or the dead-man switch) forever. Anything above
+/// `MAX_WINDOW_SECS` / `MAX_DMS_GRACE_SECS` (`315_360_000` s ≈ 10 years) is
+/// rejected as `InvalidConfig`, fail-closed: the previously installed policy
+/// (if any) stays unchanged.
+#[test]
+fn window_and_dms_upper_bounds_rejected() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // `set_policy` returns `()` and signals rejection by panicking through
+    // `panic_with_error!` (same pattern as `self_address_rejected_in_every_list`):
+    // assert the panic *and* the fail-closed invariant.
+    let expect_invalid = |cfg: &PolicyConfig, what: &str| {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_policy(cfg);
+        }));
+        assert!(
+            res.is_err(),
+            "`{what}` must fail set_policy with InvalidConfig"
+        );
+        assert!(
+            client.policy().is_none(),
+            "`{what}` must leave the policy uninstalled (fail-closed)"
+        );
+    };
+
+    // The motivating case: `u64::MAX` — "effectively forever".
+    let mut p = h.base_policy();
+    p.window_secs = u64::MAX;
+    expect_invalid(&p, "window_secs = u64::MAX");
+
+    // One second past the bound is already rejected (inclusive bound).
+    let mut p = h.base_policy();
+    p.window_secs = crate::types::MAX_WINDOW_SECS + 1;
+    expect_invalid(&p, "window_secs = MAX + 1");
+
+    // Same rule for the dead-man switch grace: `u64::MAX` silently turns §5 off.
+    let mut p = h.base_policy();
+    p.dms_grace_secs = u64::MAX;
+    expect_invalid(&p, "dms_grace_secs = u64::MAX");
+
+    let mut p = h.base_policy();
+    p.dms_grace_secs = crate::types::MAX_DMS_GRACE_SECS + 1;
+    expect_invalid(&p, "dms_grace_secs = MAX + 1");
+
+    // Sanity: the same env still installs an in-bounds policy cleanly, proving
+    // the rejections above came from the bound and not from a broken harness.
+    client.set_policy(&h.base_policy());
+    assert!(client.policy().is_some());
+}
+
+/// SPEC §8 (issue #34): the bound is inclusive — exactly `MAX_WINDOW_SECS` /
+/// `MAX_DMS_GRACE_SECS` installs cleanly — and `0` stays legal for both
+/// fields (feature disabled), so no legitimate policy regresses.
+#[test]
+fn window_and_dms_upper_bounds_accept_boundary() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // Exactly at the bound: accepted, stored verbatim.
+    let mut p = h.base_policy();
+    p.window_secs = crate::types::MAX_WINDOW_SECS;
+    client.set_policy(&p);
+    assert_eq!(
+        client.policy().expect("policy installed").window_secs,
+        crate::types::MAX_WINDOW_SECS
+    );
+
+    let mut p = h.base_policy();
+    p.dms_grace_secs = crate::types::MAX_DMS_GRACE_SECS;
+    client.set_policy(&p);
+    assert_eq!(
+        client.policy().expect("policy installed").dms_grace_secs,
+        crate::types::MAX_DMS_GRACE_SECS
+    );
+
+    // 0 remains legal for both fields.
+    let mut p = h.base_policy();
+    p.window_secs = 0;
+    p.dms_grace_secs = 0;
+    client.set_policy(&p);
+    let stored = client.policy().expect("policy installed");
+    assert_eq!((stored.window_secs, stored.dms_grace_secs), (0, 0));
+}
+
+/// The dry-run read reports the same duration rule: the #34 bound is
+/// implemented as a `PolicyRuleId`, so `validate_policy` identifies it too —
+/// `set_policy` and the dry run can never disagree about this rule.
+#[test]
+fn validate_policy_reports_duration_exceeds_bound() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    let mut p = h.base_policy();
+    p.window_secs = crate::types::MAX_WINDOW_SECS + 1;
+    assert_eq!(
+        client.validate_policy(&p),
+        ValidationOutcome::Invalid(PolicyRuleId::DurationExceedsBound)
+    );
+
+    let mut p = h.base_policy();
+    p.dms_grace_secs = crate::types::MAX_DMS_GRACE_SECS + 1;
+    assert_eq!(
+        client.validate_policy(&p),
+        ValidationOutcome::Invalid(PolicyRuleId::DurationExceedsBound)
+    );
+
+    // Exactly at the bound (both fields at once): the dry run is `Valid` and
+    // the real `set_policy` accepts — inclusive bound, on both surfaces.
+    let mut p = h.base_policy();
+    p.window_secs = crate::types::MAX_WINDOW_SECS;
+    p.dms_grace_secs = crate::types::MAX_DMS_GRACE_SECS;
+    assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
+    client.set_policy(&p);
+    assert!(client.policy().is_some());
 }
