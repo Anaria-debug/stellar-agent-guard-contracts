@@ -1716,3 +1716,214 @@ fn detailed_check_reports_per_recipient_headroom() {
     assert_eq!(detail.remaining_window, Some(60)); // 100 cap - 40 already admitted
     assert_eq!(detail.effective_window_cap, Some(100));
 }
+
+// ── status() operational fields (issue #29) ──────────────────────────────
+
+#[test]
+fn status_without_policy_reports_null_operational_fields() {
+    let h = Harness::new();
+    let st = h.status();
+    assert!(!st.has_policy);
+    // Default-deny has nothing to pause, no cap to project headroom from, and
+    // no active window to sit outside of — all three must be inert.
+    assert!(!st.paused);
+    assert_eq!(st.window_remaining, None);
+    assert!(!st.outside_active_window);
+}
+
+#[test]
+fn status_reports_paused_flag_from_policy() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    h.install_policy(&p);
+    assert!(!h.status().paused);
+
+    p.paused = true;
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).set_policy(&p);
+    assert!(h.status().paused);
+}
+
+#[test]
+fn status_window_remaining_full_partial_and_disabled() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // Full headroom before any spend.
+    let st = h.status();
+    assert_eq!(st.window_remaining, Some(100));
+
+    // Partially spent window: 40 admitted, headroom drops to 60. This must
+    // agree with the `remaining_window` `check_detailed` reports for a
+    // recipient without a per-recipient override.
+    h.transfer(&recv, 40);
+    let st = h.status();
+    assert_eq!(st.window_remaining, Some(60));
+    let detail = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
+    });
+    assert_eq!(detail.remaining_window, st.window_remaining);
+
+    // Spent to exactly the cap: headroom floors at 0 (never negative).
+    h.transfer(&recv, 60);
+    let st = h.status();
+    assert_eq!(st.window_remaining, Some(0));
+    assert_eq!(st.now, h.env.ledger().timestamp());
+
+    // Disabled global cap (window_cap = 0): None, even with a live policy.
+    p.window_cap = 0;
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).set_policy(&p);
+    assert_eq!(h.status().window_remaining, None);
+}
+
+#[test]
+fn status_window_remaining_ignores_expired_entries() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_secs = 100;
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+    h.transfer(&recv, 80);
+    assert_eq!(h.status().window_remaining, Some(20));
+
+    // 200s later the whole window has rolled over: headroom must be back to
+    // full even though the ledger still *stores* the expired entry, because
+    // `status` prunes on read exactly like the decision path.
+    h.set_time(1_200);
+    assert_eq!(h.status().window_remaining, Some(100));
+}
+
+#[test]
+fn status_window_remaining_agrees_with_check_detailed_for_recipient_override_too() {
+    // A recipient *with* a per-recipient override gets its own tighter ledger;
+    // the global `window_remaining` must still track the global cap/total so
+    // the two reads can never disagree about the global picture.
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_cap = 1_000;
+    p.recipient_window_caps = soroban_sdk::vec![
+        &h.env,
+        crate::types::RecipientCap {
+            recipient: recv.clone(),
+            cap: 100,
+        },
+    ];
+    h.install_policy(&p);
+    h.set_time(1_000);
+    h.transfer(&recv, 40);
+
+    assert_eq!(h.status().window_remaining, Some(960));
+    let detail = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
+    });
+    // The recipient-targeted read is tighter — that difference is the point.
+    assert_eq!(detail.remaining_window, Some(60));
+}
+
+#[test]
+fn status_outside_active_window_tracks_bounds() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.active_from = 1_500;
+    p.active_until = 1_600;
+    h.install_policy(&p);
+
+    // Before the window opens.
+    h.set_time(1_499);
+    // Inclusive open boundary (now == active_from is inside).
+    h.set_time(1_500);
+    assert!(!h.status().outside_active_window);
+    h.set_time(1_600);
+    assert!(!h.status().outside_active_window);
+    // Inclusive close boundary (now == active_until is inside), then after.
+    h.set_time(1_601);
+    assert!(h.status().outside_active_window);
+
+    // Unrestricted windows never read as outside.
+    p.active_from = 0;
+    p.active_until = 0;
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).set_policy(&p);
+    h.set_time(1_700);
+    assert!(!h.status().outside_active_window);
+}
+
+#[test]
+fn status_outside_active_window_matches_check_block_reason() {
+    // The flag must agree with the §4 gate: when `check` blocks with
+    // `outside_active_window`, `status` must say so — and vice versa.
+    let h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.active_from = 1_400;
+    p.active_until = 1_500;
+    h.install_policy(&p);
+    h.set_time(1_000);
+    assert!(h.status().outside_active_window);
+    let detail = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
+    });
+    assert_eq!(
+        detail.result,
+        CheckResult::Blocked(Symbol::new(&h.env, "outside_active_window"))
+    );
+
+    // Inside the window: flag clears and the same transfer is allowed.
+    h.set_time(1_450);
+    assert!(!h.status().outside_active_window);
+    let detail = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
+    });
+    assert_eq!(detail.result, CheckResult::Allowed);
+}
+
+#[test]
+fn status_reads_never_write_window_or_emit_events() {
+    // `status` is an event-free, write-free read. `env.events().all()` holds
+    // only the most recent top-level invocation's events, so a status() call
+    // followed by an empty event list proves that invocation emitted nothing.
+    // Write-freedom is asserted directly on the persisted window ledger.
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+    h.transfer(&recv, 40);
+
+    let ledger_before = h.env.as_contract(&h.guard, || {
+        h.env
+            .storage()
+            .persistent()
+            .get::<DataKey, crate::types::WindowState>(&DataKey::Window)
+    });
+    for _ in 0..3 {
+        assert_eq!(h.status().window_remaining, Some(60));
+        assert!(
+            h.env.events().all().events().is_empty(),
+            "status must not emit (an auth_checked event here is a bug)"
+        );
+    }
+    let ledger_after = h.env.as_contract(&h.guard, || {
+        h.env
+            .storage()
+            .persistent()
+            .get::<DataKey, crate::types::WindowState>(&DataKey::Window)
+    });
+    assert_eq!(
+        ledger_after, ledger_before,
+        "status must not rewrite the window ledger"
+    );
+
+    // And spend accounting was untouched: a further 60 transfer must still fit.
+    h.transfer(&recv, 60);
+    assert_eq!(h.status().window_remaining, Some(0));
+}

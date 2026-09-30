@@ -117,6 +117,29 @@ To verify what a deployment contains:
    `cargo audit` / `cargo deny check advisories`). The SBOM is the inventory
    artifact; the advisory scan is a separate gate.
 
+## Release artifact verification
+
+Every tagged release (`v*`) publishes four assets, built only after the full
+gate suite (format, clippy, tests) went green — a failed gate blocks the
+release (see `.github/workflows/release.yml`):
+
+- `stellar_agent_guard_contracts.wasm` — the deployable contract build.
+- `stellar_agent_guard_contracts.wasm.sha256` — its SHA-256 checksum.
+- `provenance.txt` — the git tag, commit SHA, exact build command, toolchain
+  version (`rustc`/`cargo`), and runner the WASM was built on.
+- `sbom.cdx.json` — the CycloneDX inventory described above.
+
+Before deploying a released artifact:
+
+1. Verify the checksum: `sha256sum -c stellar_agent_guard_contracts.wasm.sha256`
+   must print `OK`. A mismatch means the download is corrupt or tampered with —
+   do not deploy it.
+2. Confirm `provenance.txt` pins the git tag and commit you expect, then
+   rebuild that tag yourself (`cargo build --release --target wasm32v1-none`)
+   and compare hashes for a reproducibility check.
+3. Diff the SBOM component list against a locally regenerated one as described
+   above.
+
 ## Security Considerations
 
 - The policy admin holds **no fund-moving authority**; only the registered agent
