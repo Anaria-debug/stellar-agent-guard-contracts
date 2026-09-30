@@ -343,6 +343,7 @@ impl Error {
             Self::SelfFunctionNotAllowed,
             Self::CreateContractNotAllowed,
             Self::ProtocolCallRateExceeded,
+            Self::DecisionInvariantViolation,
         ];
         all_errors
             .into_iter()
