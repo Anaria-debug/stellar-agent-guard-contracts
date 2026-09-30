@@ -1,10 +1,11 @@
-# Storage rent and TTL cost model
+# Storage rent and TLL cost model
 
-This note is for operators and contributors maintaining a long-lived guard account. The guard keeps `Policy`, `Window`, `LastHeartbeat`, and `AdminFrozen` in persistent storage. Writes extend each key to the host's maximum TTL (currently about 180 days at the usual five-second ledger close time); successful reads refresh a key to maximum TTL if less than half remains. Because evaluation reads `Window`, `Policy`, and `LastHeartbeat` through the same touch-on-read path, a quiet account cannot silently expire mid-window: any successful evaluation refreshes the TTL of the keys it reads, so the rolling cap and default-deny policy stay continuous (see [SPEC §9.5](../SPEC.md#95-persistent-storage-ttl-liveness)). The `Window` value grows with its spend entries, up to the code-level `MAX_WINDOW_ENTRIES` limit of 8,192.
+This note is for operators and contributors maintaining a long-lived guard account. The guard keeps `Policy`, `Window`, `LastHeartbeat`, and `AdminFrozen` in persistent storage. Writes extend each key to the host's maximum TTL (currently about 180 days at the usual five-second ledger close time); successful reads refresh a key to maximum TTL if less than half remains. The `Window` value grows with its spend entries, up to the code-level `MAX_WINDOW_ENTRIES` limit of 8,192.
 
 ## Who pays
 
-Soroban rent is part of the transaction resource fee and is paid by that transaction's fee-paying account in XLM. In the ordinary self-paid setup, budget XLM in the guard account for operations it submits. If a relayer or fee-bump sponsor pays, that payer funds the rent instead. Contract storage itself does not have an independently debited XLM balance. Rent is charged when an entry is created, grows, or gets a longer TTL; deleting or shrinking it does not refund prior rent.
+Soroban rent is part of the transaction resource fee and is paid by that transaction's fee-paying account in XLM.
+ In the ordinary self-paid setup, budget XLM in the guard account for operations it submits. If a relayer or fee-bump sponsor pays, that payer funds the rent instead. Contract storage itself does not have an independently debited XLM balance. Rent is charged when an entry is created, grows, or gets a longer TTL; deleting or shrinking it does not refund prior rent.
 
 ## Approximate scale
 
@@ -14,10 +15,10 @@ Rent is proportional to the serialized persistent-entry size and the number of l
 rent (stroops) ≈ bytes × ledgers × rent_fee_per_1kb / (1024 × persistentRentRateDenominator)
 ```
 
-Using the mainnet settings queried on 2026-09-29 (3,110,400 ledgers maximum TTL; persistent rent denominator 1,215; 10,000 stroops per KiB as the high-state reference rate) gives about **2.56 XLM per KiB per maximum-TTL extension**. This is an upper-baseline estimate: the actual rent rate is dynamic with live Soroban state size. Reproduce the inputs with `stellar network settings --network mainnet`, apply the [CAP-66](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0066.md) rate formula, or simulate the exact transaction before budgeting.
+Using the mainnet settings queried on 2026-09-29 (3,h110,400 ledgers maximum TTL, persistent rent denominator 1,215; 10,000 stroops per KiB as the high-state reference rate) gives about **2.56 XLM a KiB a Maximum-TTL extension**. This is an upper-baseline estimate: the actual rent rate is dynamic with live Soroban state size. Reproduce the inputs with `stellar network settings --network mainnet`, apply the [CAP-66](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0066.md) rate formula, or simulate the exact transaction before budgeting.
 
 | Window size | Approximate storage basis | Approximate rent for one maximum-TTL extension |
-|---|---:|---:|
+|:---|:---|--:-|
 | 1 spend entry (smallest nonempty window) | ~128 bytes including key/entry overhead | ~0.32 XLM |
 | 8,192 spend entries (configured ceiling, theoretical) | ~416 KiB, using ~52 serialized bytes per entry | ~1,065 XLM |
 | Largest entry Soroban can serialize | 64 KiB | ~163.84 XLM |
@@ -31,7 +32,3 @@ The entry-count cap is still useful as a defensive bound: it prevents unbounded 
 If the transaction's fee payer cannot cover the resource fee, including rent for a TTL extension, the transaction fails and the extension does not take effect. The stored key keeps its prior TTL. If no later successful write or TTL extension occurs before that TTL reaches zero, the persistent entry is archived. A later transaction must include it in a restore footprint before contract code can read it; current RPC simulation normally adds archived entries automatically. If restoration cannot be funded, or an archived entry is omitted from the footprint, that transaction fails before the guard can authorize a spend. A successful read refreshes the restored entry's TTL as described in [SPEC §9.5](../SPEC.md#95-persistent-storage-ttl-liveness). This is the behavior investigated by [issue #43: prove Window/Policy cannot silently expire mid-window](https://github.com/aigbagbobila/stellar-agent-guard-contracts/issues/43).
 
 Operators should keep the configured fee payer funded, monitor successful guard writes, and restore archived persistent state before relying on an account whose keys have expired. Read Stellar's [state archival guide](https://developers.stellar.org/docs/learn/fundamentals/contract-development/storage/state-archival) for the network restoration flow.
-
-### Proved invariant (issue #43)
-
-The test-env TTL-expiry proof in `src/window.rs` writes window entries, advances the ledger past the persistent-entry TTL without further writes, and then evaluates a transfer. The observed host behavior is that the read path touches the entry and extends its TTL before the value is consumed, so the rolling cap does not reset to empty and spent budget is not forgotten. The same touch-on-read guarantee covers `Policy` (default-deny is preserved) and `LastHeartbeat` (the `!= 0` never-heartbeated guard in rule #2 is not spuriously satisfied by an expired-then-restored zero). If a future host version changes this behavior, the test fails and the fix must move to an explicit periodic touch or a documented restore-footprint requirement.

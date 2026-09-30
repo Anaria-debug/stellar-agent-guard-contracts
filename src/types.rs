@@ -1,5 +1,5 @@
-/// Shared types: policy model, storage keys, errors, and the pure parsed-call
-/// representation that the decision engine operates on.
+//! Shared types: policy model, storage keys, errors, and the pure parsed-call
+//! representation that the decision engine operates on.
 
 use soroban_sdk::{contracterror, contracttype, Address, Bytes, Env, Symbol, Vec};
 
@@ -225,7 +225,7 @@ pub const NO_POLICY_DIGEST: [u8; 32] = [
 ///    **ascending symbol-key order** (the host map invariant — the same order
 ///    SPEC$§3.2 pins for manual encoders), and
 /// 2. `ScVal` XDR is a canonical byte format: every field has a single XDR type
-///    (`i128` → `I128`, `u64` → `U64`, `Option::None` → `Void`, …), so two
+///    (`i128` → `i128`, `u64` → `U64`, `Option::None` → `Void`, …), so two
 ///    conforming encoders never disagree on the bytes.
 ///
 /// Any field change therefore changes the stream and the hash; a policy that
@@ -289,8 +289,8 @@ impl Error {
 pub struct CheckDetailed {
     pub allowed: bool,
     pub reason: Symbol,
-    pub window_remaining: Option<i128>,
-    pub recipient_remaining: Option<i128>,
-    pub window_expires_at: Option<u64>,
+    pub per_tx_cap_remaining: Option<i128>,
+    pub window_cap_remaining: Option<i128>,
+    pub recipient_cap_remaining: Option<i128>,
     pub protocol_calls_remaining: Option<u32>,
 }

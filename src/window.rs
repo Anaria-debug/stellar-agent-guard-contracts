@@ -14,11 +14,12 @@
 //! `lib.rs` (`persist_get`/`save_ledger`); this module transforms only the
 //! in-memory snapshot after storage has loaded it.
 //!
-//! TTL-expiry invariant (SPEC §9.5): the storage boundary must extend the
-//! persistent entry's TTL on every read that feeds a decision (touch-on-read),
-//! so a quiet account cannot have its `WindowState` silently archived between
-//! writes. The helpers below expose `touch`-style no-op accessors so the
-//! boundary can prove the invariant without mutating ledger contents.
+//! TTL continuity (SPEC §9.5): the storage boundary in `lib.rs` is
+//! responsible for extending the persistent `WindowState` TTL on every read
+//! *and* write (`persist_get`/`save_ledger`), so a quiet account cannot have
+//! its rolling-window entries silently archived mid-window. This module
+//! assumes the snapshot it receives is complete; it does not itself touch
+//! storage.
 
 use crate::types::{
     ProtocolCallEntry, RecipientWindowState, SpendEntry, WindowState, MAX_WINDOW_ENTRIES,
@@ -132,6 +133,11 @@ impl Ledger {
     /// at low timestamps, so an entry recorded at ledger ts 0 cannot be
     /// wrongly treated as expired just because `now - window_secs` would clip
     /// to 0 under saturating subtraction.
+    ///
+    /// Callers must have already loaded a snapshot whose persistent TTL was
+    /// refreshed by the storage boundary (see module docs); otherwise a
+    /// host-side archive could present an empty snapshot and this prune would
+    /// observe a reset budget.
     pub fn prune(&mut self, now: u64, window_secs: u64) {
         prune_entries(&mut self.total, &mut self.entries, now, window_secs);
         for i in 0..self.recipients.len() {
@@ -194,22 +200,6 @@ impl Ledger {
             &mut self.protocol_call_entries,
             now,
         );
-    }
-
-    /// Touch-on-read hook: called by the storage boundary after loading the
-    /// persisted `WindowState` so the caller can extend the entry's TTL before
-    /// any decision is made. This method intentionally performs no mutation of
-    /// the ledger contents; it exists so the invariant is exercised (and
-    /// covered by tests) at the same layer that owns TTL management.
-    ///
-    /// SPEC §9.5: reads that feed a decision must extend the persistent entry
-    /// to max TTL, otherwise a quiet account's window can be archived and the
-    /// rolling cap silently forgets spent budget.
-    pub fn touch(&self, _env: &Env) {
-        // No-op on the in-memory snapshot. The storage boundary is responsible
-        // for calling `env.storage().persistent().extend_ttl(...)` on the
-        // `WindowState` key. Keeping this method here makes the read path
-        // explicit and unit-testable.
     }
 }
 
@@ -692,16 +682,32 @@ mod tests {
     }
 
     #[test]
-    fn touch_is_a_noop_on_ledger_contents() {
-        // SPEC §9.5 invariant: the touch-on-read hook must not mutate the
-        // in-memory snapshot. TTL extension is the storage boundary's job;
-        // this test pins that the ledger layer stays pure so the boundary
-        // can safely call `touch` on every read path.
+    fn prune_of_empty_snapshot_is_indistinguishable_from_reset() {
+        // Issue #6 audit: this test pins the *in-memory* semantics that make
+        // the storage-boundary TTL guarantee load-bearing. If the host ever
+        // archives a persistent `WindowState` mid-window and the storage
+        // boundary in `lib.rs` fails to refresh TTL on read, `from_state`
+        // will be handed an empty `WindowState` and `prune` will observe a
+        // zero total — i.e. a silently reset rolling cap. The fix lives in
+        // `lib.rs` (`persist_get`/`save_ledger` touch-on-read/write); this
+        // test documents the failure mode the fix must prevent.
         let env = Env::default();
         let mut ledger = Ledger::empty(&env);
-        ledger.admit(100, 10);
-        let before = ledger.clone();
-        ledger.touch(&env);
-        assert_eq!(ledger, before);
+        ledger.admit(100, 7);
+        assert_eq!(ledger.total, 7);
+
+        // Simulate the host having archived the entry: the storage boundary
+        // hands back an empty `WindowState`.
+        let archived = WindowState {
+            total: 0,
+            entries: soroban_sdk::Vec::new(&env),
+            recipients: soroban_sdk::Vec::new(&env),
+            protocol_call_entries: soroban_sdk::Vec::new(&env),
+        };
+        let mut restored = Ledger::from_state(&env, archived);
+        restored.prune(101, 100);
+        // The cap has silently forgotten the spent budget — the exact
+        // fund-limit bypass the storage-boundary TTL refresh must prevent.
+        assert_eq!(restored.total, 0);
     }
 }
