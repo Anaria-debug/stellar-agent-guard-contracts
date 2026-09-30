@@ -514,6 +514,30 @@ fn emit_agent_rotated(env: &Env, by: &Address, old: &BytesN<32>, new: &BytesN<32
     .publish(env);
 }
 
+fn emit_admin_rotation_proposed(env: &Env, by: &Address, proposed: &Address) {
+    EventAdminRotationProposed {
+        by: by.clone(),
+        proposed: proposed.clone(),
+    }
+    .publish(env);
+}
+
+fn emit_admin_rotated(env: &Env, old: &Address, new: &Address) {
+    EventAdminRotated {
+        old: old.clone(),
+        new: new.clone(),
+    }
+    .publish(env);
+}
+
+fn emit_admin_rotation_cancelled(env: &Env, by: &Address, cancelled: &Address) {
+    EventAdminRotationCancelled {
+        by: by.clone(),
+        cancelled: cancelled.clone(),
+    }
+    .publish(env);
+}
+
 // ── Contract ──────────────────────────────────────────────────────────
 
 #[contract]
