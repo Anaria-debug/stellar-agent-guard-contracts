@@ -42,7 +42,7 @@ use types::{
     CheckResult, DataKey, PolicyRuleId, Status, WindowState, MAX_DMS_GRACE_SECS, MAX_POLICY_ASSETS,
     MAX_POLICY_PROTOCOLS, MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
 };
-use window::Ledger;
+use window::{Ledger, WindowMerge, WindowMergeKind};
 
 // ── Contract events (SPEC §9). Each event is its own type; topic layout
 //    follows the SPEC table exactly so the Phase-2 listener can filter on one
@@ -136,6 +136,31 @@ struct EventAgentRotated {
     by: Address,
     old_fingerprint: BytesN<8>,
     new_fingerprint: BytesN<8>,
+}
+
+/// A conservative ledger coalescence at the 8192-entry backstop.
+/// Topic 1 identifies the ledger kind; data carries retained timestamp/value.
+#[contractevent]
+#[derive(Clone)]
+struct EventWindowMerged {
+    #[topic]
+    ledger_kind: Symbol,
+    merged_ts: u64,
+    merged_value: i128,
+}
+
+fn emit_window_merge(env: &Env, merge: WindowMerge) {
+    let ledger_kind = match merge.kind {
+        WindowMergeKind::GlobalSpend => "global_spend",
+        WindowMergeKind::RecipientSpend => "recipient_spend",
+        WindowMergeKind::ProtocolCalls => "protocol_calls",
+    };
+    EventWindowMerged {
+        ledger_kind: Symbol::new(env, ledger_kind),
+        merged_ts: merge.merged_ts,
+        merged_value: merge.merged_value,
+    }
+    .publish(env);
 }
 
 // ── Persistent-storage helpers (SPEC §3) ────────────────────────────────
@@ -949,6 +974,9 @@ impl CustomAccountInterface for PolicyEngine {
 
         if all_passed {
             // 4. Persist window changes made by the decision.
+            for &merge in &ledger.merges {
+                emit_window_merge(&env, merge);
+            }
             let has_entries = ledger.len() > 0 || ledger_has_recipient_entries(&ledger);
             if window_persisted || has_entries {
                 save_ledger(&env, &ledger);
