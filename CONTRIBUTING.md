@@ -29,6 +29,11 @@ cargo build --release --target wasm32v1-none
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
 
+The `stellar` CLI cannot sign Soroban authorization entries whose address is a
+contract. Heartbeat testing uses the guard contract's own address, so the CLI
+cannot submit a heartbeat; use `agent-tx` for this path. See the
+[`agent-tx` usage guide](tools/agent-tx/README.md) for commands and options.
+
 ## Clean Build Artifacts
 
 ```bash
@@ -93,6 +98,14 @@ This removes all `target/` directories and `*.wasm` artifacts. The `.gitignore` 
 3. Describe the *why* in the PR body: what was broken/wrong, what the fix does,
    and — for enforcement changes — how it was verified (tests, and testnet
    evidence where applicable).
+
+## Keeping your PR mergeable
+
+This repo has a security-sensitive backlog and several PRs touching `engine.rs` in parallel; merge conflicts pile up fast. Keep your branch cheap to rebase:
+
+- **One logical unit per PR.** A bug fix, a doc change, a workflow --- each its own branch and PR. Small branches have a small conflict surface.
+- **Rebase onto `main` early and often**, not just once before opening the PR.
+- **Draft PRs get a nudge, not a close.** A draft that hasn't moved in 14 days gets a warning comment; if it's still stalled 7 days later it's closed (see `.github/workflows/stale.yml`). Issues are never auto-closed --- the backlog is curated by maintainers.
 
 ## Project Structure
 
