@@ -30,6 +30,7 @@ use soroban_sdk::{
     contract, contractevent, contractimpl, panic_with_error, vec, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, TryFromVal, Val,
 };
+pub use types::NO_POLICY_DIGEST;
 pub use types::{
     CheckDetail, Error, PolicyConfig, ProtocolRule, RecipientCap, RecipientWindowState,
 };
@@ -503,6 +504,30 @@ impl PolicyEngine {
         persist_get(&env, &DataKey::Policy)
     }
 
+    /// Canonical encoding fingerprint for cheap policy drift detection
+    /// (`policy_hash`): SHA-256 over the deterministic canonical encoding of
+    /// the installed policy (SPEC §7.3), or `NO_POLICY_DIGEST` (the SHA-256 of
+    /// the empty marker, documented and never trapping) when no policy is
+    /// installed. No auth, event-free, and write-free. A returned hash only
+    /// changes when the *policy* changes — not on any other storage or ledger
+    /// activity — so SDKs/dashboards can detect drift by comparing one 32-byte
+    /// value instead of shipping and diffing the full `PolicyConfig`, and can
+    /// record the value alongside `auth_checked` events as a tamper-evident
+    /// log anchor.
+    ///
+    /// Off-chain reproduction is pinned by SPEC §7.3 (field order, per-field
+    /// encoding, sentinel value) and locked by `tests/policy_hash_encoding.rs`.
+    #[allow(clippy::must_use_candidate)] // public read surface
+    pub fn policy_hash(env: Env) -> BytesN<32> {
+        match persist_get::<PolicyConfig>(&env, &DataKey::Policy) {
+            None => BytesN::from_array(&env, &crate::types::NO_POLICY_DIGEST),
+            Some(cfg) => {
+                let encoding = crate::types::policy_canonical_encoding(&env, &cfg);
+                env.crypto().sha256(&encoding).into()
+            }
+        }
+    }
+
     /// Evaluates dead-man switch health (`Ok`, `Warn` at ≥80% elapsed, or `Expired`).
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn dms_health(env: Env) -> crate::types::DmsHealthStatus {
@@ -514,17 +539,50 @@ impl PolicyEngine {
         engine::dms_health(now, last, &cfg)
     }
 
+    /// Operational snapshot: policy presence/revision, admin freeze, DMS state,
+    /// plus the operational fields (`paused`, `window_remaining`,
+    /// `outside_active_window`) a dashboard or SDK needs to explain *why* the
+    /// next transaction would be admitted or rejected. Event-free read with no
+    /// auth and no spend-accounting writes; like every persistent read it may
+    /// refresh entry TTLs (SPEC §9.5).
+    ///
+    /// Semantics of the operational fields mirror the §4 account gates and
+    /// `check_detailed` headroom exactly:
+    /// - `paused` is the policy's kill switch (`false` with no policy —
+    ///   default-deny has nothing to pause).
+    /// - `window_remaining` is global `window_cap - spent` on the *pruned*
+    ///   ledger (expired entries never count), or `None` when the global cap
+    ///   is disabled — including the no-policy case. Per-recipient override
+    ///   headroom is recipient-targeted; use `check_detailed` for that.
+    /// - `outside_active_window` evaluates the same bounds the §4 gate uses
+    ///   (`false` with no policy or an unrestricted window).
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn status(env: Env) -> Status {
-        let has_policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy).is_some();
+        let policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy);
         let policy_revision = persist_get::<u64>(&env, &DataKey::PolicyRevision).unwrap_or(0);
         let admin_frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
         let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
         let now = env.ledger().timestamp();
-        let grace =
-            persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
+        let (paused, window_remaining, outside_active_window, grace) = match &policy {
+            None => (false, None, false, 0),
+            Some(cfg) => {
+                // Prune a local copy of the ledger so remaining headroom never
+                // counts expired entries. No storage write: this is a read.
+                let mut ledger = load_ledger(&env);
+                if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
+                    ledger.prune(now, cfg.window_secs);
+                }
+                (
+                    cfg.paused,
+                    engine::global_window_remaining(cfg, &ledger),
+                    (cfg.active_from != 0 && now < cfg.active_from)
+                        || (cfg.active_until != 0 && now > cfg.active_until),
+                    cfg.dms_grace_secs,
+                )
+            }
+        };
         Status {
-            has_policy,
+            has_policy: policy.is_some(),
             policy_revision,
             admin_frozen,
             heartbeat_expired: grace > 0
@@ -532,6 +590,9 @@ impl PolicyEngine {
                 && now.saturating_sub(last_heartbeat) > grace,
             last_heartbeat,
             now,
+            paused,
+            window_remaining,
+            outside_active_window,
         }
     }
 
@@ -741,6 +802,7 @@ impl CustomAccountInterface for PolicyEngine {
 #[allow(clippy::must_use_candidate, clippy::len_without_is_empty)]
 pub mod testutils {
     pub use crate::engine::{contains_addr, decide, parse_call, AccountState, Decision};
+    pub use crate::types::policy_canonical_encoding;
     pub use crate::types::{
         CheckResult, DataKey, Error, PolicyConfig, ProtocolRule, RecipientCap,
         RecipientWindowState, Status, WindowState,
