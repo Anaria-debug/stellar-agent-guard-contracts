@@ -40,6 +40,19 @@ pub fn cap_metrics(
     (remaining, per_tx_cap, window_cap)
 }
 
+/// Global remaining window headroom for a policy: the rolling `window_cap`
+/// minus the (already pruned) global ledger total, or `None` when the global
+/// cap is disabled. This is the no-recipient branch of [`cap_metrics`], so
+/// `status().window_remaining` always agrees with the `remaining_window` a
+/// `check_detailed` call reports for a recipient without a per-recipient
+/// override. Per-recipient headroom stays recipient-targeted and is not
+/// reflected here (a global status has no recipient to project for).
+#[allow(clippy::must_use_candidate)]
+pub fn global_window_remaining(policy: &PolicyConfig, ledger: &Ledger) -> Option<i128> {
+    let remaining = policy.window_cap.saturating_sub(ledger.total).max(0);
+    (policy.window_cap > 0).then_some(remaining)
+}
+
 /// Evaluate dead-man switch health given current timestamp, last heartbeat, and policy config.
 pub fn dms_health(
     now: u64,
