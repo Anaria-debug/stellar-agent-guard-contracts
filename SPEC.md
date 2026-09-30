@@ -115,6 +115,7 @@ TTL on every write; see §9.5).
 | `Window` | `WindowState` | persistent | rolling spend ledger for asset transfers |
 | `LastHeartbeat` | `u64` | persistent | unix seconds of last agent heartbeat (0 = never) |
 | `AdminFrozen` | `bool` | persistent | admin-initiated freeze flag |
+| `AutoFrozenAt` | `u64` | persistent | unix seconds when DMS auto-freeze was explicitly recorded |
 
 ```rust
 #[contracttype]
@@ -210,10 +211,11 @@ admin's `unfreeze` (§7). This is the precise freeze/reversal boundary.
   window accounting.
 - **Grace:** `dms_grace_secs` in the policy (0 disables). Recommended default on testnet proofs:
   small (e.g. 60s) so the freeze is observable; production guidance ≥ several days.
-- **Freeze mechanism:** automatic and *lazy*. There is no stored "auto-frozen" flag — rule #2
+- **Freeze mechanism:** automatic and *lazy*. There is no stored "auto-frozen" flag for the enforcement itself — rule #2
   derives it from `LastHeartbeat` and ledger time on every authorization, so the account is
   frozen the moment the grace elapses, with zero transactions and zero background writes
   required, and can never be "unfrozen by time passing."
+- **Freeze visibility / Telemetry:** `refresh_deadman()` (permissionless). Because the freeze is lazy, it natively produces no on-chain event. This helper explicitly records `AutoFrozenAt` and emits a `dms_auto_frozen` event if the grace has elapsed. It does not weaken the freeze semantics: the authorization path still derives the decision lazily regardless of this flag (rule #2). It is permissionless because it only records an already-true fact (the account is already frozen).
 - **Manual freeze:** `freeze()` (admin) sets `AdminFrozen = true` — immediate, and blocks even a
   live, heartbeating agent.
 - **Reversal path (explicit):** `unfreeze()` (admin only) clears `AdminFrozen` **and** sets
@@ -308,6 +310,9 @@ pub fn heartbeat(env: Env)
     // require_auth(env.current_contract_address()) — i.e., routes through
     // __check_auth, which verifies the registered agent key. Records LastHeartbeat.
     // Blocked when AdminFrozen or grace already expired.
+pub fn refresh_deadman(env: Env)
+    // permissionless. Explicitly records AutoFrozenAt and emits an event if
+    // the grace has elapsed, for telemetry visibility. No effect on enforcement.
 pub fn freeze(env: Env)      // require_auth(Admin); sets AdminFrozen = true
 pub fn unfreeze(env: Env)    // require_auth(Admin); clears AdminFrozen, LastHeartbeat = now
 
@@ -380,6 +385,7 @@ filtering by the SDK listener.
 |---|---|---|---|
 | `auth_checked` | `result: Symbol` (`allowed`/`blocked`), `reason: Symbol` | — | every `__check_auth` / `check` decision |
 | `heartbeat` | — | `at: u64` | on agent heartbeat |
+| `dms_auto_frozen` | — | `at: u64` | explicit auto-freeze record via `refresh_deadman` |
 | `frozen` / `unfrozen` | — | `by: Address` | admin freeze / unfreeze |
 | `policy_set` / `policy_revoked` | — | `by: Address` | admin policy changes |
 
