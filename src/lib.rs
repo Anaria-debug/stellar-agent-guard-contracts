@@ -20,6 +20,9 @@ mod types;
 mod window;
 
 #[cfg(test)]
+mod event_audit_tests;
+
+#[cfg(test)]
 mod integration_tests;
 
 #[cfg(test)]
@@ -31,10 +34,15 @@ use soroban_sdk::{
     contract, contractevent, contractimpl, panic_with_error, vec, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, TryFromVal, Val,
 };
+pub use types::NO_POLICY_DIGEST;
 pub use types::{
     CheckDetail, Error, PolicyConfig, ProtocolRule, RecipientCap, RecipientWindowState,
+    ValidationOutcome,
 };
-use types::{CheckResult, DataKey, Status, WindowState, MAX_RECIPIENT_ENTRIES};
+use types::{
+    CheckResult, DataKey, PolicyRuleId, Status, WindowState, MAX_DMS_GRACE_SECS, MAX_POLICY_ASSETS,
+    MAX_POLICY_PROTOCOLS, MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
+};
 use window::Ledger;
 
 mod event_types {
@@ -47,6 +55,9 @@ mod event_types {
     //    vocabulary without decoding payloads it does not need.
 
     /// Every decision: topic[0]=result (`allowed`/`blocked`), topic[1]=reason.
+    /// Data carries `context_index` plus `revision` — the `PolicyRevision`
+    /// counter at decision time, so telemetry can join each admission/rejection
+    /// to the exact policy generation in force (issue #38).
     #[contractevent]
     #[derive(Clone)]
     pub(super) struct EventAuthChecked {
@@ -55,13 +66,22 @@ mod event_types {
         #[topic]
         pub(super) reason: Symbol,
         pub(super) context_index: u32,
+        pub(super) revision: u64,
     }
 
-    /// Agent heartbeat: data `at` (unix seconds).
+    /// Agent heartbeat: data `at` (unix seconds) and `expires_at` — the
+    /// attested dead-man-switch deadline as it stood at emission time, derived
+    /// from the *current* policy's `dms_grace_secs` (`at + dms_grace_secs`).
+    /// `0` when the dead-man switch is disabled (`dms_grace_secs == 0`, which is
+    /// also how a missing policy reads). Recording the deadline on the event means
+    /// a consumer no longer recomputes it from whatever the policy happens to be
+    /// after a later `set_policy`; the event states the deadline it was attested
+    /// under (SPEC §9).
     #[contractevent]
     #[derive(Clone)]
     pub(super) struct EventHeartbeat {
         pub(super) at: u64,
+        pub(super) expires_at: u64,
     }
 
     /// Admin lifecycle events: data `by` (the admin address that acted).
@@ -89,16 +109,28 @@ mod event_types {
         pub(super) rearmed_dms: bool,
     }
 
+    /// Admin policy install: data `by` (the admin address that acted) plus
+    /// `revision` — the `PolicyRevision` value this `set_policy` produced (the
+    /// counter is incremented before the event is emitted), so telemetry can
+    /// correlate every subsequent `auth_checked` event to the policy generation
+    /// this call installed (issue #38).
     #[contractevent]
     #[derive(Clone)]
     pub(super) struct EventPolicySet {
         pub(super) by: Address,
+        pub(super) revision: u64,
     }
 
+    /// Admin policy revoke: data `by` (the admin address that acted) plus
+    /// `revision` — the `PolicyRevision` value this `revoke_policy` produced.
+    /// `auth_checked` events after this one carry this revision while the account
+    /// sits in default-deny, making the post-revoke rejections attributable
+    /// (issue #38).
     #[contractevent]
     #[derive(Clone)]
     pub(super) struct EventPolicyRevoked {
         pub(super) by: Address,
+        pub(super) revision: u64,
     }
 
     /// Agent key rotation: data `by` (the admin that acted) plus truncated
@@ -195,43 +227,62 @@ fn has_dup<T: PartialEq + TryFromVal<Env, Val> + IntoVal<Env, Val>>(
     false
 }
 
-fn validate_config(env: &Env, cfg: &PolicyConfig) -> Result<(), Error> {
+/// Evaluates every SPEC §8 validation rule against `cfg` and returns the
+/// **first** rule that fails (rules are checked in the documented §8 order),
+/// or `Ok(())` when every rule passes. Pure logic over the candidate config —
+/// no storage access beyond `env.current_contract_address()` — so the
+/// `validate_policy` read can call it without touching state (issue #35).
+fn first_failing_rule(env: &Env, cfg: &PolicyConfig) -> Result<(), PolicyRuleId> {
+    // Reject excessive vectors before content checks and duplicate scans, so
+    // both validation cost and the later authorization scans stay bounded.
+    if (cfg.assets.len() as usize) > MAX_POLICY_ASSETS {
+        return Err(PolicyRuleId::AssetListTooLong);
+    }
+    if (cfg.protocols.len() as usize) > MAX_POLICY_PROTOCOLS {
+        return Err(PolicyRuleId::ProtocolListTooLong);
+    }
+    if (cfg.recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
+        || (cfg.recipient_window_caps.len() as usize) > MAX_RECIPIENT_ENTRIES
+        || (cfg.blocked_recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
+    {
+        return Err(PolicyRuleId::RecipientListTooLong);
+    }
     if cfg.per_tx_cap < 0 || cfg.window_cap < 0 {
-        return Err(Error::InvalidConfig);
+        return Err(PolicyRuleId::AmountSign);
     }
     if cfg.window_cap > 0 && cfg.window_secs == 0 {
-        return Err(Error::InvalidConfig);
+        return Err(PolicyRuleId::WindowRequiresWidth);
     }
     if cfg.active_until != 0 && cfg.active_until <= cfg.active_from {
-        return Err(Error::InvalidConfig);
+        return Err(PolicyRuleId::ActiveWindowOrder);
     }
     let self_addr = env.current_contract_address();
-    if contains_addr(&cfg.assets, &self_addr) {
-        return Err(Error::InvalidConfig);
-    }
-    for i in 0..cfg.protocols.len() {
-        if let Some(rule) = cfg.protocols.get(i) {
-            if rule.contract == self_addr {
-                return Err(Error::InvalidConfig);
-            }
-        }
-    }
     // The deployed address is rejected in all three lists: an asset/protocol
     // self-entry is a nonsensical allowlist (self-calls are governed by the
     // fixed §6.1 rule, not policy), and a self-recipient is a no-op loop that
     // almost certainly signals a mis-pasted address. `self_addr` is fixed at
     // deployment (known before `initialize`), and `set_policy` can only run
     // post-initialize, so this always compares against the real contract ID.
+    if contains_addr(&cfg.assets, &self_addr) {
+        return Err(PolicyRuleId::SelfAddressInList);
+    }
+    for i in 0..cfg.protocols.len() {
+        if let Some(pr) = cfg.protocols.get(i) {
+            if pr.contract == self_addr {
+                return Err(PolicyRuleId::SelfAddressInList);
+            }
+        }
+    }
     if contains_addr(&cfg.recipients, &self_addr)
         || contains_addr(&cfg.blocked_recipients, &self_addr)
     {
-        return Err(Error::InvalidConfig);
+        return Err(PolicyRuleId::SelfAddressInList);
     }
     if has_dup(env, &cfg.assets)
         || has_dup(env, &cfg.recipients)
         || has_dup(env, &cfg.blocked_recipients)
     {
-        return Err(Error::InvalidConfig);
+        return Err(PolicyRuleId::DuplicateAddressInList);
     }
     for i in 0..cfg.recipient_window_caps.len() {
         for j in (i + 1)..cfg.recipient_window_caps.len() {
@@ -240,29 +291,23 @@ fn validate_config(env: &Env, cfg: &PolicyConfig) -> Result<(), Error> {
                 cfg.recipient_window_caps.get(j),
             ) {
                 if a.recipient == b.recipient {
-                    return Err(Error::InvalidConfig);
+                    return Err(PolicyRuleId::DuplicateRecipientCap);
                 }
             }
         }
     }
-    if (cfg.recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
-        || (cfg.recipient_window_caps.len() as usize) > MAX_RECIPIENT_ENTRIES
-        || (cfg.blocked_recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
-    {
-        return Err(Error::InvalidConfig);
-    }
     for i in 0..cfg.recipient_window_caps.len() {
         if let Some(rc) = cfg.recipient_window_caps.get(i) {
             if rc.cap < 0 {
-                return Err(Error::InvalidConfig);
+                return Err(PolicyRuleId::RecipientCapSign);
             }
             if rc.cap > 0 && cfg.window_secs == 0 {
-                return Err(Error::InvalidConfig);
+                return Err(PolicyRuleId::WindowRequiresWidth);
             }
             // Same rule as `recipients`: a self-addressed cap entry is a
             // meaningless no-op loop.
             if rc.recipient == self_addr {
-                return Err(Error::InvalidConfig);
+                return Err(PolicyRuleId::SelfAddressInList);
             }
         }
     }
@@ -270,32 +315,57 @@ fn validate_config(env: &Env, cfg: &PolicyConfig) -> Result<(), Error> {
     for i in 0..cfg.recipients.len() {
         if let Some(recipient) = cfg.recipients.get(i) {
             if contains_addr(&cfg.blocked_recipients, &recipient) {
-                return Err(Error::InvalidConfig);
+                return Err(PolicyRuleId::RecipientAllowAndBlocked);
             }
         }
     }
     let mut contracts: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(env);
     for i in 0..cfg.protocols.len() {
-        if let Some(rule) = cfg.protocols.get(i) {
+        if let Some(pr) = cfg.protocols.get(i) {
             for j in 0..contracts.len() {
                 if let Some(existing) = contracts.get(j) {
-                    if existing == rule.contract {
-                        return Err(Error::InvalidConfig);
+                    if existing == pr.contract {
+                        return Err(PolicyRuleId::ProtocolContractDuplicate);
                     }
                 }
             }
-            contracts.push_back(rule.contract.clone());
-            if let Some(fns) = &rule.fns {
+            contracts.push_back(pr.contract.clone());
+            if let Some(fns) = &pr.fns {
                 if fns.is_empty() || has_dup(env, fns) {
-                    return Err(Error::InvalidConfig);
+                    return Err(PolicyRuleId::ProtocolFnListInvalid);
                 }
             }
         }
     }
+    // Sane upper bounds on every duration knob (issue #34): `window_secs` and
+    // `dms_grace_secs` are `u64`, so a seconds/millis mix-up or a fat-fingered
+    // `u64::MAX` silently disables pruning (or the dead-man switch) forever
+    // while still reading as a "valid" config. Values beyond ~10 years are
+    // rejected outright — fail-closed, policy unchanged. Evaluated last so
+    // the `PolicyRuleId` variant ordinals of the previously documented rules
+    // stay wire-stable.
+    if cfg.window_secs > MAX_WINDOW_SECS || cfg.dms_grace_secs > MAX_DMS_GRACE_SECS {
+        return Err(PolicyRuleId::DurationExceedsBound);
+    }
     Ok(())
 }
 
+/// SPEC §8 gate used by `set_policy`. Translates the failing §8 rule into the
+/// single stable `InvalidConfig` error code — deliberately unchanged by
+/// issue #35 so the on-chain error surface (and every consumer matching on
+/// it) stays byte-compatible.
+fn validate_config(env: &Env, cfg: &PolicyConfig) -> Result<(), Error> {
+    first_failing_rule(env, cfg).map_err(|_| Error::InvalidConfig)
+}
+
 // ── Event emission ───────────────────────────────────────────────────────
+
+/// Reads the current `PolicyRevision` counter (0 before the first policy
+/// action). Event emission never mutates state, so this is a bare read with
+/// no TTL-side write beyond the standard §9.5 thresholded refresh.
+fn current_revision(env: &Env) -> u64 {
+    persist_get::<u64>(env, &DataKey::PolicyRevision).unwrap_or(0)
+}
 
 fn emit_auth(env: &Env, allowed: bool, reason: Option<Error>, context_index: u32) {
     let res = if allowed { "allowed" } else { "blocked" };
@@ -304,12 +374,13 @@ fn emit_auth(env: &Env, allowed: bool, reason: Option<Error>, context_index: u32
         result: Symbol::new(env, res),
         reason: Symbol::new(env, reason),
         context_index,
+        revision: current_revision(env),
     }
     .publish(env);
 }
 
-fn emit_heartbeat(env: &Env, at: u64) {
-    EventHeartbeat { at }.publish(env);
+fn emit_heartbeat(env: &Env, at: u64, expires_at: u64) {
+    EventHeartbeat { at, expires_at }.publish(env);
 }
 
 fn emit_initialized(env: &Env, by: &Address) {
@@ -326,10 +397,18 @@ fn emit_unfrozen(env: &Env, by: &Address, rearmed_dms: bool) {
     .publish(env);
 }
 fn emit_policy_set(env: &Env, by: &Address) {
-    EventPolicySet { by: by.clone() }.publish(env);
+    EventPolicySet {
+        by: by.clone(),
+        revision: current_revision(env),
+    }
+    .publish(env);
 }
 fn emit_policy_revoked(env: &Env, by: &Address) {
-    EventPolicyRevoked { by: by.clone() }.publish(env);
+    EventPolicyRevoked {
+        by: by.clone(),
+        revision: current_revision(env),
+    }
+    .publish(env);
 }
 /// Compact key fingerprint: the first 8 bytes of `SHA-256(pubkey)`. Rendered
 /// as 16 lowercase hex characters off-chain (greppable, small event payload);
@@ -473,7 +552,19 @@ mod policy_engine_type {
                 return;
             }
             persist_set(&env, &DataKey::LastHeartbeat, &now);
-            emit_heartbeat(&env, now);
+            // Read the policy fresh here, at emission time, so the recorded
+            // deadline reflects the grace actually in force for this heartbeat and
+            // not a value cached from an earlier call. A missing policy or a zero
+            // `dms_grace_secs` means the dead-man switch is disabled, which the
+            // event records as `expires_at == 0` (SPEC §9).
+            let grace =
+                persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |cfg| cfg.dms_grace_secs);
+            let expires_at = if grace == 0 {
+                0
+            } else {
+                now.saturating_add(grace)
+            };
+            emit_heartbeat(&env, now, expires_at);
         }
 
         /// Immediately freezes policy-authorized calls until the admin unfreezes.
@@ -515,6 +606,52 @@ mod policy_engine_type {
             persist_get(&env, &DataKey::Policy)
         }
 
+        /// Canonical encoding fingerprint for cheap policy drift detection
+        /// (`policy_hash`): SHA-256 over the deterministic canonical encoding of
+        /// the installed policy (SPEC §7.3), or `NO_POLICY_DIGEST` (the SHA-256 of
+        /// the empty marker, documented and never trapping) when no policy is
+        /// installed. No auth, event-free, and write-free. A returned hash only
+        /// changes when the *policy* changes — not on any other storage or ledger
+        /// activity — so SDKs/dashboards can detect drift by comparing one 32-byte
+        /// value instead of shipping and diffing the full `PolicyConfig`, and can
+        /// record the value alongside `auth_checked` events as a tamper-evident
+        /// log anchor.
+        ///
+        /// Off-chain reproduction is pinned by SPEC §7.3 (field order, per-field
+        /// encoding, sentinel value) and locked by `tests/policy_hash_encoding.rs`.
+        #[allow(clippy::must_use_candidate)] // public read surface
+        pub fn policy_hash(env: Env) -> BytesN<32> {
+            match persist_get::<PolicyConfig>(&env, &DataKey::Policy) {
+                None => BytesN::from_array(&env, &crate::types::NO_POLICY_DIGEST),
+                Some(cfg) => {
+                    let encoding = crate::types::policy_canonical_encoding(&env, &cfg);
+                    env.crypto().sha256(&encoding).into()
+                }
+            }
+        }
+
+        /// Dry-runs `set_policy` validation against a candidate policy and reports
+        /// **which** SPEC §8 rule would reject it (issue #35): `Valid` when every
+        /// rule passes, otherwise `Invalid(rule)` naming the first failing rule,
+        /// in the documented §8 evaluation order. Read-only: no auth, no events,
+        /// no writes (beyond the standard §9.5 TTL refresh of read entries). The
+        /// on-chain rejection path is unchanged — `set_policy` still panics with
+        /// the single stable `InvalidConfig` code; this read is the identifiable
+        /// off-chain counterpart so SDKs and dashboards can preflight a policy
+        /// and pinpoint the offending field instead of guessing from one opaque
+        /// error code (see SPEC §8 for the rule → `PolicyRuleId` mapping).
+        ///
+        /// Evaluates the *candidate* argument — never the installed policy — and,
+        /// like `set_policy`, is only meaningful post-`initialize` (the self-list
+        /// rules compare against the contract's own address).
+        #[allow(clippy::must_use_candidate)] // public read surface
+        pub fn validate_policy(env: Env, config: PolicyConfig) -> ValidationOutcome {
+            match first_failing_rule(&env, &config) {
+                Ok(()) => ValidationOutcome::Valid,
+                Err(rule) => ValidationOutcome::Invalid(rule),
+            }
+        }
+
         /// Evaluates dead-man switch health (`Ok`, `Warn` at ≥80% elapsed, or `Expired`).
         /// Permissionless; this read may refresh stored state TTLs.
         #[allow(clippy::must_use_candidate)] // public read surface
@@ -527,19 +664,50 @@ mod policy_engine_type {
             engine::dms_health(now, last, &cfg)
         }
 
+        /// Operational snapshot: policy presence/revision, admin freeze, DMS state,
+        /// plus the operational fields (`paused`, `window_remaining`,
+        /// `outside_active_window`) a dashboard or SDK needs to explain *why* the
+        /// next transaction would be admitted or rejected. Event-free read with no
+        /// auth and no spend-accounting writes; like every persistent read it may
+        /// refresh entry TTLs (SPEC §9.5).
+        ///
+        /// Semantics of the operational fields mirror the §4 account gates and
+        /// `check_detailed` headroom exactly:
+        /// - `paused` is the policy's kill switch (`false` with no policy —
+        ///   default-deny has nothing to pause).
+        /// - `window_remaining` is global `window_cap - spent` on the *pruned*
+        ///   ledger (expired entries never count), or `None` when the global cap
+        ///   is disabled — including the no-policy case. Per-recipient override
+        ///   headroom is recipient-targeted; use `check_detailed` for that.
+        /// - `outside_active_window` evaluates the same bounds the §4 gate uses
+        ///   (`false` with no policy or an unrestricted window).
         #[allow(clippy::must_use_candidate)] // public read surface
-        /// Returns current policy, freeze, heartbeat, and ledger-time status.
-        /// This permissionless read may refresh state-entry TTLs.
         pub fn status(env: Env) -> Status {
-            let has_policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy).is_some();
+            let policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy);
             let policy_revision = persist_get::<u64>(&env, &DataKey::PolicyRevision).unwrap_or(0);
             let admin_frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
             let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
             let now = env.ledger().timestamp();
-            let grace =
-                persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
+            let (paused, window_remaining, outside_active_window, grace) = match &policy {
+                None => (false, None, false, 0),
+                Some(cfg) => {
+                    // Prune a local copy of the ledger so remaining headroom never
+                    // counts expired entries. No storage write: this is a read.
+                    let mut ledger = load_ledger(&env);
+                    if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
+                        ledger.prune(now, cfg.window_secs);
+                    }
+                    (
+                        cfg.paused,
+                        engine::global_window_remaining(cfg, &ledger),
+                        (cfg.active_from != 0 && now < cfg.active_from)
+                            || (cfg.active_until != 0 && now > cfg.active_until),
+                        cfg.dms_grace_secs,
+                    )
+                }
+            };
             Status {
-                has_policy,
+                has_policy: policy.is_some(),
                 policy_revision,
                 admin_frozen,
                 heartbeat_expired: grace > 0
@@ -547,6 +715,9 @@ mod policy_engine_type {
                     && now.saturating_sub(last_heartbeat) > grace,
                 last_heartbeat,
                 now,
+                paused,
+                window_remaining,
+                outside_active_window,
             }
         }
 
@@ -770,9 +941,11 @@ pub mod testutils {
     #![allow(missing_docs)] // Test-only helper re-exports are not contract API.
 
     pub use crate::engine::{contains_addr, decide, parse_call, AccountState, Decision};
+    pub use crate::types::policy_canonical_encoding;
     pub use crate::types::{
-        CheckResult, DataKey, Error, PolicyConfig, ProtocolRule, RecipientCap,
-        RecipientWindowState, Status, WindowState,
+        CheckResult, DataKey, Error, PolicyConfig, PolicyRuleId, ProtocolRule, RecipientCap,
+        RecipientWindowState, Status, ValidationOutcome, WindowState, MAX_DMS_GRACE_SECS,
+        MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
     };
     pub use crate::window::Ledger;
     pub use soroban_sdk::auth::{Context, ContractContext};
