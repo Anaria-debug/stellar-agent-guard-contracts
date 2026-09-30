@@ -335,7 +335,7 @@ pub enum Error {
     NoPolicy = 12,
     Paused = 13,
     OutsideActiveWindow = 14,
-    // Per-call decisions (20..=29)
+    // Per-call decisions (20..=30)
     AssetNotAllowed = 20,
     RecipientNotAllowed = 21,
     PerTxCapExceeded = 22,
@@ -347,6 +347,8 @@ pub enum Error {
     CreateContractNotAllowed = 28,
     RecipientBlocked = 29,
     ProtocolCallRateExceeded = 30,
+    // Internal enforcement invariant (31)
+    DecisionInvariantViolation = 31,
 }
 
 impl Error {
@@ -375,6 +377,7 @@ impl Error {
             Self::SelfFunctionNotAllowed => "self_function_not_allowed",
             Self::CreateContractNotAllowed => "create_contract_not_allowed",
             Self::ProtocolCallRateExceeded => "protocol_call_rate_exceeded",
+            Self::DecisionInvariantViolation => "decision_invariant_violation",
         }
     }
 }
