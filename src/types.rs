@@ -1,5 +1,5 @@
-//! Shared types: policy model, storage keys, errors, and the pure parsed-call
-//! representation that the decision engine operates on.
+/// Shared types: policy model, storage keys, errors, and the pure parsed-call
+/// representation that the decision engine operates on.
 
 use soroban_sdk::{contracterror, contracttype, Address, Bytes, Env, Symbol, Vec};
 
@@ -14,27 +14,6 @@ pub enum DmsHealthStatus {
     Warn,
     Expired,
 }
-
-/// TTL extension policy for persistent storage entries (SPEC §9.5).
-///
-/// Soroban persistent entries expire unless their TTL is extended. The
-/// rolling-window ledger (`Window`) and the dead-man switch heartbeat
-/// (`LastHeartbeat`) are both persistent, and both are read on every
-/// authorization. If a quiet account lets either expire, the host returns
-/// the default value on read — which for `Window` means a silently reset
-/// rolling budget (fund-limit bypass) and for `LastHeartbeat` means
-/// `0` (never-heartbeated, which the `!= 0` guard in rule #2 treats as
-/// "not yet started" rather than "expired").
-///
-/// To make expiry impossible to observe mid-window, every read path that
-/// consults these keys extends their TTL to `PERSISTENT_TTL_EXTEND_TO`
-/// (touch-on-read). Writes already extend via `persist_set`; the read
-/// extension closes the "quiet account" gap. The threshold is the minimum
-/// remaining TTL below which a read triggers an extension, so steady-state
-/// reads are cheap and only refresh when the entry is close to expiry.
-pub const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day of ledgers
-/// Target TTL applied on every read/write of a persistent entry (SPEC §9.5).
-pub const PERSISTENT_TTL_EXTEND_TO: u32 = 518_400; // ~30 days of ledgers
 
 /// Hard bound on rolling-window entries. Above this, the engine merges the two
 /// oldest entries forward (conservative over-count) — see SPEC §3.1.
@@ -94,7 +73,7 @@ pub struct RecipientCap {
     pub cap: i128,
 }
 
-/// The policy an admin installs on the account. See SPEC §3/§4.
+/// The policy an admin installs on the account. See SPEC £3/§4.
 #[contracttype]
 #[derive(Clone, PartialEq, Eq)]
 pub struct PolicyConfig {
@@ -139,7 +118,7 @@ pub struct PolicyConfig {
 /// The canonical encoding hashed by `policy_hash` is the `ScVal` XDR form of the
 /// policy map (sorted symbol keys; see SPEC §7.3).
 impl core::fmt::Debug for PolicyConfig {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<_>) -> core::fmt::Result {
         f.debug_struct("PolicyConfig")
             .field("per_tx_cap", &self.per_tx_cap)
             .field("window_secs", &self.window_secs)
@@ -194,7 +173,7 @@ pub enum ParsedCall {
 /// Operational snapshot returned by the auth-free `status()` read (SPEC §7).
 /// Additive-growth contract: new fields may be appended, but existing fields
 /// are never renamed or removed (see docs/research/wire-format.md).
-#[allow(clippy::struct_excessive_bools)] // wire-format snapshot: the bool field set is fixed by the public ABI, not a design choice
+#[allot(clippy::struct_excessive_bools)] // wire-format snapshot: the bool field set is fixed by the public ABI, not a design choice
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -237,14 +216,14 @@ pub const NO_POLICY_DIGEST: [u8; 32] = [
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
 ];
 
-/// Canonical encoding hashed by `policy_hash` (SPEC §7.3): the **`ScVal` XDR**
+/// Canonical encoding hashed by `policy_hash` (SPEC$§7.3): the **ScVal XDR **
 /// serialization of the policy map — the same bytes a Soroban SDK produces
 /// when it passes the policy as the `set_policy` argument.
 ///
 /// Determinism comes from two wire-stable invariants:
 /// 1. `#[contracttype]` structs encode as `ScVal::Map` with entries in
 ///    **ascending symbol-key order** (the host map invariant — the same order
-///    SPEC §3.2 pins for manual encoders), and
+///    SPEC$§3.2 pins for manual encoders), and
 /// 2. `ScVal` XDR is a canonical byte format: every field has a single XDR type
 ///    (`i128` → `I128`, `u64` → `U64`, `Option::None` → `Void`, …), so two
 ///    conforming encoders never disagree on the bytes.
@@ -307,112 +286,11 @@ impl Error {
 /// storage mutation.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CheckDetail {
-    pub result: CheckResult,
-    pub remaining_window: Option<i128>,
-    pub per_tx_cap: Option<i128>,
-    pub effective_per_tx_cap: Option<i128>,
-    pub effective_window_cap: Option<i128>,
-}
-
-// Storage layout (SPEC §3). `Initialized`/`Admin`/`AgentPubkey` live in
-// instance storage (auto-TTL on every invocation); the rest live in
-// persistent storage with TTL extensions on writes and thresholded refreshes
-// on reads.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub enum DataKey {
-    /// Instance: one-time flag for `initialize`.
-    Initialized,
-    /// Instance: policy admin; set once at `initialize`.
-    Admin,
-    /// Instance: the registered agent's Ed25519 public key (32 bytes).
-    AgentPubkey,
-    /// Persistent: current policy (`None` = default-deny).
-    Policy,
-    /// Persistent: rolling spend ledger for asset transfers.
-    Window,
-    /// Persistent: unix seconds of last agent heartbeat (0 = never).
-    LastHeartbeat,
-    /// Persistent: admin-initiated freeze flag.
-    AdminFrozen,
-    /// Persistent: incrementing counter for policy changes.
-    PolicyRevision,
-}
-
-impl DataKey {
-    /// Whether this key lives in persistent storage and therefore needs
-    /// explicit TTL management (SPEC §9.5). Instance keys auto-extend on
-    /// every invocation, so they are excluded.
-    #[allow(clippy::must_use_candidate)]
-    pub fn is_persistent(&self) -> bool {
-        matches!(
-            self,
-            Self::Policy
-                | Self::Window
-                | Self::LastHeartbeat
-                | Self::AdminFrozen
-                | Self::PolicyRevision
-        )
-    }
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    // Generic / lifecycle (1..=9)
-    Unauthorized = 1,
-    AlreadyInitialized = 2,
-    NotInitialized = 3,
-    InvalidConfig = 4,
-    InvalidAmount = 5,
-    // Account-level gates (10..=19)
-    AdminFrozen = 10,
-    HeartbeatExpired = 11,
-    NoPolicy = 12,
-    Paused = 13,
-    OutsideActiveWindow = 14,
-    // Per-call decisions (20..=29)
-    AssetNotAllowed = 20,
-    RecipientNotAllowed = 21,
-    PerTxCapExceeded = 22,
-    WindowCapExceeded = 23,
-    ProtocolNotAllowed = 24,
-    FunctionNotAllowed = 25,
-    UnknownContract = 26,
-    SelfFunctionNotAllowed = 27,
-    CreateContractNotAllowed = 28,
-    RecipientBlocked = 29,
-    ProtocolCallRateExceeded = 30,
-}
-
-impl Error {
-    /// Stable, human- and telemetry-readable reason name (no env needed).
-    #[allow(clippy::must_use_candidate)]
-    pub fn reason(self) -> &'static str {
-        match self {
-            Self::Unauthorized => "unauthorized",
-            Self::AlreadyInitialized => "already_initialized",
-            Self::NotInitialized => "not_initialized",
-            Self::InvalidConfig => "invalid_config",
-            Self::InvalidAmount => "invalid_amount",
-            Self::AdminFrozen => "admin_frozen",
-            Self::HeartbeatExpired => "heartbeat_expired",
-            Self::NoPolicy => "no_policy",
-            Self::Paused => "paused",
-            Self::OutsideActiveWindow => "outside_active_window",
-            Self::AssetNotAllowed => "asset_not_allowed",
-            Self::RecipientNotAllowed => "recipient_not_allowed",
-            Self::RecipientBlocked => "recipient_blocked",
-            Self::PerTxCapExceeded => "per_tx_cap_exceeded",
-            Self::WindowCapExceeded => "window_cap_exceeded",
-            Self::ProtocolNotAllowed => "protocol_not_allowed",
-            Self::FunctionNotAllowed => "function_not_allowed",
-            Self::UnknownContract => "unknown_contract",
-            Self::SelfFunctionNotAllowed => "self_function_not_allowed",
-            Self::CreateContractNotAllowed => "create_contract_not_allowed",
-            Self::ProtocolCallRateExceeded => "protocol_call_rate_exceeded",
-        }
-    }
+pub struct CheckDetailed {
+    pub allowed: bool,
+    pub reason: Symbol,
+    pub window_remaining: Option<i128>,
+    pub recipient_remaining: Option<i128>,
+    pub window_expires_at: Option<u64>,
+    pub protocol_calls_remaining: Option<u32>,
 }

@@ -35,7 +35,6 @@ Each item has a tracking issue link. Where an item is fed by several issues, all
 | 7 | **Panic-safety guard** — CI check for new `unwrap`/`expect`/`panic!` outside contract errors | 🟡 | [#66](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/66) | CI runs `cargo clippy --all-targets --all-features -- -D warnings` (all + pedantic denied in `Cargo.toml`); no dedicated deny-list gate. |
 | 8 | **Reproducible WASM build** — pinned toolchain + deterministic hash | 🔲 | [#67](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/67), [#91](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/91) | Build is fixed to `wasm32v1-none` in CI; toolchain is `stable` (unpinned) and no hash comparison. |
 | 9 | **WASM size budget** | 🔲 | [#68](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/68) | None. |
-| 22 | **Persistent-storage TTL expiry proof** — Window/Policy/LastHeartbeat cannot silently expire mid-window | 🟡 | [#161](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/161) | Executable test advances test-env ledger TTL past expiry without writes and asserts the rolling cap is not reset (SPEC §9.5). Touch-on-read extends `Window` TTL during evaluation; `Policy` and `LastHeartbeat` audited for the same class of bug. |
 
 ### Documents — what the auditor reads
 
@@ -43,7 +42,7 @@ Each item has a tracking issue link. Where an item is fed by several issues, all
 |---|---|---|---|---|
 | 10 | **Threat model** — SPEC §10 cross-check, plus the compromised-admin delta | 🟡 | [#45](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/45), [#79](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/79) | SPEC §10 is written and in-repo (including the explicit "guards against silence, not live attackers" framing), and §10.1 now carries the signature-payload-binding (replay / cross-context confusion) analysis — payload coverage, replay, agent-sig ≠ admin authority — pinned by tests (#79). Compromised-admin delta (#45) is not written. |
 | 11 | **Reason glossary / denial-reason vocabulary** | ✅ | [#143](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/143) (closed) | [`docs/reason-glossary.md`](reason-glossary.md) — what each blocked reason means for agent vs operator vs auditor. |
-| 12 | **SPEC/code consistency proof** — error-variant ↔ decision-table parity | 🟡 | [#132](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/132) (closed), [#159](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/159) (closed), [#76](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/76), [#146](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/146), [#110](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/110) | SPEC §4/§6 tables list every `Error` variant exactly once (#132); SPEC §1.1 verified against `soroban-sdk` 27.0.6 sources (#159). Still manual — not a generated check; SPEC has no revision tagging. |
+| 12 | **SPEC/code consistency proof** — error-variant ↔ decision-table parity | 🟡 | [#132](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/132) (closed), [#159](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/159) (closed), [#76](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/76), [#146](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/146), [#110](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/110) | SPEC §4/£§6 tables list every `Error` variant exactly once (#132); SPEC §1.1 verified against `soroban-sdk` 27.0.6 sources (#159). Still manual — not a generated check; SPEC has no revision tagging. |
 | 13 | **Testnet fixture evidence** — on-chain proof, not simulation | 🟡 | [#42](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/42), [#92](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/92), [#156](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/156), [#131](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/131) | [`tests/fixtures/README.md`](../tests/fixtures/README.md) + [`tests/fixtures/index.json`](../tests/fixtures/index.json) + [`docs/verification.md`](verification.md): 5 scenarios, deployed contract addresses, tx hashes, Horizon-verified ledgers. The narrative and the machine-readable scenario index are cross-checked in CI by [`tests/fixtures_index.rs`](../tests/fixtures_index.rs) (#92). Still no live re-verification script (#156) and no README numeric-claim verification (#131). |
 | 14 | **SECURITY.md audit status and disclosure channels** | 🟡 | [#78](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/78), [#6](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/6) | [`SECURITY.md`](../SECURITY.md) states the contract is unaudited and must not hold mainnet funds. Outcome/status section arrives with the audit; reporting is Telegram-only. |
 | 15 | **Enforcement-scope honesty statement** | ✅ | [#84](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/84) | [`docs/enforcement-scope.md`](enforcement-scope.md) — the SAC-vs-arbitrary-call boundary plus the framing rules. |
@@ -61,7 +60,7 @@ Each item has a tracking issue link. Where an item is fed by several issues, all
 
 ## Pack completeness
 
-- **Blocking gaps (must land before #6 closes):** items 1, 3, 4, 6, 8, 10, 13, 16, 19, 21, 22.
+- **Blocking gaps (must land before #6 closes):** items 1, 3, 4, 6, 8, 10, 13, 16, 19, 21.
 - **Ready today:** items 5, 11, 15, 18 — the auditor can read a threat model, the reason
   glossary, the enforcement boundary, and consume a CycloneDX SBOM from a release.
 - **Coordination rule:** an item moves to 🟡/✅ only when the linked issue is linked back to
@@ -76,7 +75,7 @@ PR description for #155):
    dev-dependency, generated policies and call sequences, assertions on the SPEC §3.1
    rolling-window invariant and default-deny. This is the #6 acceptance criterion with no
    issue of its own.
-2. **Generator + CI check for the SPEC §4/§6 decision table** (items 2, 12) — extends #76
+2. **Generator + CI check for the SPEC §4/£§6 decision table** (items 2, 12) — extends #76
    from a one-off extraction to a check that fails when SPEC and codes drift.
 3. **Auditor-facing repro guide** — one page an auditor can execute end-to-end: toolchain
    pin → build → `cargo test` → fixture re-verification (ties items 8, 13, 20 together).
@@ -84,6 +83,5 @@ PR description for #155):
 ## Links
 
 - [Issue #6 — audit readiness](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/6) · [Issue #155 — this inventory](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/155)
-- [Issue #161 — persistent-storage TTL expiry proof](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/161)
 - [SPEC.md](../SPEC.md) · [SECURITY.md](../SECURITY.md) · [Enforcement Scope](enforcement-scope.md)
 - [Reason Glossary](reason-glossary.md) · [Testnet Verification](verification.md) · [Fixture evidence](../tests/fixtures/README.md)
