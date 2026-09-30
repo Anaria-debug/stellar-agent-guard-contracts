@@ -15,6 +15,27 @@ pub enum DmsHealthStatus {
     Expired,
 }
 
+/// TTL extension policy for persistent storage entries (SPEC §9.5).
+///
+/// Soroban persistent entries expire unless their TTL is extended. The
+/// rolling-window ledger (`Window`) and the dead-man switch heartbeat
+/// (`LastHeartbeat`) are both persistent, and both are read on every
+/// authorization. If a quiet account lets either expire, the host returns
+/// the default value on read — which for `Window` means a silently reset
+/// rolling budget (fund-limit bypass) and for `LastHeartbeat` means
+/// `0` (never-heartbeated, which the `!= 0` guard in rule #2 treats as
+/// "not yet started" rather than "expired").
+///
+/// To make expiry impossible to observe mid-window, every read path that
+/// consults these keys extends their TTL to `PERSISTENT_TTL_EXTEND_TO`
+/// (touch-on-read). Writes already extend via `persist_set`; the read
+/// extension closes the "quiet account" gap. The threshold is the minimum
+/// remaining TTL below which a read triggers an extension, so steady-state
+/// reads are cheap and only refresh when the entry is close to expiry.
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day of ledgers
+/// Target TTL applied on every read/write of a persistent entry (SPEC §9.5).
+pub const PERSISTENT_TTL_EXTEND_TO: u32 = 518_400; // ~30 days of ledgers
+
 /// Hard bound on rolling-window entries. Above this, the engine merges the two
 /// oldest entries forward (conservative over-count) — see SPEC §3.1.
 pub const MAX_WINDOW_ENTRIES: usize = 8192;
@@ -317,6 +338,23 @@ pub enum DataKey {
     AdminFrozen,
     /// Persistent: incrementing counter for policy changes.
     PolicyRevision,
+}
+
+impl DataKey {
+    /// Whether this key lives in persistent storage and therefore needs
+    /// explicit TTL management (SPEC §9.5). Instance keys auto-extend on
+    /// every invocation, so they are excluded.
+    #[allow(clippy::must_use_candidate)]
+    pub fn is_persistent(&self) -> bool {
+        matches!(
+            self,
+            Self::Policy
+                | Self::Window
+                | Self::LastHeartbeat
+                | Self::AdminFrozen
+                | Self::PolicyRevision
+        )
+    }
 }
 
 #[contracterror]

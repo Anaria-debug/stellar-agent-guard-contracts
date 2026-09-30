@@ -35,6 +35,7 @@ Each item has a tracking issue link. Where an item is fed by several issues, all
 | 7 | **Panic-safety guard** — CI check for new `unwrap`/`expect`/`panic!` outside contract errors | 🟡 | [#66](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/66) | CI runs `cargo clippy --all-targets --all-features -- -D warnings` (all + pedantic denied in `Cargo.toml`); no dedicated deny-list gate. |
 | 8 | **Reproducible WASM build** — pinned toolchain + deterministic hash | 🔲 | [#67](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/67), [#91](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/91) | Build is fixed to `wasm32v1-none` in CI; toolchain is `stable` (unpinned) and no hash comparison. |
 | 9 | **WASM size budget** | 🔲 | [#68](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/68) | None. |
+| 22 | **Persistent-storage TTL expiry proof** — Window/Policy/LastHeartbeat cannot silently expire mid-window | 🟡 | [#161](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/161) | Executable test advances test-env ledger TTL past expiry without writes and asserts the rolling cap is not reset (SPEC §9.5). Touch-on-read extends `Window` TTL during evaluation; `Policy` and `LastHeartbeat` audited for the same class of bug. |
 
 ### Documents — what the auditor reads
 
@@ -60,7 +61,7 @@ Each item has a tracking issue link. Where an item is fed by several issues, all
 
 ## Pack completeness
 
-- **Blocking gaps (must land before #6 closes):** items 1, 3, 4, 6, 8, 10, 13, 16, 19, 21.
+- **Blocking gaps (must land before #6 closes):** items 1, 3, 4, 6, 8, 10, 13, 16, 19, 21, 22.
 - **Ready today:** items 5, 11, 15, 18 — the auditor can read a threat model, the reason
   glossary, the enforcement boundary, and consume a CycloneDX SBOM from a release.
 - **Coordination rule:** an item moves to 🟡/✅ only when the linked issue is linked back to
@@ -83,5 +84,6 @@ PR description for #155):
 ## Links
 
 - [Issue #6 — audit readiness](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/6) · [Issue #155 — this inventory](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/155)
+- [Issue #161 — persistent-storage TTL expiry proof](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/161)
 - [SPEC.md](../SPEC.md) · [SECURITY.md](../SECURITY.md) · [Enforcement Scope](enforcement-scope.md)
 - [Reason Glossary](reason-glossary.md) · [Testnet Verification](verification.md) · [Fixture evidence](../tests/fixtures/README.md)

@@ -1,3 +1,4 @@
+
 //! Rolling-window ledger (SPEC §3.1). Operates over `soroban_sdk::Vec` so it
 //! is no_std/wasm-clean. Pure logic — no storage access — unit-testable with
 //! a bare `Env`.
@@ -13,6 +14,11 @@
 //! Persistent `WindowState` TTL management belongs to the storage boundary in
 //! `lib.rs` (`persist_get`/`save_ledger`); this module transforms only the
 //! in-memory snapshot after storage has loaded it.
+//!
+//! TTL continuity invariant (SPEC §9.5): the storage boundary must extend the
+//! persistent entry's TTL on every read that observes a live window, so that a
+//! quiet account cannot have its `WindowState` silently archived mid-window.
+//! See `lib.rs::persist_get` / `save_ledger` for the touch-on-read contract.
 
 use crate::types::{
     ProtocolCallEntry, RecipientWindowState, SpendEntry, WindowState, MAX_WINDOW_ENTRIES,
@@ -50,6 +56,22 @@ pub struct Ledger {
     pub protocol_call_entries: soroban_sdk::Vec<ProtocolCallEntry>,
     /// Cached rolling total of protocol calls (sum of non-expired entries).
     pub protocol_call_total: u32,
+}
+
+impl Ledger {
+    /// True when this ledger holds any spend or protocol-call entry that is
+    /// still inside `window_secs` at `now`. Used by the storage boundary to
+    /// decide whether a read must touch the persistent entry's TTL: an empty
+    /// or fully-expired ledger carries no budget to protect, so extending its
+    /// TTL would only waste rent.
+    #[allow(clippy::must_use_candidate)]
+    pub fn has_live_entries(&self, now: u64, window_secs: u64) -> bool {
+        has_live_spend_entries(&self.entries, now, window_secs)
+            || self.recipients.iter().any(|r| {
+                has_live_spend_entries(&r.entries, now, window_secs)
+            })
+            || has_live_protocol_call_entries(&self.protocol_call_entries, now, window_secs)
+    }
 }
 
 impl Ledger {
@@ -189,6 +211,48 @@ impl Ledger {
             now,
         );
     }
+}
+
+// ── Live-entry predicates (TTL continuity, SPEC §9.5) ────────────────────────
+
+fn has_live_spend_entries(
+    entries: &soroban_sdk::Vec<SpendEntry>,
+    now: u64,
+    window_secs: u64,
+) -> bool {
+    if window_secs == 0 {
+        return false;
+    }
+    let mut i = 0;
+    while i < entries.len() {
+        if let Some(e) = entries.get(i) {
+            if e.ts.saturating_add(window_secs) > now {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn has_live_protocol_call_entries(
+    entries: &soroban_sdk::Vec<ProtocolCallEntry>,
+    now: u64,
+    window_secs: u64,
+) -> bool {
+    if window_secs == 0 {
+        return false;
+    }
+    let mut i = 0;
+    while i < entries.len() {
+        if let Some(e) = entries.get(i) {
+            if e.ts.saturating_add(window_secs) > now {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 // ── Single rolling ledger helpers ────────────────────────────────────────────
@@ -667,5 +731,43 @@ mod tests {
 
         assert_eq!(restored.protocol_call_total, 3);
         assert_eq!(restored.protocol_call_entries.len(), 2);
+    }
+
+    #[test]
+    fn has_live_entries_true_while_inside_window() {
+        let env = Env::default();
+        let mut ledger = Ledger::empty(&env);
+        ledger.admit(100, 10);
+        assert!(ledger.has_live_entries(100, 100));
+        assert!(ledger.has_live_entries(199, 100));
+        // Exactly on the boundary: ts + window == now -> expired.
+        assert!(!ledger.has_live_entries(200, 100));
+        assert!(!ledger.has_live_entries(300, 100));
+    }
+
+    #[test]
+    fn has_live_entries_covers_recipient_and_protocol_call_ledgers() {
+        let env = Env::default();
+        let mut ledger = Ledger::empty(&env);
+        let r = addr(&env, 1);
+        ledger.admit_for_recipient(&env, 100, r.clone(), 5);
+        assert!(ledger.has_live_entries(150, 100));
+        assert!(!ledger.has_live_entries(250, 100));
+
+        let mut ledger2 = Ledger::empty(&env);
+        ledger2.admit_protocol_call(100);
+        assert!(ledger2.has_live_entries(150, 100));
+        assert!(!ledger2.has_live_entries(250, 100));
+    }
+
+    #[test]
+    fn has_live_entries_false_for_empty_and_zero_window() {
+        let env = Env::default();
+        let ledger = Ledger::empty(&env);
+        assert!(!ledger.has_live_entries(0, 100));
+
+        let mut ledger2 = Ledger::empty(&env);
+        ledger2.admit(100, 10);
+        assert!(!ledger2.has_live_entries(100, 0));
     }
 }
