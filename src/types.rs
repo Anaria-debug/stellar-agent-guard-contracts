@@ -3,14 +3,46 @@
 
 use soroban_sdk::{contracterror, contracttype, Address, Symbol, Vec};
 
+/// Warning threshold percentage for dead-man switch health evaluation (80%).
+pub const DMS_WARN_THRESHOLD_PERCENT: u64 = 80;
+
+/// Dead-man switch health status returned by `dms_health`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DmsHealthStatus {
+    Ok,
+    Warn,
+    Expired,
+}
+
 /// Hard bound on rolling-window entries. Above this, the engine merges the two
 /// oldest entries forward (conservative over-count) — see SPEC §3.1.
 pub const MAX_WINDOW_ENTRIES: usize = 8192;
 
-/// Per-policy rolling spend ledger for SAC asset transfers.
+/// Hard bound on the number of entries in `recipients` and
+/// `recipient_window_caps`. Keeps allowlist scans and per-recipient storage
+/// bounded and predictable (SPEC §3 / §8).
+pub const MAX_RECIPIENT_ENTRIES: usize = 256;
+
+/// Per-policy rolling spend ledger for SAC asset transfers and protocol call counts.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowState {
+    /// Cached rolling total (sum of non-expired entries).
+    pub total: i128,
+    /// Chronological spend entries (oldest first).
+    pub entries: Vec<SpendEntry>,
+    /// Per-recipient rolling spend ledgers for recipients with an override cap.
+    pub recipients: Vec<RecipientWindowState>,
+    /// Protocol call count entries (for rate limiting).
+    pub protocol_call_entries: Vec<ProtocolCallEntry>,
+}
+
+/// Rolling spend ledger for a single recipient.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipientWindowState {
+    pub recipient: Address,
     /// Cached rolling total (sum of non-expired entries).
     pub total: i128,
     /// Chronological spend entries (oldest first).
@@ -24,9 +56,26 @@ pub struct SpendEntry {
     pub amount: i128,
 }
 
-/// The policy an admin installs on the account. See SPEC §3/§4.
+/// A protocol call entry in the rolling-window counter (for rate limiting).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtocolCallEntry {
+    pub ts: u64,
+    pub count: u32,
+}
+
+/// Per-recipient rolling-window cap override.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipientCap {
+    pub recipient: Address,
+    /// Rolling cap for this recipient within `window_secs`; 0 = disabled / fall back to global.
+    pub cap: i128,
+}
+
+/// The policy an admin installs on the account. See SPEC §3/§4.
+#[contracttype]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PolicyConfig {
     /// Per asset-transfer call cap; 0 = disabled.
     pub per_tx_cap: i128,
@@ -40,6 +89,12 @@ pub struct PolicyConfig {
     pub protocols: Vec<ProtocolRule>,
     /// Allowed SAC transfer destinations.
     pub recipients: Vec<Address>,
+    /// Per-recipient rolling-window cap overrides; recipients not listed here
+    /// use the global `window_cap`. Storage bounded by `MAX_RECIPIENT_ENTRIES`.
+    pub recipient_window_caps: Vec<RecipientCap>,
+    /// Denied SAC transfer destinations. Checked before the allowlist and
+    /// before `allow_any_recipient`; an empty list leaves behavior unchanged.
+    pub blocked_recipients: Vec<Address>,
     /// Escape hatch: skip the recipient allowlist (caps still apply).
     pub allow_any_recipient: bool,
     /// Active window start (unix seconds); 0 = unrestricted.
@@ -50,6 +105,37 @@ pub struct PolicyConfig {
     pub paused: bool,
     /// Dead-man switch grace (seconds); 0 = disabled.
     pub dms_grace_secs: u64,
+    /// Maximum protocol (non-SAC allowlisted) calls per rolling window; 0 = disabled.
+    pub protocol_calls_per_window: u32,
+}
+
+/// Manual `Debug` implementation for `PolicyConfig` with stable field order.
+///
+/// Field order is the declaration order (as of SPEC §3 table) and must not be
+/// changed without updating the snapshot test in `tests/debug_policy_config.rs`.
+/// This is the *human-readable* format for logs, test fixtures, and dashboard
+/// inspect scripts — it is NOT the canonical encoding for `policy_hash`.
+/// Canonical encoding for hashing must be a separate, unambiguous serialization
+/// (e.g., XDR with deterministic field tags); see SPEC §8/§9 discussion.
+impl core::fmt::Debug for PolicyConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PolicyConfig")
+            .field("per_tx_cap", &self.per_tx_cap)
+            .field("window_secs", &self.window_secs)
+            .field("window_cap", &self.window_cap)
+            .field("assets", &self.assets)
+            .field("protocols", &self.protocols)
+            .field("recipients", &self.recipients)
+            .field("recipient_window_caps", &self.recipient_window_caps)
+            .field("blocked_recipients", &self.blocked_recipients)
+            .field("allow_any_recipient", &self.allow_any_recipient)
+            .field("active_from", &self.active_from)
+            .field("active_until", &self.active_until)
+            .field("paused", &self.paused)
+            .field("dms_grace_secs", &self.dms_grace_secs)
+            .field("protocol_calls_per_window", &self.protocol_calls_per_window)
+            .finish()
+    }
 }
 
 #[contracttype]
@@ -102,9 +188,64 @@ pub enum CheckResult {
     Blocked(Symbol),
 }
 
+impl Error {
+    /// Convert an `Error` variant into its corresponding `BlockReason` symbol (as used in `CheckResult::Blocked`).
+    #[allow(clippy::must_use_candidate)]
+    pub fn to_block_reason(self) -> Symbol {
+        // Uses the existing reason() string which matches SPEC §7 / reason glossary.
+        Symbol::new(&soroban_sdk::Env::default(), self.reason())
+    }
+
+    /// Attempt to convert a `BlockReason` symbol back to an `Error` variant.
+    #[allow(clippy::must_use_candidate)]
+    pub fn from_block_reason(symbol: &Symbol) -> Option<Self> {
+        let env = soroban_sdk::Env::default();
+        let all_errors = [
+            Self::Unauthorized,
+            Self::AlreadyInitialized,
+            Self::NotInitialized,
+            Self::InvalidConfig,
+            Self::InvalidAmount,
+            Self::AdminFrozen,
+            Self::HeartbeatExpired,
+            Self::NoPolicy,
+            Self::Paused,
+            Self::OutsideActiveWindow,
+            Self::AssetNotAllowed,
+            Self::RecipientNotAllowed,
+            Self::RecipientBlocked,
+            Self::PerTxCapExceeded,
+            Self::WindowCapExceeded,
+            Self::ProtocolNotAllowed,
+            Self::FunctionNotAllowed,
+            Self::UnknownContract,
+            Self::SelfFunctionNotAllowed,
+            Self::CreateContractNotAllowed,
+            Self::ProtocolCallRateExceeded,
+        ];
+        all_errors
+            .into_iter()
+            .find(|&err| symbol == &Symbol::new(&env, err.reason()))
+    }
+}
+
+/// Advisory result for a targeted asset transfer. All fields are calculated
+/// from the current policy and window snapshot; this type never represents a
+/// storage mutation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckDetail {
+    pub result: CheckResult,
+    pub remaining_window: Option<i128>,
+    pub per_tx_cap: Option<i128>,
+    pub effective_per_tx_cap: Option<i128>,
+    pub effective_window_cap: Option<i128>,
+}
+
 // Storage layout (SPEC §3). `Initialized`/`Admin`/`AgentPubkey` live in
 // instance storage (auto-TTL on every invocation); the rest live in
-// persistent storage with explicit TTL extension on every write.
+// persistent storage with TTL extensions on writes and thresholded refreshes
+// on reads.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum DataKey {
@@ -154,10 +295,13 @@ pub enum Error {
     UnknownContract = 26,
     SelfFunctionNotAllowed = 27,
     CreateContractNotAllowed = 28,
+    RecipientBlocked = 29,
+    ProtocolCallRateExceeded = 30,
 }
 
 impl Error {
     /// Stable, human- and telemetry-readable reason name (no env needed).
+    #[allow(clippy::must_use_candidate)]
     pub fn reason(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
@@ -172,6 +316,7 @@ impl Error {
             Self::OutsideActiveWindow => "outside_active_window",
             Self::AssetNotAllowed => "asset_not_allowed",
             Self::RecipientNotAllowed => "recipient_not_allowed",
+            Self::RecipientBlocked => "recipient_blocked",
             Self::PerTxCapExceeded => "per_tx_cap_exceeded",
             Self::WindowCapExceeded => "window_cap_exceeded",
             Self::ProtocolNotAllowed => "protocol_not_allowed",
@@ -179,6 +324,7 @@ impl Error {
             Self::UnknownContract => "unknown_contract",
             Self::SelfFunctionNotAllowed => "self_function_not_allowed",
             Self::CreateContractNotAllowed => "create_contract_not_allowed",
+            Self::ProtocolCallRateExceeded => "protocol_call_rate_exceeded",
         }
     }
 }

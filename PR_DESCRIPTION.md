@@ -1,18 +1,15 @@
 # Description
 
-Closes #24
+Closes #21
 
-This PR adds a fuzzing-style generative test `fuzz_parse_call_against_arbitrary_auth_context_argument_vectors` to `src/engine.rs`.
-The test validates that `parse_call` robustly handles dynamically generated, malformed SAC (Stellar Asset Contract) transfer contexts without ever trapping or panicking the host.
+This PR verifies that rejected SAC transfers never mutate rolling-window state, including invalid amounts rejected in per-context enforcement.
 
 ### Changes
-*   **Tests:** Added `fuzz_parse_call_against_arbitrary_auth_context_argument_vectors` which generates thousands of argument combinations for `transfer` and `transfer_from`.
-*   Tested cases include: varying number of arguments (0..4), incorrect types at each position, extra trailing args, and non-address first arguments.
-*   Verified that `parse_call` and `decide` gracefully handle every malformed shape by yielding a stable classified denial (e.g., `UnknownContract`) instead of trapping.
+* **Tests:** Added zero and negative amount cases that assert `InvalidAmount` and compare the complete ledger against its pre-call snapshot.
+* **Regression coverage:** Reused full-ledger snapshot assertions for per-transaction cap, rolling-window cap, and recipient-denied rejections.
 
 ### Acceptance Criteria Checklist
-- [x] Generator produces contexts for known SAC contracts with: 0..n args, wrong types at each position, extra trailing args, non-address first arg.
-- [x] Every case yields a stable classified denial — never a host trap/panic.
-- [x] At least one case each for transfer and transfer_from.
-- [x] Lint, type-check, and tests all pass locally.
-- [x] PR description references this issue with Closes #24.
+- [x] Amounts 0 and < 0 return `InvalidAmount` without changing window state.
+- [x] Cap-exceeded and recipient-denied cases assert unchanged ledger state.
+- [ ] Formatting, lint, type-check, and tests pass locally.
+- [x] PR description references the issue (Closes #21).

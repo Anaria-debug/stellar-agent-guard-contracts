@@ -20,8 +20,56 @@ pub enum Decision {
     Blocked(Error),
 }
 
+/// Return advisory cap metrics from an already-loaded ledger for a specific
+/// recipient. If the recipient has a per-recipient window override, the
+/// effective cap and remaining headroom use that recipient's ledger;
+/// otherwise the global ledger and cap are used.
+pub fn cap_metrics(
+    policy: &PolicyConfig,
+    ledger: &Ledger,
+    recipient: &Address,
+) -> (Option<i128>, Option<i128>, Option<i128>) {
+    let window_cap = effective_window_cap(policy, recipient);
+    let per_tx_cap = (policy.per_tx_cap > 0).then_some(policy.per_tx_cap);
+    let tracked_total = if has_recipient_window_cap(policy, recipient) {
+        ledger.recipient_total(recipient)
+    } else {
+        ledger.total
+    };
+    let remaining = window_cap.map(|cap| cap.saturating_sub(tracked_total).max(0));
+    (remaining, per_tx_cap, window_cap)
+}
+
+/// Evaluate dead-man switch health given current timestamp, last heartbeat, and policy config.
+pub fn dms_health(
+    now: u64,
+    last_heartbeat: u64,
+    policy: &PolicyConfig,
+) -> crate::types::DmsHealthStatus {
+    if policy.dms_grace_secs == 0 {
+        return crate::types::DmsHealthStatus::Ok;
+    }
+    if last_heartbeat == 0 {
+        return crate::types::DmsHealthStatus::Expired;
+    }
+    let elapsed = now.saturating_sub(last_heartbeat);
+    if elapsed > policy.dms_grace_secs {
+        return crate::types::DmsHealthStatus::Expired;
+    }
+    let warn_threshold = policy
+        .dms_grace_secs
+        .saturating_mul(crate::types::DMS_WARN_THRESHOLD_PERCENT)
+        / 100;
+    if elapsed >= warn_threshold {
+        crate::types::DmsHealthStatus::Warn
+    } else {
+        crate::types::DmsHealthStatus::Ok
+    }
+}
+
 // ── Small contains helpers (soroban Vec has no `contains`) ───────────────
 
+#[allow(clippy::must_use_candidate)]
 pub fn contains_addr(list: &Vec<Address>, a: &Address) -> bool {
     for i in 0..list.len() {
         if let Some(x) = list.get(i) {
@@ -44,9 +92,50 @@ fn contains_sym(list: &Vec<Symbol>, s: &Symbol) -> bool {
     false
 }
 
+#[allow(clippy::must_use_candidate)]
+fn recipient_override_cap(cfg: &PolicyConfig, recipient: &Address) -> Option<i128> {
+    for i in 0..cfg.recipient_window_caps.len() {
+        if let Some(rc) = cfg.recipient_window_caps.get(i) {
+            if &rc.recipient == recipient && rc.cap > 0 {
+                return Some(rc.cap);
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::must_use_candidate)]
+fn has_recipient_window_cap(cfg: &PolicyConfig, recipient: &Address) -> bool {
+    recipient_override_cap(cfg, recipient).is_some()
+}
+
+#[allow(clippy::must_use_candidate)]
+fn effective_window_cap(cfg: &PolicyConfig, recipient: &Address) -> Option<i128> {
+    recipient_override_cap(cfg, recipient)
+        .or_else(|| (cfg.window_cap > 0).then_some(cfg.window_cap))
+}
+
 // ── Context parsing (SPEC §6) ────────────────────────────────────────────
 
+#[cfg(feature = "testutils")]
+#[allow(clippy::must_use_candidate)]
+pub fn parse_call(env: &Env, self_addr: &Address, ctx: &Context, cfg: &PolicyConfig) -> ParsedCall {
+    parse_call_inner(env, self_addr, ctx, cfg)
+}
+
+#[cfg(not(feature = "testutils"))]
+#[allow(clippy::must_use_candidate)]
 fn parse_call(env: &Env, self_addr: &Address, ctx: &Context, cfg: &PolicyConfig) -> ParsedCall {
+    parse_call_inner(env, self_addr, ctx, cfg)
+}
+
+#[allow(clippy::must_use_candidate)]
+fn parse_call_inner(
+    env: &Env,
+    self_addr: &Address,
+    ctx: &Context,
+    cfg: &PolicyConfig,
+) -> ParsedCall {
     match ctx {
         Context::Contract(ContractContext {
             contract,
@@ -69,6 +158,17 @@ fn parse_call(env: &Env, self_addr: &Address, ctx: &Context, cfg: &PolicyConfig)
                 } else {
                     (2u32, 3u32)
                 };
+                // Exact arity required: transfer = 3 args, transfer_from = 4 args.
+                // Extra trailing args or short arg lists are rejected -- we do not
+                // partially parse a call whose effective meaning we do not fully
+                // understand (SPEC section 6.2). Falling through to Unknown = default deny.
+                let expected_arity: u32 = if fn_name == &fn_transfer { 3 } else { 4 };
+                if args.len() != expected_arity {
+                    return ParsedCall::Unknown {
+                        contract: contract.clone(),
+                        fname: fn_name.clone(),
+                    };
+                }
                 let to_val = args.get(to_idx);
                 let amt_val = args.get(amt_idx);
                 if let (Some(to_val), Some(amt_val)) = (to_val, amt_val) {
@@ -157,11 +257,24 @@ pub fn decide(
     }
 
     // ── Per-context rules (SPEC §6) ──────────────────────────────────────
-    if cfg.window_cap > 0 {
+    // Window: prune expired entries once up front, then check every transfer
+    // against the running total (current total + amounts already admitted in
+    // this request). Admission is staged and committed only after every
+    // context passes. Per-recipient overrides run alongside the global window.
+    // Protocol call rate limiting uses the same lazy pruning semantics.
+    if cfg.window_cap > 0
+        || !cfg.recipient_window_caps.is_empty()
+        || cfg.protocol_calls_per_window > 0
+    {
         ledger.prune(now, cfg.window_secs);
     }
     let mut pending: i128 = 0;
     let mut admission: Vec<crate::types::SpendEntry> = Vec::new(env);
+    // Running per-recipient totals staged in this request. Parallel Vecs keep
+    // iteration deterministic and avoid pulling `Map` into the pure engine.
+    let mut pending_recipients: Vec<Address> = Vec::new(env);
+    let mut pending_recipient_amounts: Vec<i128> = Vec::new(env);
+    let mut pending_protocol_calls: u32 = 0;
     let mut all_passed = true;
 
     for ctx in contexts.iter() {
@@ -180,21 +293,59 @@ pub fn decide(
             ParsedCall::AssetTransfer { to, amount, .. } => {
                 if amount <= 0 {
                     Decision::Blocked(Error::InvalidAmount)
+                } else if contains_addr(&cfg.blocked_recipients, &to) {
+                    Decision::Blocked(Error::RecipientBlocked)
                 } else if !cfg.allow_any_recipient && !contains_addr(&cfg.recipients, &to) {
                     Decision::Blocked(Error::RecipientNotAllowed)
                 } else if cfg.per_tx_cap > 0 && amount > cfg.per_tx_cap {
                     Decision::Blocked(Error::PerTxCapExceeded)
-                } else if cfg.window_cap > 0 {
-                    let projected = ledger.total.saturating_add(pending);
-                    if projected.saturating_add(amount) > cfg.window_cap {
+                } else {
+                    // Window accounting: global cap plus an optional
+                    // per-recipient override keyed by the destination.
+                    // Projections are computed first; staging happens only
+                    // when this context clears both caps.
+                    let recip_cap = recipient_override_cap(cfg, &to);
+                    let mut staged_recip: i128 = 0;
+                    let mut staged_idx: Option<u32> = None;
+                    if recip_cap.is_some() {
+                        for i in 0..pending_recipients.len() {
+                            if let Some(r) = pending_recipients.get(i) {
+                                if r == to {
+                                    staged_idx = Some(i);
+                                    staged_recip = pending_recipient_amounts.get(i).unwrap_or(0);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Cumulative against the current windows: existing totals +
+                    // amounts staged earlier in this same request.
+                    let global_projected =
+                        ledger.total.saturating_add(pending).saturating_add(amount);
+                    let recip_projected = ledger
+                        .recipient_total(&to)
+                        .saturating_add(staged_recip)
+                        .saturating_add(amount);
+                    if (cfg.window_cap > 0 && global_projected > cfg.window_cap)
+                        || recip_cap.is_some_and(|cap| recip_projected > cap)
+                    {
                         Decision::Blocked(Error::WindowCapExceeded)
                     } else {
-                        pending = pending.saturating_add(amount);
-                        admission.push_back(crate::types::SpendEntry { ts: now, amount });
+                        if cfg.window_cap > 0 {
+                            pending = pending.saturating_add(amount);
+                            admission.push_back(crate::types::SpendEntry { ts: now, amount });
+                        }
+                        if recip_cap.is_some() {
+                            let next = staged_recip.saturating_add(amount);
+                            if let Some(idx) = staged_idx {
+                                pending_recipient_amounts.set(idx, next);
+                            } else {
+                                pending_recipients.push_back(to.clone());
+                                pending_recipient_amounts.push_back(next);
+                            }
+                        }
                         Decision::Allowed
                     }
-                } else {
-                    Decision::Allowed
                 }
             }
             ParsedCall::Protocol { contract, fname } => {
@@ -216,6 +367,19 @@ pub fn decide(
                     Decision::Blocked(Error::ProtocolNotAllowed)
                 } else if !fn_ok {
                     Decision::Blocked(Error::FunctionNotAllowed)
+                } else if cfg.protocol_calls_per_window > 0 {
+                    // Protocol call rate limiting: check if admitting this call
+                    // would exceed the per-window cap.
+                    let projected_calls = ledger
+                        .protocol_call_total
+                        .saturating_add(pending_protocol_calls)
+                        .saturating_add(1);
+                    if projected_calls > cfg.protocol_calls_per_window {
+                        Decision::Blocked(Error::ProtocolCallRateExceeded)
+                    } else {
+                        pending_protocol_calls = pending_protocol_calls.saturating_add(1);
+                        Decision::Allowed
+                    }
                 } else {
                     Decision::Allowed
                 }
@@ -233,6 +397,16 @@ pub fn decide(
         for e in admission.iter() {
             ledger.admit(e.ts, e.amount);
         }
+        for i in 0..pending_recipients.len() {
+            if let (Some(recipient), Some(amount)) =
+                (pending_recipients.get(i), pending_recipient_amounts.get(i))
+            {
+                ledger.admit_for_recipient(env, now, recipient, amount);
+            }
+        }
+        for _ in 0..pending_protocol_calls {
+            ledger.admit_protocol_call(now);
+        }
     }
 
     verdicts
@@ -241,7 +415,7 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ProtocolRule;
+    use crate::types::{ProtocolRule, RecipientCap};
     use soroban_sdk::{auth::ContractContext, vec, Address, Env, IntoVal, Symbol, Val, Vec};
 
     fn addr(env: &Env, n: u8) -> Address {
@@ -258,11 +432,14 @@ mod tests {
             assets: vec![env, addr(env, 1)],
             protocols: Vec::new(env),
             recipients: vec![env, addr(env, 2)],
+            recipient_window_caps: Vec::new(env),
+            blocked_recipients: Vec::new(env),
             allow_any_recipient: false,
             active_from: 0,
             active_until: 0,
             paused: false,
             dms_grace_secs: 0,
+            protocol_calls_per_window: 0,
         }
     }
 
@@ -332,19 +509,49 @@ mod tests {
     }
 
     #[test]
+    fn invalid_amount_rejections_do_not_mutate_window() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.window_cap = 100;
+        let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+
+        for amount in [0, -1] {
+            let before = l.clone();
+            let d = decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, transfer_ctx(&env, 1, 2, amount)],
+            );
+            assert!(matches!(
+                d.first().unwrap(),
+                Decision::Blocked(Error::InvalidAmount)
+            ));
+            assert_eq!(l, before, "rejected amount {amount} mutated the window");
+        }
+    }
+
+    #[test]
     fn per_tx_cap_enforced() {
         let env = Env::default();
         let sa = self_addr(&env);
         let mut p = base_policy(&env);
         p.per_tx_cap = 10;
         let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+        let before = l.clone();
         let ctx = vec![&env, transfer_ctx(&env, 1, 2, 11)];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.first().unwrap(),
             Decision::Blocked(Error::PerTxCapExceeded)
         ));
-        assert_eq!(l.total, 0);
+        assert_eq!(l, before);
     }
 
     #[test]
@@ -353,17 +560,69 @@ mod tests {
         let sa = self_addr(&env);
         let p = Some(base_policy(&env));
         let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+        let before = l.clone();
         let ctx = vec![&env, transfer_ctx(&env, 1, 99, 5)];
         let d = decide(&env, &sa, p.as_ref(), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.first().unwrap(),
             Decision::Blocked(Error::RecipientNotAllowed)
         ));
+        assert_eq!(l, before);
         let mut p2 = base_policy(&env);
         p2.allow_any_recipient = true;
         let ctx2 = vec![&env, transfer_ctx(&env, 1, 99, 5)];
         let d2 = decide(&env, &sa, Some(&p2), &alive(), &mut l, 1000, ctx2.clone());
         assert!(matches!(d2.first().unwrap(), Decision::Allowed));
+    }
+
+    #[test]
+    fn blocked_recipient_wins_over_allowlist_and_escape_hatch() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let blocked_addr = addr(&env, 3);
+
+        // Listed in both allowlist and denylist -> blocked wins.
+        let mut p = base_policy(&env);
+        p.recipients = vec![&env, addr(&env, 2), blocked_addr.clone()];
+        p.blocked_recipients = vec![&env, blocked_addr.clone()];
+        let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+        let before = l.clone();
+        let ctx = vec![&env, transfer_ctx(&env, 1, 3, 5)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::RecipientBlocked)
+        ));
+        assert_eq!(l, before);
+
+        // allow_any_recipient true but address is blocked -> still blocked.
+        let mut p2 = base_policy(&env);
+        p2.allow_any_recipient = true;
+        p2.blocked_recipients = vec![&env, blocked_addr.clone()];
+        let d2 = decide(&env, &sa, Some(&p2), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d2.first().unwrap(),
+            Decision::Blocked(Error::RecipientBlocked)
+        ));
+        assert_eq!(l, before);
+
+        // A different non-blocked recipient passes under the escape hatch.
+        let ctx3 = vec![&env, transfer_ctx(&env, 1, 4, 5)];
+        let d3 = decide(&env, &sa, Some(&p2), &alive(), &mut l, 1000, ctx3);
+        assert!(matches!(d3.first().unwrap(), Decision::Allowed));
+    }
+
+    #[test]
+    fn empty_blocked_recipients_list_is_no_op() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_ctx(&env, 1, 2, 5)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
     }
 
     #[test]
@@ -397,6 +656,7 @@ mod tests {
             vec![&env, transfer_ctx(&env, 1, 2, 60)],
         );
         assert!(matches!(d1.first().unwrap(), Decision::Allowed));
+        let before_rejection = l.clone();
         let d2 = decide(
             &env,
             &sa,
@@ -410,6 +670,7 @@ mod tests {
             d2.first().unwrap(),
             Decision::Blocked(Error::WindowCapExceeded)
         ));
+        assert_eq!(l, before_rejection);
         let d3 = decide(
             &env,
             &sa,
@@ -434,12 +695,13 @@ mod tests {
             transfer_ctx(&env, 1, 2, 60),
             transfer_ctx(&env, 1, 2, 60),
         ];
+        let before = l.clone();
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.get(1).unwrap(),
             Decision::Blocked(Error::WindowCapExceeded)
         ));
-        assert_eq!(l.total, 0);
+        assert_eq!(l, before);
     }
 
     #[test]
@@ -610,103 +872,525 @@ mod tests {
         ));
     }
 
+    fn transfer_ctx_with_extra_args(
+        env: &Env,
+        asset: u8,
+        to: u8,
+        amount: i128,
+        extra: u32,
+    ) -> Context {
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(addr(env, 9).into_val(env));
+        args.push_back(addr(env, to).into_val(env));
+        args.push_back(amount.into_val(env));
+        for i in 0..extra {
+            args.push_back(i128::from(i).into_val(env));
+        }
+        Context::Contract(ContractContext {
+            contract: addr(env, asset),
+            fn_name: Symbol::new(env, "transfer"),
+            args,
+        })
+    }
+
+    fn transfer_from_ctx_with_arg_count(
+        env: &Env,
+        asset: u8,
+        to: u8,
+        amount: i128,
+        count: u32,
+    ) -> Context {
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(addr(env, 9).into_val(env));
+        args.push_back(addr(env, 8).into_val(env));
+        args.push_back(addr(env, to).into_val(env));
+        args.push_back(amount.into_val(env));
+        if count < 4 {
+            let mut short: Vec<Val> = Vec::new(env);
+            for i in 0..count {
+                if let Some(v) = args.get(i) {
+                    short.push_back(v);
+                }
+            }
+            args = short;
+        } else {
+            for i in 4..count {
+                args.push_back(i128::from(i).into_val(env));
+            }
+        }
+        Context::Contract(ContractContext {
+            contract: addr(env, asset),
+            fn_name: Symbol::new(env, "transfer_from"),
+            args,
+        })
+    }
+
     #[test]
-    fn fuzz_parse_call_against_arbitrary_auth_context_argument_vectors() {
+    fn arity_guard_transfer_4_args_is_denied() {
         let env = Env::default();
-        env.cost_estimate().budget().reset_unlimited();
         let sa = self_addr(&env);
         let p = base_policy(&env);
-        let asset = addr(&env, 1);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_ctx_with_extra_args(&env, 1, 2, 5, 1)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
+    }
+
+    #[test]
+    fn arity_guard_transfer_2_args_is_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let mut args: Vec<Val> = Vec::new(&env);
+        args.push_back(addr(&env, 9).into_val(&env));
+        args.push_back(addr(&env, 2).into_val(&env));
+        let ctx = vec![
+            &env,
+            Context::Contract(ContractContext {
+                contract: addr(&env, 1),
+                fn_name: Symbol::new(&env, "transfer"),
+                args,
+            }),
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
+    }
+
+    #[test]
+    fn arity_guard_transfer_from_5_args_is_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 5)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
+    }
+
+    #[test]
+    fn arity_guard_transfer_from_3_args_is_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 3)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
+    }
+
+    #[test]
+    fn arity_guard_transfer_from_4_args_is_allowed() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![&env, transfer_from_ctx_with_arg_count(&env, 1, 2, 5, 4)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+    }
+
+    #[test]
+    fn per_recipient_cap_enforced_independently() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        let r2 = addr(&env, 2);
+        let r3 = addr(&env, 3);
+        p.recipients = vec![&env, r2.clone(), r3.clone()];
+        p.window_cap = 1_000; // generous global cap
+        p.recipient_window_caps = vec![
+            &env,
+            RecipientCap {
+                recipient: r2.clone(),
+                cap: 100,
+            },
+        ];
         let mut l = Ledger::empty(&env);
 
-        let vals: alloc::vec::Vec<Val> = alloc::vec![
-            0_i128.into_val(&env),
-            100_i128.into_val(&env),
-            (-50_i128).into_val(&env),
-            addr(&env, 2).into_val(&env),
-            Symbol::new(&env, "foo").into_val(&env),
-            ().into_val(&env),
-            true.into_val(&env),
-            soroban_sdk::String::from_str(&env, "hello").into_val(&env),
+        // r2 is bound by its per-recipient cap.
+        let d1 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_ctx(&env, 1, 2, 101)],
+        );
+        assert!(matches!(
+            d1.first().unwrap(),
+            Decision::Blocked(Error::WindowCapExceeded)
+        ));
+
+        // r3 is not in the override map, so it falls back to the global cap.
+        let d2 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_ctx(&env, 1, 3, 500)],
+        );
+        assert!(matches!(d2.first().unwrap(), Decision::Allowed));
+
+        // Allowed spends to r2 are tracked only in its own ledger.
+        let d3 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_ctx(&env, 1, 2, 80)],
+        );
+        assert!(matches!(d3.first().unwrap(), Decision::Allowed));
+        let d4 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_ctx(&env, 1, 2, 21)],
+        );
+        assert!(matches!(
+            d4.first().unwrap(),
+            Decision::Blocked(Error::WindowCapExceeded)
+        ));
+    }
+
+    #[test]
+    fn per_recipient_cap_stages_cumulatively_within_request() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.window_cap = 1_000;
+        p.recipient_window_caps = vec![
+            &env,
+            RecipientCap {
+                recipient: addr(&env, 2),
+                cap: 100,
+            },
         ];
+        let mut l = Ledger::empty(&env);
 
-        let mut all_args = alloc::vec::Vec::new();
-        
-        // 0 args
-        all_args.push(Vec::new(&env));
+        let ctx = vec![
+            &env,
+            transfer_ctx(&env, 1, 2, 60),
+            transfer_ctx(&env, 1, 2, 50), // cumulative 110 > 100
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx);
+        assert!(matches!(
+            d.get(1).unwrap(),
+            Decision::Blocked(Error::WindowCapExceeded)
+        ));
+        assert_eq!(l.recipient_total(&addr(&env, 2)), 0);
+    }
 
-        // 1 arg
-        for v1 in &vals {
-            let mut a = Vec::new(&env);
-            a.push_back(*v1);
-            all_args.push(a);
+    #[test]
+    fn per_recipient_and_global_caps_both_bind() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        let r2 = addr(&env, 2);
+        p.window_cap = 50; // tighter global cap
+        p.recipient_window_caps = vec![
+            &env,
+            RecipientCap {
+                recipient: r2.clone(),
+                cap: 100,
+            },
+        ];
+        let mut l = Ledger::empty(&env);
+
+        // The per-recipient cap (100) is higher, but the global cap (50) blocks first.
+        let d = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_ctx(&env, 1, 2, 60)],
+        );
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::WindowCapExceeded)
+        ));
+    }
+
+    #[test]
+    fn per_recipient_cap_with_allow_any_recipient() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.allow_any_recipient = true;
+        p.window_cap = 1_000;
+        p.recipient_window_caps = vec![
+            &env,
+            RecipientCap {
+                recipient: addr(&env, 2),
+                cap: 50,
+            },
+        ];
+        let mut l = Ledger::empty(&env);
+
+        // Listed recipient is bound by its per-recipient cap.
+        let d1 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_ctx(&env, 1, 2, 51)],
+        );
+        assert!(matches!(
+            d1.first().unwrap(),
+            Decision::Blocked(Error::WindowCapExceeded)
+        ));
+
+        // Unlisted recipient falls back to the global cap and is allowed.
+        let d2 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_ctx(&env, 1, 99, 500)],
+        );
+        assert!(matches!(d2.first().unwrap(), Decision::Allowed));
+    }
+
+    #[test]
+    fn protocol_call_rate_limit_disabled_by_default() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        p.protocol_calls_per_window = 0; // disabled
+        let mut l = Ledger::empty(&env);
+
+        // Should allow unlimited protocol calls when disabled
+        for _ in 0..10 {
+            let d = decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, proto_ctx(&env, 3, "swap")],
+            );
+            assert!(matches!(d.first().unwrap(), Decision::Allowed));
         }
+    }
 
-        // 2 args
-        for v1 in &vals {
-            for v2 in &vals {
-                let mut a = Vec::new(&env);
-                a.push_back(*v1);
-                a.push_back(*v2);
-                all_args.push(a);
-            }
+    #[test]
+    fn protocol_call_rate_limit_blocks_at_threshold() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        p.protocol_calls_per_window = 3;
+        let mut l = Ledger::empty(&env);
+
+        // First 3 calls allowed
+        for i in 0..3 {
+            let d = decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, proto_ctx(&env, 3, "swap")],
+            );
+            assert!(
+                matches!(d.first().unwrap(), Decision::Allowed),
+                "Call {} should be allowed",
+                i + 1
+            );
         }
+        assert_eq!(l.protocol_call_total, 3);
 
-        // 3 args
-        for v1 in &vals {
-            for v2 in &vals {
-                for v3 in &vals {
-                    let mut a = Vec::new(&env);
-                    a.push_back(*v1);
-                    a.push_back(*v2);
-                    a.push_back(*v3);
-                    all_args.push(a);
-                }
-            }
-        }
+        // 4th call blocked
+        let d4 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, proto_ctx(&env, 3, "swap")],
+        );
+        assert!(matches!(
+            d4.first().unwrap(),
+            Decision::Blocked(Error::ProtocolCallRateExceeded)
+        ));
+        // Ledger should not be updated
+        assert_eq!(l.protocol_call_total, 3);
+    }
 
-        // 4 args
-        for v1 in &vals {
-            for v2 in &vals {
-                for v3 in &vals {
-                    for v4 in &vals {
-                        let mut a = Vec::new(&env);
-                        a.push_back(*v1);
-                        a.push_back(*v2);
-                        a.push_back(*v3);
-                        a.push_back(*v4);
-                        all_args.push(a);
-                    }
-                }
-            }
-        }
+    #[test]
+    fn protocol_call_rate_limit_resets_with_window() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.window_secs = 100;
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        p.protocol_calls_per_window = 2;
+        let mut l = Ledger::empty(&env);
 
-        for fn_name in ["transfer", "transfer_from"] {
-            let fn_sym = Symbol::new(&env, fn_name);
-            for args in &all_args {
-                let ctx = Context::Contract(ContractContext {
-                    contract: asset.clone(),
-                    fn_name: fn_sym.clone(),
-                    args: args.clone(),
-                });
+        // Use up the limit at time 1000
+        let d1 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, proto_ctx(&env, 3, "swap")],
+        );
+        assert!(matches!(d1.first().unwrap(), Decision::Allowed));
+        let d2 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, proto_ctx(&env, 3, "swap")],
+        );
+        assert!(matches!(d2.first().unwrap(), Decision::Allowed));
+        assert_eq!(l.protocol_call_total, 2);
 
-                // The parse call should never panic, and `decide` should handle it.
-                // It either yields a stable classified denial, or an Allowed (if it randomly made a valid transfer).
-                let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, vec![&env, ctx]);
-                assert!(!d.is_empty());
-                
-                // Extra check: parse_call doesn't trap
-                let parsed = parse_call(&env, &sa, &Context::Contract(ContractContext {
-                    contract: asset.clone(),
-                    fn_name: fn_sym.clone(),
-                    args: args.clone(),
-                }), &p);
-                
-                match parsed {
-                    ParsedCall::AssetTransfer { .. } | ParsedCall::Unknown { .. } => {}
-                    _ => panic!("Expected AssetTransfer or Unknown"),
-                }
-            }
-        }
+        // Third call within window blocked
+        let d3 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1050,
+            vec![&env, proto_ctx(&env, 3, "swap")],
+        );
+        assert!(matches!(
+            d3.first().unwrap(),
+            Decision::Blocked(Error::ProtocolCallRateExceeded)
+        ));
+
+        // After window expires (1000 + 100 = 1100), new calls allowed
+        let d4 = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1200,
+            vec![&env, proto_ctx(&env, 3, "swap")],
+        );
+        assert!(matches!(d4.first().unwrap(), Decision::Allowed));
+        assert_eq!(l.protocol_call_total, 1);
+    }
+
+    #[test]
+    fn protocol_call_rate_limit_stages_within_request() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        p.protocol_calls_per_window = 2;
+        let mut l = Ledger::empty(&env);
+
+        // Batch request: 1 call allowed, 2nd allowed, 3rd blocked (cumulative)
+        let ctx = vec![
+            &env,
+            proto_ctx(&env, 3, "swap"),
+            proto_ctx(&env, 3, "swap"),
+            proto_ctx(&env, 3, "swap"), // cumulative 3 > limit of 2
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx);
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+        assert!(matches!(d.get(1).unwrap(), Decision::Allowed));
+        assert!(matches!(
+            d.get(2).unwrap(),
+            Decision::Blocked(Error::ProtocolCallRateExceeded)
+        ));
+        // Ledger should not be updated (all-or-nothing commit)
+        assert_eq!(l.protocol_call_total, 0);
+    }
+
+    #[test]
+    fn self_call_and_asset_transfer_do_not_consume_protocol_rate_limit() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.window_cap = 1_000;
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        p.protocol_calls_per_window = 2;
+        let mut l = Ledger::empty(&env);
+
+        // Mix of self-call, asset transfer, and protocol calls
+        let ctx = vec![
+            &env,
+            heartbeat_ctx(&env, &sa),      // SelfCall - should not count
+            transfer_ctx(&env, 1, 2, 100), // AssetTransfer - should not count
+            proto_ctx(&env, 3, "swap"),    // Protocol - counts
+            proto_ctx(&env, 3, "swap"),    // Protocol - counts
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx);
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+        assert!(matches!(d.get(1).unwrap(), Decision::Allowed));
+        assert!(matches!(d.get(2).unwrap(), Decision::Allowed));
+        assert!(matches!(d.get(3).unwrap(), Decision::Allowed));
+        // Only 2 protocol calls should be counted
+        assert_eq!(l.protocol_call_total, 2);
+        assert_eq!(l.total, 100); // asset transfer counted separately
     }
 }
