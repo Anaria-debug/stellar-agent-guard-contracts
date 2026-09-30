@@ -142,3 +142,4 @@ When bumping `soroban-sdk` version in `Cargo.toml`, you **must** re-verify
 SPEC §1.1 quotes against the new SDK source (`src/auth.rs`, `src/custom_account.rs`).
 Update the version comment in `Cargo.toml` and the SPEC §1.1 header accordingly.
 This is the mechanical ratchet preventing silent auth-semantics drift.
+...
