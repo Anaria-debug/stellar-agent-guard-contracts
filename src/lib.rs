@@ -485,17 +485,50 @@ impl PolicyEngine {
         engine::dms_health(now, last, &cfg)
     }
 
+    /// Operational snapshot: policy presence/revision, admin freeze, DMS state,
+    /// plus the operational fields (`paused`, `window_remaining`,
+    /// `outside_active_window`) a dashboard or SDK needs to explain *why* the
+    /// next transaction would be admitted or rejected. Event-free read with no
+    /// auth and no spend-accounting writes; like every persistent read it may
+    /// refresh entry TTLs (SPEC §9.5).
+    ///
+    /// Semantics of the operational fields mirror the §4 account gates and
+    /// `check_detailed` headroom exactly:
+    /// - `paused` is the policy's kill switch (`false` with no policy —
+    ///   default-deny has nothing to pause).
+    /// - `window_remaining` is global `window_cap - spent` on the *pruned*
+    ///   ledger (expired entries never count), or `None` when the global cap
+    ///   is disabled — including the no-policy case. Per-recipient override
+    ///   headroom is recipient-targeted; use `check_detailed` for that.
+    /// - `outside_active_window` evaluates the same bounds the §4 gate uses
+    ///   (`false` with no policy or an unrestricted window).
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn status(env: Env) -> Status {
-        let has_policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy).is_some();
+        let policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy);
         let policy_revision = persist_get::<u64>(&env, &DataKey::PolicyRevision).unwrap_or(0);
         let admin_frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
         let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
         let now = env.ledger().timestamp();
-        let grace =
-            persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
+        let (paused, window_remaining, outside_active_window, grace) = match &policy {
+            None => (false, None, false, 0),
+            Some(cfg) => {
+                // Prune a local copy of the ledger so remaining headroom never
+                // counts expired entries. No storage write: this is a read.
+                let mut ledger = load_ledger(&env);
+                if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
+                    ledger.prune(now, cfg.window_secs);
+                }
+                (
+                    cfg.paused,
+                    engine::global_window_remaining(cfg, &ledger),
+                    (cfg.active_from != 0 && now < cfg.active_from)
+                        || (cfg.active_until != 0 && now > cfg.active_until),
+                    cfg.dms_grace_secs,
+                )
+            }
+        };
         Status {
-            has_policy,
+            has_policy: policy.is_some(),
             policy_revision,
             admin_frozen,
             heartbeat_expired: grace > 0
@@ -503,6 +536,9 @@ impl PolicyEngine {
                 && now.saturating_sub(last_heartbeat) > grace,
             last_heartbeat,
             now,
+            paused,
+            window_remaining,
+            outside_active_window,
         }
     }
 

@@ -588,7 +588,9 @@ pub fn unfreeze(env: Env)    // require_auth(Admin); clears AdminFrozen, LastHea
 
 // ── Read / advisory (no auth; non-confidential state; TTL effects in §9.5) ──
 pub fn policy(env: Env) -> Option<PolicyConfig>       // current policy
-pub fn status(env: Env) -> Status                     // frozen? admin_frozen? last_heartbeat? now?
+pub fn status(env: Env) -> Status                     // operational snapshot (see Status block below):
+                                                      // paused / window_remaining / outside_active_window
+                                                      // / admin_frozen / heartbeat_expired / revision
 pub fn dms_health(env: Env) -> DmsHealth                  // ok, warn (>=80%), or expired
 pub fn check(env: Env, asset: Address, to: Address, amount: i128) -> CheckResult
     // Preflight / simulate a transfer (doc alias; ABI frozen as `check`):
@@ -620,7 +622,21 @@ impl CustomAccountInterface for PolicyEngine {
 #[contracttype]
 pub struct Status { pub admin_frozen: bool, pub heartbeat_expired: bool,
                    pub last_heartbeat: u64, pub now: u64, pub has_policy: bool,
-                   pub policy_revision: u64 }
+                   pub policy_revision: u64,
+                   pub paused: bool, pub window_remaining: Option<i128>,
+                   pub outside_active_window: bool }
+// Operational fields (additive; SDK/dashboard decoders must tolerate new keys):
+// - paused: the installed policy's admin kill switch (§3 `PolicyConfig.paused`);
+//   false when no policy is installed (default-deny has nothing to pause).
+// - window_remaining: global headroom `window_cap - spent` over the *pruned*
+//   rolling ledger (expired entries never count) — the same number
+//   `check_detailed` reports as `remaining_window` for a recipient without a
+//   per-recipient override; None when the global cap is disabled (0), including
+//   the no-policy case. Per-recipient override headroom is recipient-targeted
+//   and not projected here (use `check_detailed` per recipient).
+// - outside_active_window: whether `now` sits outside the policy's active
+//   window (`active_from`/`active_until`, both bounds inclusive; §4 account
+//   gate) — false with no policy or an unrestricted window (either bound 0).
 
 #[contracttype]
 pub enum DmsHealthStatus { Ok, Warn, Expired }

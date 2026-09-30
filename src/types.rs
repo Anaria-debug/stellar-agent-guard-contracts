@@ -170,6 +170,10 @@ pub enum ParsedCall {
     Unknown { contract: Address, fname: Symbol },
 }
 
+/// Operational snapshot returned by the auth-free `status()` read (SPEC §7).
+/// Additive-growth contract: new fields may be appended, but existing fields
+/// are never renamed or removed (see docs/research/wire-format.md).
+#[allow(clippy::struct_excessive_bools)] // wire-format snapshot: the bool field set is fixed by the public ABI, not a design choice
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -179,6 +183,20 @@ pub struct Status {
     pub heartbeat_expired: bool,
     pub last_heartbeat: u64,
     pub now: u64,
+    /// The installed policy's admin kill switch (`cfg.paused`). `false` when
+    /// no policy is installed (default-deny has nothing to pause).
+    pub paused: bool,
+    /// Global rolling-window headroom: `window_cap - spent` within the current
+    /// window, computed on the lazily pruned ledger so expired entries never
+    /// count. `None` when the global `window_cap` is disabled (0) — including
+    /// the no-policy case. Per-recipient override headroom is recipient-targeted
+    /// and deliberately not projected here; use `check_detailed` for that.
+    pub window_remaining: Option<i128>,
+    /// Whether `now` falls outside the policy's active window (`active_from` /
+    /// `active_until`, the §4 account gate that blocks with
+    /// `outside_active_window`). `false` when no policy is installed or the
+    /// window is unrestricted (either bound 0).
+    pub outside_active_window: bool,
 }
 
 #[contracttype]
