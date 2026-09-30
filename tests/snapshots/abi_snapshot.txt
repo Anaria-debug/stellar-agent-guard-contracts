@@ -64,6 +64,8 @@ enum PolicyRuleId
   ProtocolContractDuplicate
   ProtocolFnListInvalid
   DurationExceedsBound
+  AssetListTooLong
+  ProtocolListTooLong
 enum ValidationOutcome
   Valid
   Invalid(PolicyRuleId)

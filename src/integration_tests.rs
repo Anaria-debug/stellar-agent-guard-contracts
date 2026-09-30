@@ -2606,6 +2606,102 @@ fn validate_policy_reports_recipient_list_too_long() {
 }
 
 #[test]
+fn policy_asset_protocol_and_recipient_limits_are_inclusive_and_fail_closed() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    let baseline = h.base_policy();
+    client.set_policy(&baseline);
+
+    let mut assets = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..crate::types::MAX_POLICY_ASSETS {
+        assets.push_back(Address::generate(&h.env));
+    }
+    let mut at_limit = baseline.clone();
+    at_limit.assets = assets.clone();
+    assert_eq!(client.validate_policy(&at_limit), ValidationOutcome::Valid);
+    client.set_policy(&at_limit);
+    assert_eq!(client.policy(), Some(at_limit.clone()));
+    assets.push_back(Address::generate(&h.env));
+    let mut over_limit = at_limit.clone();
+    over_limit.assets = assets;
+    assert_rejects_preserving_policy(
+        &h.env,
+        &h.guard,
+        &over_limit,
+        &at_limit,
+        &PolicyRuleId::AssetListTooLong,
+    );
+
+    let mut protocols = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..crate::types::MAX_POLICY_PROTOCOLS {
+        protocols.push_back(ProtocolRule {
+            contract: Address::generate(&h.env),
+            fns: None,
+        });
+    }
+    let mut at_limit = baseline.clone();
+    at_limit.protocols = protocols.clone();
+    assert_eq!(client.validate_policy(&at_limit), ValidationOutcome::Valid);
+    client.set_policy(&at_limit);
+    assert_eq!(client.policy(), Some(at_limit.clone()));
+    protocols.push_back(ProtocolRule {
+        contract: Address::generate(&h.env),
+        fns: None,
+    });
+    let mut over_limit = at_limit.clone();
+    over_limit.protocols = protocols;
+    assert_rejects_preserving_policy(
+        &h.env,
+        &h.guard,
+        &over_limit,
+        &at_limit,
+        &PolicyRuleId::ProtocolListTooLong,
+    );
+
+    let mut recipients = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..crate::types::MAX_RECIPIENT_ENTRIES {
+        recipients.push_back(Address::generate(&h.env));
+    }
+    let mut at_limit = baseline;
+    at_limit.recipients = recipients.clone();
+    assert_eq!(client.validate_policy(&at_limit), ValidationOutcome::Valid);
+    client.set_policy(&at_limit);
+    assert_eq!(client.policy(), Some(at_limit.clone()));
+    recipients.push_back(Address::generate(&h.env));
+    let mut over_limit = at_limit.clone();
+    over_limit.recipients = recipients;
+    assert_rejects_preserving_policy(
+        &h.env,
+        &h.guard,
+        &over_limit,
+        &at_limit,
+        &PolicyRuleId::RecipientListTooLong,
+    );
+}
+
+fn assert_rejects_preserving_policy(
+    env: &Env,
+    guard: &Address,
+    candidate: &PolicyConfig,
+    installed: &PolicyConfig,
+    rule: &PolicyRuleId,
+) {
+    let client = PolicyEngineClient::new(env, guard);
+    assert_eq!(
+        client.validate_policy(candidate),
+        ValidationOutcome::Invalid(rule.clone())
+    );
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_policy(candidate);
+    }));
+    assert!(
+        res.is_err(),
+        "over-limit policy must fail with InvalidConfig"
+    );
+    assert_eq!(client.policy(), Some(installed.clone()));
+}
+
+#[test]
 fn validate_policy_reports_recipient_cap_sign() {
     let h = Harness::new();
     let mut p = h.base_policy();

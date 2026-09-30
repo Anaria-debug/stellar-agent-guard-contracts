@@ -679,7 +679,9 @@ pub enum PolicyRuleId { AmountSign, WindowRequiresWidth, ActiveWindowOrder,
                         SelfAddressInList, DuplicateAddressInList,
                         DuplicateRecipientCap, RecipientListTooLong,
                         RecipientCapSign, RecipientAllowAndBlocked,
-                        ProtocolContractDuplicate, ProtocolFnListInvalid }
+                        ProtocolContractDuplicate, ProtocolFnListInvalid,
+                        DurationExceedsBound, AssetListTooLong,
+                        ProtocolListTooLong }
 
 #[contracttype]
 pub enum ValidationOutcome { Valid, Invalid(PolicyRuleId) }
@@ -802,6 +804,10 @@ exists to drift. Notes:
 > documented there, so the examples cannot rot into invalid configs.
 
 - All amounts `>= 0`; `window_secs` and `dms_grace_secs` are `u64` (no negatives possible).
+- Before scanning list contents, `assets` is bounded to `MAX_POLICY_ASSETS` (256),
+  `protocols` to `MAX_POLICY_PROTOCOLS` (256), and `recipients`, `blocked_recipients`,
+  and `recipient_window_caps` to `MAX_RECIPIENT_ENTRIES` (256). These limits bound
+  authorization scans, validation work, and per-recipient storage.
 - `window_cap != 0` requires `window_secs != 0`.
 - A per-recipient cap `> 0` requires `window_secs != 0`.
 - `window_secs <= MAX_WINDOW_SECS` and `dms_grace_secs <= MAX_DMS_GRACE_SECS`
@@ -824,9 +830,6 @@ exists to drift. Notes:
 - Duplicate addresses within a list are rejected (`assets`, `recipients`,
   `blocked_recipients`, `protocols`).
 - Duplicate recipients within `recipient_window_caps` are rejected.
-- `recipients`, `blocked_recipients`, and `recipient_window_caps` are each bounded to
-  `MAX_RECIPIENT_ENTRIES` (256) entries to keep allowlist/denylist scans and
-  per-recipient storage predictable.
 - `recipients` and `blocked_recipients` must not intersect — a contradictory config is
   rejected.
 - The contract's own address may not appear in **any** of the address lists:
@@ -864,13 +867,15 @@ order:
 
 | `PolicyRuleId` | §8 rule |
 |---|---|
+| `AssetListTooLong` | `assets` over `MAX_POLICY_ASSETS` |
+| `ProtocolListTooLong` | `protocols` over `MAX_POLICY_PROTOCOLS` |
+| `RecipientListTooLong` | `recipients` / `recipient_window_caps` / `blocked_recipients` over `MAX_RECIPIENT_ENTRIES` |
 | `AmountSign` | `per_tx_cap` / `window_cap` negative |
 | `WindowRequiresWidth` | `window_cap != 0` (or a per-recipient cap `> 0`) with `window_secs == 0` |
 | `ActiveWindowOrder` | `active_until != 0 && active_until <= active_from` |
 | `SelfAddressInList` | the contract's own address in `assets`, `protocols`, `recipients`, `blocked_recipients`, or a `recipient_window_caps` entry |
 | `DuplicateAddressInList` | duplicate address in `assets` / `recipients` / `blocked_recipients`, or duplicate fn name within one protocol rule |
 | `DuplicateRecipientCap` | the same recipient twice in `recipient_window_caps` |
-| `RecipientListTooLong` | `recipients` / `recipient_window_caps` / `blocked_recipients` over `MAX_RECIPIENT_ENTRIES` |
 | `RecipientCapSign` | a per-recipient cap negative |
 | `RecipientAllowAndBlocked` | a recipient in both `recipients` and `blocked_recipients` |
 | `ProtocolContractDuplicate` | the same contract in two protocol rules |

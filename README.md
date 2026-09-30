@@ -180,9 +180,10 @@ Other validation rules (SPEC §8): negative caps, `window_cap > 0` or a positive
 `recipient_window_caps` entry with `window_secs == 0`, duplicate
 assets/recipients/blocked_recipients/protocol contracts, duplicate recipients in
 `recipient_window_caps`, a non-empty intersection between `recipients` and
-`blocked_recipients`, more than 256 recipients, blocked recipients, or per-recipient
-cap entries, empty per-protocol fn lists, or the self-address in
-`assets`/`protocols`/`recipients`/`blocked_recipients` all fail with `InvalidConfig`.
+`blocked_recipients`, more than 256 `assets`, `protocols`, or `recipients` (and more
+than 256 `blocked_recipients` or per-recipient cap entries), empty per-protocol fn
+lists, or the self-address in `assets`/`protocols`/`recipients`/`blocked_recipients`
+all fail with `InvalidConfig`.
 
 **Not sure where to start?** Copy-paste presets for common operator personas —
 day-trader agent, payments bot, watch-only + heartbeat, max security — each with

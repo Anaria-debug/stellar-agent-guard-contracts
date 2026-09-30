@@ -39,8 +39,8 @@ pub use types::{
     ValidationOutcome,
 };
 use types::{
-    CheckResult, DataKey, PolicyRuleId, Status, WindowState, MAX_DMS_GRACE_SECS,
-    MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
+    CheckResult, DataKey, PolicyRuleId, Status, WindowState, MAX_DMS_GRACE_SECS, MAX_POLICY_ASSETS,
+    MAX_POLICY_PROTOCOLS, MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
 };
 use window::Ledger;
 
@@ -219,12 +219,25 @@ fn has_dup<T: PartialEq + TryFromVal<Env, Val> + IntoVal<Env, Val>>(
 }
 
 /// Evaluates every SPEC §8 validation rule against `cfg` and returns the
-/// **first** rule that fails (rules are checked in the documented §8 order,
-/// which the `PolicyRuleId` variant order mirrors), or `Ok(())` when every
-/// rule passes. Pure logic over the candidate config — no storage access
-/// beyond `env.current_contract_address()` — so the `validate_policy` read
-/// can call it without touching state (issue #35).
+/// **first** rule that fails (rules are checked in the documented §8 order),
+/// or `Ok(())` when every rule passes. Pure logic over the candidate config —
+/// no storage access beyond `env.current_contract_address()` — so the
+/// `validate_policy` read can call it without touching state (issue #35).
 fn first_failing_rule(env: &Env, cfg: &PolicyConfig) -> Result<(), PolicyRuleId> {
+    // Reject excessive vectors before content checks and duplicate scans, so
+    // both validation cost and the later authorization scans stay bounded.
+    if (cfg.assets.len() as usize) > MAX_POLICY_ASSETS {
+        return Err(PolicyRuleId::AssetListTooLong);
+    }
+    if (cfg.protocols.len() as usize) > MAX_POLICY_PROTOCOLS {
+        return Err(PolicyRuleId::ProtocolListTooLong);
+    }
+    if (cfg.recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
+        || (cfg.recipient_window_caps.len() as usize) > MAX_RECIPIENT_ENTRIES
+        || (cfg.blocked_recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
+    {
+        return Err(PolicyRuleId::RecipientListTooLong);
+    }
     if cfg.per_tx_cap < 0 || cfg.window_cap < 0 {
         return Err(PolicyRuleId::AmountSign);
     }
@@ -273,12 +286,6 @@ fn first_failing_rule(env: &Env, cfg: &PolicyConfig) -> Result<(), PolicyRuleId>
                 }
             }
         }
-    }
-    if (cfg.recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
-        || (cfg.recipient_window_caps.len() as usize) > MAX_RECIPIENT_ENTRIES
-        || (cfg.blocked_recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
-    {
-        return Err(PolicyRuleId::RecipientListTooLong);
     }
     for i in 0..cfg.recipient_window_caps.len() {
         if let Some(rc) = cfg.recipient_window_caps.get(i) {

@@ -19,9 +19,15 @@ pub enum DmsHealthStatus {
 /// oldest entries forward (conservative over-count) — see SPEC §3.1.
 pub const MAX_WINDOW_ENTRIES: usize = 8192;
 
-/// Hard bound on the number of entries in `recipients` and
-/// `recipient_window_caps`. Keeps allowlist scans and per-recipient storage
-/// bounded and predictable (SPEC §3 / §8).
+/// Maximum number of asset contracts in a policy (SPEC §8).
+pub const MAX_POLICY_ASSETS: usize = 256;
+
+/// Maximum number of protocol contracts in a policy (SPEC §8).
+pub const MAX_POLICY_PROTOCOLS: usize = 256;
+
+/// Hard bound on the number of entries in `recipients`, `blocked_recipients`,
+/// and `recipient_window_caps`. Keeps allowlist scans and per-recipient
+/// storage bounded and predictable (SPEC §3 / §8).
 pub const MAX_RECIPIENT_ENTRIES: usize = 256;
 
 /// Upper bound on `window_secs` and `dms_grace_secs` (issue #34). `3_650` days
@@ -33,10 +39,9 @@ pub const MAX_WINDOW_SECS: u64 = 315_360_000; // 86_400 × 3_650
 /// Same upper bound as `MAX_WINDOW_SECS`, applied to the DMS grace.
 pub const MAX_DMS_GRACE_SECS: u64 = MAX_WINDOW_SECS;
 
-/// Which SPEC §8 validation rule rejected a policy (issue #35). One variant
-/// per distinct rule; variants are listed in the order `validate_config`
-/// evaluates them, and `validate_policy` reports the **first** rule that
-/// fails.
+/// Which SPEC §8 validation rule rejected a policy (issue #35). `validate_policy`
+/// reports the **first** failing rule. Variants added after the original set
+/// preserve their established contract-type ordinals.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyRuleId {
@@ -70,6 +75,10 @@ pub enum PolicyRuleId {
     /// (`315_360_000` s ≈ 10 years; issue #34). Evaluated after the other
     /// rules so the previously documented variant ordinals stay wire-stable.
     DurationExceedsBound,
+    /// `assets` exceeds `MAX_POLICY_ASSETS`.
+    AssetListTooLong,
+    /// `protocols` exceeds `MAX_POLICY_PROTOCOLS`.
+    ProtocolListTooLong,
 }
 
 /// Result of the `validate_policy` read (issue #35): whether a candidate
