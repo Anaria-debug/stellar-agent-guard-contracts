@@ -168,10 +168,73 @@ fn persist_get<T: soroban_sdk::TryFromVal<Env, Val>>(env: &Env, key: &DataKey) -
     Some(value)
 }
 
-fn load_ledger(env: &Env) -> Ledger {
+/// Read `DataKey::Window` exactly once, yielding the in-memory ledger and
+/// whether the key was present in storage at all. Callers that need both (the
+/// authorization snapshot) must not re-read the key to find out.
+fn load_window(env: &Env) -> (Ledger, bool) {
     match persist_get::<WindowState>(env, &DataKey::Window) {
-        Some(state) => Ledger::from_state(env, state),
-        None => Ledger::empty(env),
+        Some(state) => (Ledger::from_state(env, state), true),
+        None => (Ledger::empty(env), false),
+    }
+}
+
+/// Everything the *policy* half of an authorization reads from storage, loaded
+/// in one shot.
+///
+/// # Invariant: one load per key per authorization
+///
+/// Every persistent key consulted while deciding is read here, exactly once,
+/// before any decision is made. Do not add a `persist_get` or a
+/// `storage().persistent().get` anywhere else in the authorization path:
+///
+/// - a repeated read of a key already in the snapshot is redundant host work —
+///   a meterable cost the agent pays on every single authorization, for
+///   information the snapshot already holds; and
+/// - a read added *after* a mutation would let the decision evaluate a mix of
+///   pre- and post-mutation state (split brain), which is a correctness bug,
+///   not just a wasted read.
+///
+/// If a new gate needs a new key, add the field here and load it here — never
+/// inline at the use site.
+///
+/// The one key read outside this snapshot is the instance-stored
+/// `DataKey::AgentPubkey`: the signature has to be verified before any policy
+/// state is consulted, and it is read once for that. Two tests keep this
+/// honest: `authorization_reads_each_storage_key_exactly_once` measures the
+/// read count, and `authorization_touches_storage_only_through_the_snapshot`
+/// fails if an inline read is added back.
+struct AuthSnapshot {
+    /// Installed policy. `None` is the default-deny state.
+    policy: PolicyConfig,
+    /// Admin kill switch.
+    admin_frozen: bool,
+    /// Unix seconds of the last agent heartbeat (0 = never).
+    last_heartbeat: u64,
+    /// `DataKey::Window` was present in storage, as opposed to the account
+    /// never having spent. Captured by the same single load that builds the
+    /// ledger, so the caller deciding whether to write the window back does not
+    /// have to ask storage a second time.
+    window_persisted: bool,
+    /// Rolling spend ledger.
+    ledger: Ledger,
+}
+
+impl AuthSnapshot {
+    /// Load the whole authorization snapshot. `None` when no policy is
+    /// installed — the default-deny state, reported without loading anything
+    /// else (the `?` short-circuits before the remaining keys are touched).
+    fn load(env: &Env) -> Option<Self> {
+        let policy = persist_get::<PolicyConfig>(env, &DataKey::Policy)?;
+        let admin_frozen = persist_get::<bool>(env, &DataKey::AdminFrozen).unwrap_or(false);
+        let last_heartbeat = persist_get::<u64>(env, &DataKey::LastHeartbeat).unwrap_or(0);
+        let (ledger, window_persisted) = load_window(env);
+        Some(Self {
+            policy,
+            admin_frozen,
+            last_heartbeat,
+            window_persisted,
+            ledger,
+        })
     }
 }
 
@@ -423,7 +486,7 @@ fn emit_agent_rotated(env: &Env, by: &Address, old: &BytesN<32>, new: &BytesN<32
     .publish(env);
 }
 
-// ── Contract ─────────────────────────────────────────────────────────────
+// ── Contract ──────────────────────────────────────────────────────────
 
 #[contract]
 pub struct PolicyEngine;
@@ -654,7 +717,7 @@ impl PolicyEngine {
             Some(cfg) => {
                 // Prune a local copy of the ledger so remaining headroom never
                 // counts expired entries. No storage write: this is a read.
-                let mut ledger = load_ledger(&env);
+                let (mut ledger, _) = load_window(&env);
                 if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
                     ledger.prune(now, cfg.window_secs);
                 }
@@ -728,7 +791,7 @@ impl PolicyEngine {
     /// This function panics if the policy engine's `decide` evaluation returns an empty list of verdicts.
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail {
-        let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+        let Some(snapshot) = AuthSnapshot::load(&env) else {
             emit_auth(&env, false, Some(Error::NoPolicy), 0);
             return CheckDetail {
                 result: CheckResult::Blocked(Symbol::new(&env, Error::NoPolicy.reason())),
@@ -738,23 +801,31 @@ impl PolicyEngine {
                 effective_window_cap: None,
             };
         };
-        let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
-        let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+
+        let AuthSnapshot {
+            policy,
+            admin_frozen,
+            last_heartbeat,
+            mut ledger,
+            ..
+        } = snapshot;
         let now = env.ledger().timestamp();
         let self_addr = env.current_contract_address();
-        let mut ledger = load_ledger(&env);
-        if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
-            ledger.prune(now, cfg.window_secs);
+
+        if policy.window_cap > 0 || !policy.recipient_window_caps.is_empty() {
+            ledger.prune(now, policy.window_secs);
         }
-        let (remaining_window, per_tx_cap, effective_window_cap) = cap_metrics(&cfg, &ledger, &to);
+
+        let (remaining_window, per_tx_cap, effective_window_cap) =
+            cap_metrics(&policy, &ledger, &to);
         let effective_per_tx_cap = per_tx_cap;
         let call = transfer_context(&env, &asset, &to, amount);
         let verdicts = decide(
             &env,
             &self_addr,
-            Some(&cfg),
+            Some(&policy),
             &AccountState {
-                admin_frozen: frozen,
+                admin_frozen,
                 last_heartbeat,
             },
             &mut ledger,
@@ -828,25 +899,32 @@ impl CustomAccountInterface for PolicyEngine {
         let message: Bytes = signature_payload.into();
         env.crypto().ed25519_verify(&agent, &message, &signatures);
 
-        // 3. Policy snapshot + gate evaluation over every context.
-        let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+        // 3. Policy snapshot + gate evaluation over every context. The whole
+        //    storage read set of an authorization happens here, in one place,
+        //    exactly once per key — see the `AuthSnapshot` invariant.
+        let Some(snapshot) = AuthSnapshot::load(&env) else {
             for i in 0..auth_contexts.len() {
                 emit_auth(&env, false, Some(Error::NoPolicy), i);
             }
             return Err(Error::NoPolicy);
         };
-        let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
-        let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+
+        let AuthSnapshot {
+            policy,
+            admin_frozen,
+            last_heartbeat,
+            window_persisted,
+            mut ledger,
+        } = snapshot;
         let now = env.ledger().timestamp();
         let self_addr = env.current_contract_address();
 
-        let mut ledger = load_ledger(&env);
         let verdicts = decide(
             &env,
             &self_addr,
-            Some(&cfg),
+            Some(&policy),
             &AccountState {
-                admin_frozen: frozen,
+                admin_frozen,
                 last_heartbeat,
             },
             &mut ledger,
@@ -871,9 +949,8 @@ impl CustomAccountInterface for PolicyEngine {
 
         if all_passed {
             // 4. Persist window changes made by the decision.
-            let had_window = persist_get::<WindowState>(&env, &DataKey::Window).is_some();
             let has_entries = ledger.len() > 0 || ledger_has_recipient_entries(&ledger);
-            if had_window || has_entries {
+            if window_persisted || has_entries {
                 save_ledger(&env, &ledger);
             }
             Ok(())
