@@ -16,6 +16,14 @@
 //! - `MockAdmin` is a trivial custom account (`Signature = ()`, always
 //!   approves) so admin calls can be enforced in the same env without key
 //!   material.
+//!
+//! Protocol allowlist coverage (SPEC §6.3): `ProtocolRule.fns` has three
+//! states — `None` (any fn on that contract), `Some(list)` with a match, and
+//! `Some(list)` without a match. The tests below pin each state plus the
+//! unknown-contract denial and the empty-`Some([])` config rejection, and
+//! assert that the allowlist check runs *before* any arg inspection (a
+//! protocol named like an SAC is still classified as a protocol, not a
+//! transfer).
 
 use crate::types::{
     CheckResult, DataKey, DmsHealthStatus, Error as GuardError, PolicyConfig, PolicyRuleId,
