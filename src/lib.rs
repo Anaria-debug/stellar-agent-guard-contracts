@@ -43,16 +43,16 @@ use types::{
     CheckResult, DataKey, PolicyRuleId, Status, WindowState, MAX_DMS_GRACE_SECS, MAX_POLICY_ASSETS,
     MAX_POLICY_PROTOCOLS, MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
 };
-use window::Ledger;
+use window::{Ledger, WindowMerge, WindowMergeKind};
+
+// ── Contract events (SPEC §9). Each event is its own type; topic layout
+//    follows the SPEC table exactly so the Phase-2 listener can filter on one
+//    vocabulary without decoding payloads it does not need.
 
 mod event_types {
     #![allow(missing_docs)] // Soroban contractevent emits undocumented static metadata.
-
+    #[allow(clippy::wildcard_imports)] // event structs share the crate-root imports
     use super::*;
-
-    // ── Contract events (SPEC §9). Each event is its own type; topic layout
-    //    follows the SPEC table exactly so the Phase-2 listener can filter on one
-    //    vocabulary without decoding payloads it does not need.
 
     /// Every decision: topic[0]=result (`allowed`/`blocked`), topic[1]=reason.
     /// Data carries `context_index` plus `revision` — the `PolicyRevision`
@@ -143,9 +143,35 @@ mod event_types {
         pub(super) old_fingerprint: BytesN<8>,
         pub(super) new_fingerprint: BytesN<8>,
     }
+
+    /// A conservative ledger coalescence at the 8192-entry backstop.
+    /// Topic 1 identifies the ledger kind; data carries retained timestamp/value.
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventWindowMerged {
+        #[topic]
+        pub(super) ledger_kind: Symbol,
+        pub(super) merged_ts: u64,
+        pub(super) merged_value: i128,
+    }
 }
 
+#[allow(clippy::wildcard_imports)] // every event type is used by the emit helpers below
 use event_types::*;
+
+fn emit_window_merge(env: &Env, merge: WindowMerge) {
+    let ledger_kind = match merge.kind {
+        WindowMergeKind::GlobalSpend => "global_spend",
+        WindowMergeKind::RecipientSpend => "recipient_spend",
+        WindowMergeKind::ProtocolCalls => "protocol_calls",
+    };
+    EventWindowMerged {
+        ledger_kind: Symbol::new(env, ledger_kind),
+        merged_ts: merge.merged_ts,
+        merged_value: merge.merged_value,
+    }
+    .publish(env);
+}
 
 // ── Persistent-storage helpers (SPEC §3) ────────────────────────────────
 // Admin / AgentPubkey / Initialized live in instance storage (auto-TTL on
@@ -177,10 +203,73 @@ fn persist_get<T: soroban_sdk::TryFromVal<Env, Val>>(env: &Env, key: &DataKey) -
     Some(value)
 }
 
-fn load_ledger(env: &Env) -> Ledger {
+/// Read `DataKey::Window` exactly once, yielding the in-memory ledger and
+/// whether the key was present in storage at all. Callers that need both (the
+/// authorization snapshot) must not re-read the key to find out.
+fn load_window(env: &Env) -> (Ledger, bool) {
     match persist_get::<WindowState>(env, &DataKey::Window) {
-        Some(state) => Ledger::from_state(env, state),
-        None => Ledger::empty(env),
+        Some(state) => (Ledger::from_state(env, state), true),
+        None => (Ledger::empty(env), false),
+    }
+}
+
+/// Everything the *policy* half of an authorization reads from storage, loaded
+/// in one shot.
+///
+/// # Invariant: one load per key per authorization
+///
+/// Every persistent key consulted while deciding is read here, exactly once,
+/// before any decision is made. Do not add a `persist_get` or a
+/// `storage().persistent().get` anywhere else in the authorization path:
+///
+/// - a repeated read of a key already in the snapshot is redundant host work —
+///   a meterable cost the agent pays on every single authorization, for
+///   information the snapshot already holds; and
+/// - a read added *after* a mutation would let the decision evaluate a mix of
+///   pre- and post-mutation state (split brain), which is a correctness bug,
+///   not just a wasted read.
+///
+/// If a new gate needs a new key, add the field here and load it here — never
+/// inline at the use site.
+///
+/// The one key read outside this snapshot is the instance-stored
+/// `DataKey::AgentPubkey`: the signature has to be verified before any policy
+/// state is consulted, and it is read once for that. Two tests keep this
+/// honest: `authorization_reads_each_storage_key_exactly_once` measures the
+/// read count, and `authorization_touches_storage_only_through_the_snapshot`
+/// fails if an inline read is added back.
+struct AuthSnapshot {
+    /// Installed policy. `None` is the default-deny state.
+    policy: PolicyConfig,
+    /// Admin kill switch.
+    admin_frozen: bool,
+    /// Unix seconds of the last agent heartbeat (0 = never).
+    last_heartbeat: u64,
+    /// `DataKey::Window` was present in storage, as opposed to the account
+    /// never having spent. Captured by the same single load that builds the
+    /// ledger, so the caller deciding whether to write the window back does not
+    /// have to ask storage a second time.
+    window_persisted: bool,
+    /// Rolling spend ledger.
+    ledger: Ledger,
+}
+
+impl AuthSnapshot {
+    /// Load the whole authorization snapshot. `None` when no policy is
+    /// installed — the default-deny state, reported without loading anything
+    /// else (the `?` short-circuits before the remaining keys are touched).
+    fn load(env: &Env) -> Option<Self> {
+        let policy = persist_get::<PolicyConfig>(env, &DataKey::Policy)?;
+        let admin_frozen = persist_get::<bool>(env, &DataKey::AdminFrozen).unwrap_or(false);
+        let last_heartbeat = persist_get::<u64>(env, &DataKey::LastHeartbeat).unwrap_or(0);
+        let (ledger, window_persisted) = load_window(env);
+        Some(Self {
+            policy,
+            admin_frozen,
+            last_heartbeat,
+            window_persisted,
+            ledger,
+        })
     }
 }
 
@@ -432,12 +521,14 @@ fn emit_agent_rotated(env: &Env, by: &Address, old: &BytesN<32>, new: &BytesN<32
     .publish(env);
 }
 
-// ── Contract ─────────────────────────────────────────────────────────────
+// ── Contract ──────────────────────────────────────────────────────────
 
 // Soroban macros emit undocumented ABI metadata. Keep their lint exception
 // scoped to this module, with contract types and implementations co-located.
 mod policy_engine_type {
     #![allow(missing_docs)]
+    #[allow(clippy::wildcard_imports)]
+    // contract impl shares the crate-root imports and helpers
     use super::*;
 
     /// Soroban custom account that enforces an agent's configured spending policy.
@@ -451,9 +542,6 @@ mod policy_engine_type {
 
         /// Registers the policy `admin` and the agent's Ed25519 public key.
         /// One-time; the account is default-deny until a policy is installed.
-        ///
-        /// # Authorization
-        /// Requires the admin address to authorize this one-time initialization.
         pub fn initialize(env: Env, admin: Address, agent_pubkey: BytesN<32>) {
             let already: Option<bool> = env.storage().instance().get(&DataKey::Initialized);
             if already.unwrap_or(false) {
@@ -485,9 +573,6 @@ mod policy_engine_type {
 
         /// Installs a new policy. Resets the rolling window and starts the
         /// dead-man-switch clock at install time (a fresh policy gets full grace).
-        ///
-        /// # Authorization
-        /// Requires the configured admin's authorization.
         pub fn set_policy(env: Env, config: PolicyConfig) {
             let admin = Self::admin_or_panic(&env);
             validate_config(&env, &config).unwrap_or_else(|e| panic_with_error!(&env, e));
@@ -500,9 +585,6 @@ mod policy_engine_type {
         }
 
         /// Removes the policy and window → immediate default-deny.
-        ///
-        /// # Authorization
-        /// Requires the configured admin's authorization.
         pub fn revoke_policy(env: Env) {
             let admin = Self::admin_or_panic(&env);
             env.storage().persistent().remove(&DataKey::Policy);
@@ -513,9 +595,6 @@ mod policy_engine_type {
 
         /// Re-binds the agent's Ed25519 public key. Admin never gains fund-moving
         /// power; it can only replace the key the account will authenticate.
-        ///
-        /// # Authorization
-        /// Requires the configured admin's authorization.
         pub fn rotate_agent_key(env: Env, new_pubkey: BytesN<32>) {
             let admin = Self::admin_or_panic(&env);
             // Post-initialize the key always exists; the fingerprint needs the old
@@ -538,8 +617,8 @@ mod policy_engine_type {
         /// the account gates, so a heartbeat after the grace window expired — or
         /// while admin-frozen — is rejected.
         ///
-        /// # Authorization
-        /// Requires the current account's custom-agent authorization.
+        /// Reads and writes: `Policy` (read, for the DMS grace at emission time)
+        /// and `LastHeartbeat` (read + write).
         pub fn heartbeat(env: Env) {
             env.current_contract_address().require_auth();
             let now = env.ledger().timestamp();
@@ -557,8 +636,8 @@ mod policy_engine_type {
             // not a value cached from an earlier call. A missing policy or a zero
             // `dms_grace_secs` means the dead-man switch is disabled, which the
             // event records as `expires_at == 0` (SPEC §9).
-            let grace =
-                persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |cfg| cfg.dms_grace_secs);
+            let grace = persist_get::<PolicyConfig>(&env, &DataKey::Policy)
+                .map_or(0, |cfg| cfg.dms_grace_secs);
             let expires_at = if grace == 0 {
                 0
             } else {
@@ -567,10 +646,6 @@ mod policy_engine_type {
             emit_heartbeat(&env, now, expires_at);
         }
 
-        /// Immediately freezes policy-authorized calls until the admin unfreezes.
-        ///
-        /// # Authorization
-        /// Requires the configured admin's authorization.
         pub fn freeze(env: Env) {
             let admin = Self::admin_or_panic(&env);
             persist_set(&env, &DataKey::AdminFrozen, &true);
@@ -584,9 +659,6 @@ mod policy_engine_type {
         /// on the admin's authority, and the emitted event carries
         /// `rearmed_dms: bool` so telemetry can surface exactly that side effect
         /// (`true` = `LastHeartbeat` changed, `false` = it was already `now`).
-        ///
-        /// # Authorization
-        /// Requires the configured admin's authorization.
         pub fn unfreeze(env: Env) {
             let admin = Self::admin_or_panic(&env);
             persist_set(&env, &DataKey::AdminFrozen, &false);
@@ -600,8 +672,6 @@ mod policy_engine_type {
         // ── Read / advisory (no auth; non-confidential state; TTL effects in §9.5) ─
 
         #[allow(clippy::must_use_candidate)] // public read surface
-        /// Returns the current policy, or `None` when the account is default-deny.
-        /// This permissionless read can refresh the stored policy's TTL.
         pub fn policy(env: Env) -> Option<PolicyConfig> {
             persist_get(&env, &DataKey::Policy)
         }
@@ -653,7 +723,6 @@ mod policy_engine_type {
         }
 
         /// Evaluates dead-man switch health (`Ok`, `Warn` at ≥80% elapsed, or `Expired`).
-        /// Permissionless; this read may refresh stored state TTLs.
         #[allow(clippy::must_use_candidate)] // public read surface
         pub fn dms_health(env: Env) -> crate::types::DmsHealthStatus {
             let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
@@ -693,7 +762,7 @@ mod policy_engine_type {
                 Some(cfg) => {
                     // Prune a local copy of the ledger so remaining headroom never
                     // counts expired entries. No storage write: this is a read.
-                    let mut ledger = load_ledger(&env);
+                    let (mut ledger, _) = load_window(&env);
                     if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
                         ledger.prune(now, cfg.window_secs);
                     }
@@ -723,7 +792,6 @@ mod policy_engine_type {
 
         /// Preflight / simulate a transfer (`check`): permissionless pre-flight
         /// of the asset-transfer decision path.
-        /// No authorization is required.
         ///
         /// Search aliases for SDK discoverability: "preflight", "simulate",
         /// `simulate_transfer`, `simulate-transfer`. These are documentation
@@ -754,7 +822,6 @@ mod policy_engine_type {
 
         /// Preflight / simulate a transfer with headroom (`check_detailed`):
         /// pre-flight decision plus current cap headroom for the targeted asset.
-        /// Permissionless; no authorization is required.
         /// Part of the `check` preflight / simulate alias family (documentation
         /// aliases only; the ABI is frozen — there is no `simulate_transfer`
         /// entrypoint).
@@ -769,7 +836,7 @@ mod policy_engine_type {
         /// This function panics if the policy engine's `decide` evaluation returns an empty list of verdicts.
         #[allow(clippy::must_use_candidate)] // public read surface
         pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> CheckDetail {
-            let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+            let Some(snapshot) = AuthSnapshot::load(&env) else {
                 emit_auth(&env, false, Some(Error::NoPolicy), 0);
                 return CheckDetail {
                     result: CheckResult::Blocked(Symbol::new(&env, Error::NoPolicy.reason())),
@@ -779,24 +846,31 @@ mod policy_engine_type {
                     effective_window_cap: None,
                 };
             };
-            let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
-            let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+
+            let AuthSnapshot {
+                policy,
+                admin_frozen,
+                last_heartbeat,
+                mut ledger,
+                ..
+            } = snapshot;
             let now = env.ledger().timestamp();
             let self_addr = env.current_contract_address();
-            let mut ledger = load_ledger(&env);
-            if cfg.window_cap > 0 || !cfg.recipient_window_caps.is_empty() {
-                ledger.prune(now, cfg.window_secs);
+
+            if policy.window_cap > 0 || !policy.recipient_window_caps.is_empty() {
+                ledger.prune(now, policy.window_secs);
             }
+
             let (remaining_window, per_tx_cap, effective_window_cap) =
-                cap_metrics(&cfg, &ledger, &to);
+                cap_metrics(&policy, &ledger, &to);
             let effective_per_tx_cap = per_tx_cap;
             let call = transfer_context(&env, &asset, &to, amount);
             let verdicts = decide(
                 &env,
                 &self_addr,
-                Some(&cfg),
+                Some(&policy),
                 &AccountState {
-                    admin_frozen: frozen,
+                    admin_frozen,
                     last_heartbeat,
                 },
                 &mut ledger,
@@ -849,8 +923,6 @@ mod policy_engine_type {
         type Signature = BytesN<64>;
         type Error = Error;
 
-        /// Authorizes all contexts in a transaction after verifying the registered agent signature.
-        /// The host invokes this method; callers cannot invoke it as a normal contract entrypoint.
         fn __check_auth(
             env: Env,
             signature_payload: soroban_sdk::crypto::Hash<32>,
@@ -872,25 +944,32 @@ mod policy_engine_type {
             let message: Bytes = signature_payload.into();
             env.crypto().ed25519_verify(&agent, &message, &signatures);
 
-            // 3. Policy snapshot + gate evaluation over every context.
-            let Some(cfg) = persist_get::<PolicyConfig>(&env, &DataKey::Policy) else {
+            // 3. Policy snapshot + gate evaluation over every context. The whole
+            //    storage read set of an authorization happens here, in one place,
+            //    exactly once per key — see the `AuthSnapshot` invariant.
+            let Some(snapshot) = AuthSnapshot::load(&env) else {
                 for i in 0..auth_contexts.len() {
                     emit_auth(&env, false, Some(Error::NoPolicy), i);
                 }
                 return Err(Error::NoPolicy);
             };
-            let frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
-            let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+
+            let AuthSnapshot {
+                policy,
+                admin_frozen,
+                last_heartbeat,
+                window_persisted,
+                mut ledger,
+            } = snapshot;
             let now = env.ledger().timestamp();
             let self_addr = env.current_contract_address();
 
-            let mut ledger = load_ledger(&env);
             let verdicts = decide(
                 &env,
                 &self_addr,
-                Some(&cfg),
+                Some(&policy),
                 &AccountState {
-                    admin_frozen: frozen,
+                    admin_frozen,
                     last_heartbeat,
                 },
                 &mut ledger,
@@ -915,9 +994,11 @@ mod policy_engine_type {
 
             if all_passed {
                 // 4. Persist window changes made by the decision.
-                let had_window = persist_get::<WindowState>(&env, &DataKey::Window).is_some();
+                for &merge in &ledger.merges {
+                    emit_window_merge(&env, merge);
+                }
                 let has_entries = ledger.len() > 0 || ledger_has_recipient_entries(&ledger);
-                if had_window || has_entries {
+                if window_persisted || has_entries {
                     save_ledger(&env, &ledger);
                 }
                 Ok(())
@@ -937,9 +1018,8 @@ pub use policy_engine_type::PolicyEngineClient;
 /// Test-only access to the decision engine and Soroban helpers.
 #[cfg(feature = "testutils")]
 #[allow(clippy::must_use_candidate, clippy::len_without_is_empty)]
+#[allow(missing_docs)] // Test-only helper re-exports are not contract API.
 pub mod testutils {
-    #![allow(missing_docs)] // Test-only helper re-exports are not contract API.
-
     pub use crate::engine::{contains_addr, decide, parse_call, AccountState, Decision};
     pub use crate::types::policy_canonical_encoding;
     pub use crate::types::{
