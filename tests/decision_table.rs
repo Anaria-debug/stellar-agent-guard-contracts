@@ -222,7 +222,7 @@ fn engine_block_reasons() -> BTreeSet<String> {
         rest = &rest[position + "Error::".len()..];
         let name: String = rest
             .chars()
-            .take_while(|character| character.is_ascii_alphanumeric())
+            .take_while(char::is_ascii_alphanumeric)
             .collect();
         if !name.is_empty() {
             reasons.insert(name);
@@ -362,8 +362,10 @@ fn every_reason_symbol_is_documented_in_the_reason_glossary() {
         let symbol = symbols
             .iter()
             .find(|(variant, _)| variant == &error)
-            .map(|(_variant, symbol)| symbol.as_str())
-            .unwrap_or_else(|| panic!("{TYPES}: no `reason()` arm for `{error}`"));
+            .map_or_else(
+                || panic!("{TYPES}: no `reason()` arm for `{error}`"),
+                |(_variant, symbol)| symbol.as_str(),
+            );
         assert!(
             glossary.contains(symbol),
             "{GLOSSARY} does not document `{symbol}` ({error}), so SDK and UI consumers have \
