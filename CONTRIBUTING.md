@@ -76,6 +76,16 @@ This removes all `target/` directories and `*.wasm` artifacts. The `.gitignore` 
    the quoted sentence itself changes). Copies in sibling repositories
    (`stellar-agent-guard-sdk`, `stellar-agent-guard-dashboard`) are out of scope
    here; they are tracked in their own issue trackers.
+
+   The decision table is single-sourced too, and mechanically so (issue #76):
+   [`decision-table.json`](decision-table.json) is the source of truth, the SPEC
+   §4 table is rendered from it, and `tests/decision_table.rs` fails `cargo test`
+   — therefore CI — when the JSON, the SPEC §4 table, the README walkthrough, the
+   `Error` enum, and `src/engine.rs` drift apart. When you change what a call can
+   be blocked with, the order is: `src/engine.rs` → `decision-table.json` (row,
+   reason, and the test that pins it) → paste the rendered row into SPEC §4 →
+   run `cargo test`. Adding an `Error::` branch without a JSON row fails the
+   build on purpose.
 3. **`clippy::all` and `clippy::pedantic` clean** — enforced in CI with
    `-D warnings`.
 4. **`cargo fmt` clean** — enforced in CI.
@@ -140,6 +150,8 @@ examples/
 tools/
   agent-tx/          # Sign+submit helper for the custom-account address
 tests/fixtures/      # Real testnet evidence (tx hashes, contract IDs, events)
+tests/decision_table.rs  # Drift gate: SPEC §4 ↔ decision-table.json ↔ engine
+decision-table.json  # Machine-readable source of truth for the SPEC §4 table
 rust-toolchain.toml  # Pinned toolchain: reproducible WASM hashes (issue #67)
 SPEC.md              # Architecture specification (mechanism is settled)
 ```

@@ -716,6 +716,12 @@ Stellar Agent Guard operates across three dedicated repositories:
   with a machine-readable scenario index in
   [`tests/fixtures/index.json`](tests/fixtures/index.json) (scenario → tx hash →
   ledger → expected reason → contract ID) that CI keeps consistent with the prose.
+- [`decision-table.json`](decision-table.json) — the machine-readable twin of the
+  SPEC §4 decision table: every row, the `Error` variants the engine can return
+  for it, and the test that pins each one. `tests/decision_table.rs` fails the
+  build if that file, the SPEC §4 table, the “How it works” walkthrough above, the
+  `Error` enum, and `src/engine.rs` disagree — so the three artifacts cannot drift
+  apart silently.
 - `SPEC.md` — the full architecture specification.
 
 ## ✅ Verified against live testnet
