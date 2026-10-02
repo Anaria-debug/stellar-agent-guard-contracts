@@ -248,14 +248,16 @@ and any matching per-recipient cap must be satisfied.
 
 ### 3.2 Exact ScVal encoding of `PolicyConfig` (for non-TypeScript consumers)
 
-The SDK's `policyToScVal` is currently the only reference encoder, and it is TypeScript. This
-section pins the on-wire `ScVal` layout so Go/Python/Rust integrators (or a future CLI) can
+The SDK's `policyToScVal` is the corresponding TypeScript encoder. This section pins the on-wire
+`ScVal` layout so Go/Python/Rust integrators (or a future CLI) can
 implement encoders without reverse-engineering TS source. The layout below was derived from the
 soroban-sdk 27 `#[contracttype]` derives (the host is the ultimate referee) and is locked by
-`tests/policyconfig_scval_encoding.rs`, which fails `cargo test` if a field, the key order, or a
-primitive's `ScVal` variant changes.
+`tests/policyconfig_scval_encoding.rs` and the shared vectors in
+[`tests/fixtures/policy-vectors.json`](tests/fixtures/policy-vectors.json). The Rust vector test
+decodes and round-trips each XDR value; [SDK issue #260](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/260)
+references this same file for the `policyToScVal` encoder assertion.
 
-**Top level:** `ScVal::Map` with exactly **13 entries**, one per field. The map keys are the
+**Top level:** `ScVal::Map` with exactly **14 entries**, one per field. The map keys are the
 field names as `ScVal::Symbol`.
 
 **Sort order is mandatory.** The entries below are listed in **ascending symbol-key order**
@@ -276,11 +278,12 @@ rely on the struct's declaration order. The contract itself does not re-validate
 | 6 | `dms_grace_secs` | `u64` | `U64` | 0 = DMS disabled |
 | 7 | `paused` | `bool` | `Bool` | |
 | 8 | `per_tx_cap` | `i128` | `I128` | `Int128Parts { hi: i64, lo: u64 }`, two's complement |
-| 9 | `protocols` | `Vec<ProtocolRule>` | `Vec` | elements are 2-entry maps, see below |
-| 10 | `recipient_window_caps` | `Vec<RecipientCap>` | `Vec` | elements are 2-entry maps, see below |
-| 11 | `recipients` | `Vec<Address>` | `Vec` | account addresses |
-| 12 | `window_cap` | `i128` | `I128` | 0 = disabled |
-| 13 | `window_secs` | `u64` | `U64` | |
+| 9 | `protocol_calls_per_window` | `u32` | `U32` | 0 = disabled |
+| 10 | `protocols` | `Vec<ProtocolRule>` | `Vec` | elements are 2-entry maps, see below |
+| 11 | `recipient_window_caps` | `Vec<RecipientCap>` | `Vec` | elements are 2-entry maps, see below |
+| 12 | `recipients` | `Vec<Address>` | `Vec` | account addresses |
+| 13 | `window_cap` | `i128` | `I128` | 0 = disabled |
+| 14 | `window_secs` | `u64` | `U64` | |
 
 **`ProtocolRule` sub-encoding:** each element of `protocols` is itself a `ScVal::Map` with
 exactly 2 entries, keys sorted:
@@ -300,7 +303,7 @@ exactly 2 entries, keys sorted:
 
 **Primitive rules (apply everywhere, including nested values):**
 
-- `u64` → `ScVal::U64`. There are no unsigned-32 fields in `PolicyConfig`.
+- `u64` → `ScVal::U64`; `protocol_calls_per_window: u32` → `ScVal::U32`.
 - `i128` → `ScVal::I128(Int128Parts { hi, lo })` — the 128-bit two's-complement value split into
   a signed 64-bit high word and unsigned 64-bit low word. Example: `-1234567` encodes as
   `hi: -1, lo: 18446744073708317049` (= 2⁶⁴ − 1234567). Non-negative values always have
