@@ -223,6 +223,12 @@ Implementation (exact, lazy, bounded):
   `window_secs` span") is preserved in all cases; in the pathological region of ≥8192 distinct
   spend seconds within one window the engine is conservative until density drops. This is
   documented here and in the README, not hidden.
+- **Merge telemetry:** each successful admission that triggers this backstop emits one
+  `event_window_merged` event. Topic 1 identifies `global_spend`, `recipient_spend`, or
+  `protocol_calls`; data is the compact tuple `(merged_ts, merged_value)`, where `merged_ts`
+  is the retained newer timestamp and `merged_value` is the merged spend amount or call count.
+  Events are emitted only when all auth contexts pass and the corresponding ledger changes
+  are committed. No event is emitted below the bound.
 - **Measured worst case (single lazy prune burst):** the real bench measurement for the pathological
   case of 8192 stale entries being pruned in one authorization is `worst_case_prune_cpu_cost=86925434`
   CPU instructions (`cargo test prune_worst_case_measured_cost -- --nocapture`). That is a
@@ -242,14 +248,16 @@ and any matching per-recipient cap must be satisfied.
 
 ### 3.2 Exact ScVal encoding of `PolicyConfig` (for non-TypeScript consumers)
 
-The SDK's `policyToScVal` is currently the only reference encoder, and it is TypeScript. This
-section pins the on-wire `ScVal` layout so Go/Python/Rust integrators (or a future CLI) can
+The SDK's `policyToScVal` is the corresponding TypeScript encoder. This section pins the on-wire
+`ScVal` layout so Go/Python/Rust integrators (or a future CLI) can
 implement encoders without reverse-engineering TS source. The layout below was derived from the
 soroban-sdk 27 `#[contracttype]` derives (the host is the ultimate referee) and is locked by
-`tests/policyconfig_scval_encoding.rs`, which fails `cargo test` if a field, the key order, or a
-primitive's `ScVal` variant changes.
+`tests/policyconfig_scval_encoding.rs` and the shared vectors in
+[`tests/fixtures/policy-vectors.json`](tests/fixtures/policy-vectors.json). The Rust vector test
+decodes and round-trips each XDR value; [SDK issue #260](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/260)
+references this same file for the `policyToScVal` encoder assertion.
 
-**Top level:** `ScVal::Map` with exactly **13 entries**, one per field. The map keys are the
+**Top level:** `ScVal::Map` with exactly **14 entries**, one per field. The map keys are the
 field names as `ScVal::Symbol`.
 
 **Sort order is mandatory.** The entries below are listed in **ascending symbol-key order**
@@ -270,11 +278,12 @@ rely on the struct's declaration order. The contract itself does not re-validate
 | 6 | `dms_grace_secs` | `u64` | `U64` | 0 = DMS disabled |
 | 7 | `paused` | `bool` | `Bool` | |
 | 8 | `per_tx_cap` | `i128` | `I128` | `Int128Parts { hi: i64, lo: u64 }`, two's complement |
-| 9 | `protocols` | `Vec<ProtocolRule>` | `Vec` | elements are 2-entry maps, see below |
-| 10 | `recipient_window_caps` | `Vec<RecipientCap>` | `Vec` | elements are 2-entry maps, see below |
-| 11 | `recipients` | `Vec<Address>` | `Vec` | account addresses |
-| 12 | `window_cap` | `i128` | `I128` | 0 = disabled |
-| 13 | `window_secs` | `u64` | `U64` | |
+| 9 | `protocol_calls_per_window` | `u32` | `U32` | 0 = disabled |
+| 10 | `protocols` | `Vec<ProtocolRule>` | `Vec` | elements are 2-entry maps, see below |
+| 11 | `recipient_window_caps` | `Vec<RecipientCap>` | `Vec` | elements are 2-entry maps, see below |
+| 12 | `recipients` | `Vec<Address>` | `Vec` | account addresses |
+| 13 | `window_cap` | `i128` | `I128` | 0 = disabled |
+| 14 | `window_secs` | `u64` | `U64` | |
 
 **`ProtocolRule` sub-encoding:** each element of `protocols` is itself a `ScVal::Map` with
 exactly 2 entries, keys sorted:
@@ -294,7 +303,7 @@ exactly 2 entries, keys sorted:
 
 **Primitive rules (apply everywhere, including nested values):**
 
-- `u64` → `ScVal::U64`. There are no unsigned-32 fields in `PolicyConfig`.
+- `u64` → `ScVal::U64`; `protocol_calls_per_window: u32` → `ScVal::U32`.
 - `i128` → `ScVal::I128(Int128Parts { hi, lo })` — the 128-bit two's-complement value split into
   a signed 64-bit high word and unsigned 64-bit low word. Example: `-1234567` encodes as
   `hi: -1, lo: 18446744073708317049` (= 2⁶⁴ − 1234567). Non-negative values always have
@@ -452,6 +461,18 @@ For comparison, an **allowed** transfer with window pruning costs ~14,800 instru
     (`rearmed_dms: false`).
   - **No API change:** `unfreeze`'s signature, storage writes, and authorization are unchanged;
     this is purely additive event data (see §9).
+- **Executable specification.** `dms_timeline_edge_matrix` (`src/integration_tests.rs`) is the
+  table-driven walk of rule #2 and is normative for its edges: install arms the clock at
+  `LastHeartbeat = now`, the 80% warn band is reached while spend is still admissible (`> grace`,
+  not `>= grace`), expiry blocks the transfer *and* the heartbeat, a blocked heartbeat leaves the
+  clock untouched, and `unfreeze` re-arms it so the new window expires on its own terms. It also
+  pins the two degenerate encodings: `dms_grace_secs == 0` (switch disabled — no amount of silence
+  expires the account, `dms_health` returns `Ok` without consulting the clock) and
+  `LastHeartbeat == 0` (never armed — rule #2's `!= 0` clause means the gate can never fire on the
+  sentinel, while `dms_health` reports `Expired`; a first heartbeat replaces the sentinel and the
+  grace binds from then on). Read that asymmetry as intended: the gate defaults to *not* freezing an
+  account it holds no attestation for, and the advisory view is where the missing attestation is
+  surfaced. Measured: see `dms_timeline_edge_matrix` (scenario B).
 
 ---
 
@@ -472,6 +493,9 @@ calls whose semantics and arguments are known:
 
 - `transfer` args: `(from, to, amount)` — the account is `from`; recipient = args[1], amount = args[2].
 - `transfer_from` args: `(from, spender, to, amount)` — the account is `from`; recipient = args[2], amount = args[3].
+
+Note on multi-asset batches: the window total is a unit-less sum across assets until per-asset caps
+land; operators should use single-asset policies for meaningful windows.
 
 **Exact arity required; extra args deny -- we do not partially parse.** A call whose argument list does not match the SAC schema exactly (`transfer` = 3, `transfer_from` = 4) is rejected with `UnknownContract` and never reaches the cap/allowlist evaluation. We only enforce what we fully understand; a context carrying extra trailing values is treated as a call we cannot reason about (conservative default-deny).
 
@@ -584,7 +608,9 @@ To close the CheckResult/Error duality gap, every contract `Error` variant maps 
 | 26 | `UnknownContract` | `unknown_contract` | No | Auth-path only: unlisted contracts are encountered in auth contexts. |
 | 27 | `SelfFunctionNotAllowed` | `self_function_not_allowed` | No | Auth-path only: self-calls are part of `__check_auth` context dispatch. |
 | 28 | `CreateContractNotAllowed` | `create_contract_not_allowed` | No | Auth-path only: contract creation host functions occur in auth contexts. |
-| 29 | `RecipientBlocked` | `recipient_blocked` | Yes | Recipient is on the explicit denylist.
+| 29 | `RecipientBlocked` | `recipient_blocked` | Yes | Recipient is on the explicit denylist. |
+| 30 | `ProtocolCallRateExceeded` | `protocol_call_rate_exceeded` | No | Auth-path only: protocol-call rate limits apply to auth contexts. |
+| 31 | `DecisionInvariantViolation` | `decision_invariant_violation` | No | Internal invariant guard: the policy engine returned inconsistent verdict data. |
 
 // ── Policy management (admin only) ────────────────────────────────────────
 pub fn set_policy(env: Env, config: PolicyConfig)
@@ -610,6 +636,13 @@ pub fn status(env: Env) -> Status                     // operational snapshot (s
                                                       // paused / window_remaining / outside_active_window
                                                       // / admin_frozen / heartbeat_expired / revision
 pub fn dms_health(env: Env) -> DmsHealth                  // ok, warn (>=80%), or expired
+pub fn validate_policy(env: Env, config: PolicyConfig) -> ValidationOutcome
+    // Dry-run §8 validation over the *candidate* `config` (issue #35):
+    // `Valid`, or `Invalid(rule)` naming the first failing §8 rule in
+    // evaluation order. Read-only preflight so SDKs/dashboards can pinpoint
+    // the offending field before submission; the on-chain rejection path is
+    // unchanged (`set_policy` still fails with the single `InvalidConfig`
+    // code).
 pub fn check(env: Env, asset: Address, to: Address, amount: i128) -> CheckResult
     // Preflight / simulate a transfer (doc alias; ABI frozen as `check`):
     // pure pre-flight replica of the §6.2 decision path: it does not change
@@ -668,6 +701,18 @@ pub struct DmsHealth {
 }
 
 #[contracttype]
+pub enum PolicyRuleId { AmountSign, WindowRequiresWidth, ActiveWindowOrder,
+                        SelfAddressInList, DuplicateAddressInList,
+                        DuplicateRecipientCap, RecipientListTooLong,
+                        RecipientCapSign, RecipientAllowAndBlocked,
+                        ProtocolContractDuplicate, ProtocolFnListInvalid,
+                        DurationExceedsBound, AssetListTooLong,
+                        ProtocolListTooLong }
+
+#[contracttype]
+pub enum ValidationOutcome { Valid, Invalid(PolicyRuleId) }
+
+#[contracttype]
 pub enum CheckResult { Allowed, Blocked(BlockReason) }
 
 #[contracttype]
@@ -689,7 +734,8 @@ pub enum Error {            // values stable; see tests/fixtures
     WindowCapExceeded = 23, ProtocolNotAllowed = 24, FunctionNotAllowed = 25,
     UnknownContract = 26, SelfFunctionNotAllowed = 27,
     CreateContractNotAllowed = 28,
-    RecipientBlocked = 29,
+    RecipientBlocked = 29, ProtocolCallRateExceeded = 30,
+    DecisionInvariantViolation = 31,
 }
 ```
 
@@ -785,18 +831,33 @@ exists to drift. Notes:
 > documented there, so the examples cannot rot into invalid configs.
 
 - All amounts `>= 0`; `window_secs` and `dms_grace_secs` are `u64` (no negatives possible).
+- Before scanning list contents, `assets` is bounded to `MAX_POLICY_ASSETS` (256),
+  `protocols` to `MAX_POLICY_PROTOCOLS` (256), and `recipients`, `blocked_recipients`,
+  and `recipient_window_caps` to `MAX_RECIPIENT_ENTRIES` (256). These limits bound
+  authorization scans, validation work, and per-recipient storage.
 - `window_cap != 0` requires `window_secs != 0`.
 - A per-recipient cap `> 0` requires `window_secs != 0`.
+- `window_secs <= MAX_WINDOW_SECS` and `dms_grace_secs <= MAX_DMS_GRACE_SECS`
+  (both `315_360_000` seconds = 86_400 × 3_650 ≈ 10 years, `types::MAX_WINDOW_SECS` /
+  `types::MAX_DMS_GRACE_SECS`, issue #34). Rationale: both fields are `u64`, so a
+  seconds/milliseconds mix-up (e.g. a 90-day window pasted as 7_776_000_000 ms) or a
+  fat-fingered `u64::MAX` reads as a valid config while **effectively disabling pruning
+  forever** — every rolling-window entry (and per-recipient ledger) is retained for the
+  life of the contract, which is unbounded storage growth paid by the operator, and a
+  huge `dms_grace_secs` silently turns the dead-man switch (§5) off. A decade is far
+  beyond any legitimate rolling spend window or DMS grace (it also outlives typical
+  contract deployments), so values above it are treated as a typo'd config and rejected
+  as `InvalidConfig` — fail-closed, policy unchanged. Setting a bound this high keeps
+  the decision conservative: no realistic policy is affected, only clearly accidental
+  ones. `0` remains legal for both fields (feature disabled, as documented).
 - `active_until == 0 || active_until > active_from`.
+- Policies may be installed with an `active_until` already elapsed or an `active_from` far in the past; this is allowed as a feature to park accounts in a dormant/pre-active state (subsequent transfers evaluate to `OutsideActiveWindow` until ledger time falls within the active window).
 - Assets, protocols, recipients, and per-protocol fn lists must be non-empty for their
   respective vectors to matter (empty `assets` = no SAC transfer is ever allowed; empty
   `recipients` with `allow_any_recipient == false` = no recipient allowed).
 - Duplicate addresses within a list are rejected (`assets`, `recipients`,
   `blocked_recipients`, `protocols`).
 - Duplicate recipients within `recipient_window_caps` are rejected.
-- `recipients`, `blocked_recipients`, and `recipient_window_caps` are each bounded to
-  `MAX_RECIPIENT_ENTRIES` (256) entries to keep allowlist/denylist scans and
-  per-recipient storage predictable.
 - `recipients` and `blocked_recipients` must not intersect — a contradictory config is
   rejected.
 - The contract's own address may not appear in **any** of the address lists:
@@ -815,6 +876,46 @@ exists to drift. Notes:
 
 Invalid config → `InvalidConfig`, policy unchanged (fail-closed, never partially applied).
 
+### 8.1 Identifying the failing rule: `validate_policy` (issue #35)
+
+The on-chain rejection surface is deliberately stable: any rule above fails
+`set_policy` with the single `InvalidConfig` code, and the policy is left
+uninstalled. To make the *reason* identifiable without exploding the on-chain
+error enum, the contract exposes a read-only dry run:
+
+```rust
+pub fn validate_policy(env: Env, config: PolicyConfig) -> ValidationOutcome
+```
+
+It evaluates the *candidate* `config` argument — never the installed policy —
+against the same rules, in the same order, as `set_policy`, and returns
+`Valid` or `Invalid(PolicyRuleId)`, where the payload names the **first** rule
+that failed. `PolicyRuleId` variants map to the bullets above in evaluation
+order:
+
+| `PolicyRuleId` | §8 rule |
+|---|---|
+| `AssetListTooLong` | `assets` over `MAX_POLICY_ASSETS` |
+| `ProtocolListTooLong` | `protocols` over `MAX_POLICY_PROTOCOLS` |
+| `RecipientListTooLong` | `recipients` / `recipient_window_caps` / `blocked_recipients` over `MAX_RECIPIENT_ENTRIES` |
+| `AmountSign` | `per_tx_cap` / `window_cap` negative |
+| `WindowRequiresWidth` | `window_cap != 0` (or a per-recipient cap `> 0`) with `window_secs == 0` |
+| `ActiveWindowOrder` | `active_until != 0 && active_until <= active_from` |
+| `SelfAddressInList` | the contract's own address in `assets`, `protocols`, `recipients`, `blocked_recipients`, or a `recipient_window_caps` entry |
+| `DuplicateAddressInList` | duplicate address in `assets` / `recipients` / `blocked_recipients`, or duplicate fn name within one protocol rule |
+| `DuplicateRecipientCap` | the same recipient twice in `recipient_window_caps` |
+| `RecipientCapSign` | a per-recipient cap negative |
+| `RecipientAllowAndBlocked` | a recipient in both `recipients` and `blocked_recipients` |
+| `ProtocolContractDuplicate` | the same contract in two protocol rules |
+| `ProtocolFnListInvalid` | a protocol rule's fn list empty or containing duplicates |
+| `DurationExceedsBound` | `window_secs` or `dms_grace_secs` over `MAX_WINDOW_SECS` (`315_360_000` s ≈ 10 years; evaluated last so the other variant ordinals stay wire-stable) |
+
+`validate_policy` is a read: no auth, no events, no state writes (read-path
+TTL effects in §9.5 still apply). The `InvalidConfig` code itself is
+unchanged — every decoder matching on it keeps working; surfacing
+`ValidationOutcome` in the SDK/dashboard is a cross-repo follow-up tracked in
+those repositories.
+
 ---
 
 ## 9. Events and telemetry
@@ -824,13 +925,14 @@ filtering by the SDK listener.
 
 | Event | Topics | Data | Emitted |
 |---|---|---|---|
-| `auth_checked` | `result: Symbol` (`allowed`/`blocked`), `reason: Symbol` | (none) | every `__check_auth` / `check` decision |
+| `auth_checked` | event-name topic `event_auth_checked`, then `result: Symbol` (`allowed`/`blocked`) and `reason: Symbol` (empty on allow) | Map: `context_index: u32`, `revision: u64` | every `__check_auth` / `check` decision |
 | `heartbeat` | (none) | `at: u64`, `expires_at: u64` — the attested DMS deadline as it stood at emission time, `at + dms_grace_secs` of the policy current at that moment; `0` when the dead-man switch is disabled (`dms_grace_secs == 0`, or no policy) | on agent heartbeat (skipped when `now == LastHeartbeat`; §5) |
 | `initialized` | (none) | `by: Address` | contract initialization |
 | `frozen` | (none) | `by: Address` | admin freeze |
 | `unfrozen` | (none) | `by: Address`, `rearmed_dms: bool` — whether `LastHeartbeat` was changed (DMS clock re-armed; §5) | admin unfreeze |
 | `policy_set` / `policy_revoked` | (none) | `by: Address`, `revision: u64` — the `PolicyRevision` this call produced | admin policy changes |
 | `agent_rotated` | (none) | `by: Address`, `old_fingerprint: BytesN<8>`, `new_fingerprint: BytesN<8>` | admin agent-key rotation |
+| `event_window_merged` | `ledger_kind: Symbol` (`global_spend`, `recipient_spend`, `protocol_calls`) | `(merged_ts: u64, merged_value: i128)` â€” retained newer timestamp and merged spend amount or call count | successful admission engages the 8192-entry backstop |
 
 **Policy revision join key (issue #38).** `PolicyRevision` is a persistent
 instance-stored counter (`DataKey::PolicyRevision`, §3) incremented by every

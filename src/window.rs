@@ -26,6 +26,21 @@ use crate::types::{
 };
 use soroban_sdk::{contracttype, Address, Env};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowMergeKind {
+    GlobalSpend,
+    RecipientSpend,
+    ProtocolCalls,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowMerge {
+    pub kind: WindowMergeKind,
+    pub merged_ts: u64,
+    /// Spend amount, or protocol call count when `kind` is `ProtocolCalls`.
+    pub merged_value: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientLedger {
@@ -57,6 +72,8 @@ pub struct Ledger {
     pub protocol_call_entries: soroban_sdk::Vec<ProtocolCallEntry>,
     /// Cached rolling total of protocol calls (sum of non-expired entries).
     pub protocol_call_total: u32,
+    /// Ephemeral telemetry accumulated during staged admissions; never persisted.
+    pub merges: alloc::vec::Vec<WindowMerge>,
 }
 
 impl Ledger {
@@ -68,6 +85,7 @@ impl Ledger {
             recipients: soroban_sdk::Vec::new(env),
             protocol_call_entries: soroban_sdk::Vec::new(env),
             protocol_call_total: 0,
+            merges: alloc::vec::Vec::new(),
         }
     }
 
@@ -94,6 +112,7 @@ impl Ledger {
             recipients,
             protocol_call_entries: proto_call_info.entries,
             protocol_call_total: proto_call_info.total,
+            merges: alloc::vec::Vec::new(),
         }
     }
 
@@ -156,7 +175,15 @@ impl Ledger {
 
     /// Record a spend against the global window at `now`.
     pub fn admit(&mut self, now: u64, amount: i128) {
-        admit_to_ledger(&mut self.total, &mut self.entries, now, amount);
+        if let Some((merged_ts, merged_value)) =
+            admit_to_ledger(&mut self.total, &mut self.entries, now, amount)
+        {
+            self.merges.push(WindowMerge {
+                kind: WindowMergeKind::GlobalSpend,
+                merged_ts,
+                merged_value,
+            });
+        }
     }
 
     /// Current rolling total for a recipient, or zero if no per-recipient
@@ -182,24 +209,45 @@ impl Ledger {
             if let Some(r) = self.recipients.get(i) {
                 if r.recipient == recipient {
                     let mut updated = r;
-                    admit_to_ledger(&mut updated.total, &mut updated.entries, now, amount);
+                    let merge =
+                        admit_to_ledger(&mut updated.total, &mut updated.entries, now, amount);
                     self.recipients.set(i, updated);
+                    if let Some((merged_ts, merged_value)) = merge {
+                        self.merges.push(WindowMerge {
+                            kind: WindowMergeKind::RecipientSpend,
+                            merged_ts,
+                            merged_value,
+                        });
+                    }
                     return;
                 }
             }
         }
         let mut created = RecipientLedger::empty(env, recipient);
-        admit_to_ledger(&mut created.total, &mut created.entries, now, amount);
+        let merge = admit_to_ledger(&mut created.total, &mut created.entries, now, amount);
         self.recipients.push_back(created);
+        if let Some((merged_ts, merged_value)) = merge {
+            self.merges.push(WindowMerge {
+                kind: WindowMergeKind::RecipientSpend,
+                merged_ts,
+                merged_value,
+            });
+        }
     }
 
     /// Record a protocol call at `now`.
     pub fn admit_protocol_call(&mut self, now: u64) {
-        admit_to_protocol_call_ledger(
+        if let Some((merged_ts, merged_count)) = admit_to_protocol_call_ledger(
             &mut self.protocol_call_total,
             &mut self.protocol_call_entries,
             now,
-        );
+        ) {
+            self.merges.push(WindowMerge {
+                kind: WindowMergeKind::ProtocolCalls,
+                merged_ts,
+                merged_value: i128::from(merged_count),
+            });
+        }
     }
 }
 
@@ -250,7 +298,7 @@ fn admit_to_ledger(
     entries: &mut soroban_sdk::Vec<SpendEntry>,
     now: u64,
     amount: i128,
-) {
+) -> Option<(u64, i128)> {
     debug_assert!(amount > 0);
     let n = entries.len();
     if n > 0 {
@@ -264,7 +312,7 @@ fn admit_to_ledger(
                     },
                 );
                 *total = total.saturating_add(amount);
-                return;
+                return None;
             }
         }
     }
@@ -278,11 +326,14 @@ fn admit_to_ledger(
         entries.pop_front();
         let newer = entries.first().unwrap_or(SpendEntry { ts: 0, amount: 0 });
         entries.pop_front();
-        entries.push_front(SpendEntry {
+        let merged = SpendEntry {
             ts: newer.ts,
             amount: older.amount.saturating_add(newer.amount),
-        });
+        };
+        entries.push_front(merged.clone());
+        return Some((merged.ts, merged.amount));
     }
+    None
 }
 
 fn prune_protocol_call_entries(
@@ -332,7 +383,7 @@ fn admit_to_protocol_call_ledger(
     total: &mut u32,
     entries: &mut soroban_sdk::Vec<ProtocolCallEntry>,
     now: u64,
-) {
+) -> Option<(u64, u32)> {
     let n = entries.len();
     if n > 0 {
         if let Some(last) = entries.get(n - 1) {
@@ -345,7 +396,7 @@ fn admit_to_protocol_call_ledger(
                     },
                 );
                 *total = total.saturating_add(1);
-                return;
+                return None;
             }
         }
     }
@@ -361,15 +412,19 @@ fn admit_to_protocol_call_ledger(
             .first()
             .unwrap_or(ProtocolCallEntry { ts: 0, count: 0 });
         entries.pop_front();
-        entries.push_front(ProtocolCallEntry {
+        let merged = ProtocolCallEntry {
             ts: newer.ts,
             count: older.count.saturating_add(newer.count),
-        });
+        };
+        entries.push_front(merged.clone());
+        return Some((merged.ts, merged.count));
     }
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_must_use)] // helper return values are asserted in backstop-specific tests
     use super::*;
 
     #[test]

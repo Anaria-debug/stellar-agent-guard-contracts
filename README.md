@@ -180,9 +180,10 @@ Other validation rules (SPEC §8): negative caps, `window_cap > 0` or a positive
 `recipient_window_caps` entry with `window_secs == 0`, duplicate
 assets/recipients/blocked_recipients/protocol contracts, duplicate recipients in
 `recipient_window_caps`, a non-empty intersection between `recipients` and
-`blocked_recipients`, more than 256 recipients, blocked recipients, or per-recipient
-cap entries, empty per-protocol fn lists, or the self-address in
-`assets`/`protocols`/`recipients`/`blocked_recipients` all fail with `InvalidConfig`.
+`blocked_recipients`, more than 256 `assets`, `protocols`, or `recipients` (and more
+than 256 `blocked_recipients` or per-recipient cap entries), empty per-protocol fn
+lists, or the self-address in `assets`/`protocols`/`recipients`/`blocked_recipients`
+all fail with `InvalidConfig`.
 
 **Not sure where to start?** Copy-paste presets for common operator personas —
 day-trader agent, payments bot, watch-only + heartbeat, max security — each with
@@ -446,6 +447,39 @@ When submitting transactions via `agent-tx` (run `agent-tx --help` for usage and
 | `mainnet` | `https://soroban.stellar.org` |
 | `futurenet` | `https://rpc-futurenet.stellar.org` |
 
+#### Network presets in `agent-tx`
+
+The submission helper resolves its endpoint from a named preset — both the RPC URL
+*and* the network passphrase, which is what the signed auth payload commits to — so
+`--network` replaces the raw URL instead of adding a flag to remember:
+
+```bash
+agent-tx status --guard C...                    # no flag needed: testnet is the default
+agent-tx status --guard C... --network futurenet
+agent-tx preflight --guard C... --asset C... --to G... --amount 1100 --network testnet
+```
+
+| `--network` | Endpoint | Network passphrase |
+|---|---|---|
+| `testnet` (default) | `https://soroban-testnet.stellar.org` | `Test SDF Network ; September 2015` |
+| `futurenet` | `https://rpc-futurenet.stellar.org` | `Test SDF Future Network ; October 2022` |
+| `mainnet` | `https://soroban.stellar.org` | `Public Global Stellar Network ; September 2015` |
+
+- `--rpc-url <url>` still overrides the endpoint for a custom or self-hosted node.
+  Passing `--network` *and* `--rpc-url` together is an error that names both flags
+  rather than a silent precedence rule. A preset's own URL given through `--rpc-url`
+  is recognised, and gets that preset's passphrase.
+- `--network-passphrase <phrase>` overrides the passphrase — for a local
+  `stellar standalone` instance or a fork.
+- Selecting mainnet, by preset or by URL, prints a one-line reminder to stderr: this
+  contract is unaudited and gates real funds (see [SECURITY.md](SECURITY.md)).
+- Every address flag (`--guard`, `--asset`/`--token`, `--to`, and the `guards add`
+  address and admin) is validated as a StrKey of the right kind before any network
+  call, so a truncated or mistyped ID fails locally instead of burning a simulation.
+  The leading character is a *key type*, not a network (`G` account, `C` contract),
+  so no prefix check can catch a testnet ID aimed at mainnet — the preset plus the
+  passphrase decide where a call lands.
+
 ### Build from source
 ```bash
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
@@ -571,6 +605,8 @@ maximum TTL on writes and refreshed to maximum when a read finds less than half 
 TTL remaining (`persist_get`; SPEC §9.5). The `Window` ledger is bounded at
 `MAX_WINDOW_ENTRIES = 8192` — beyond that, the two oldest entries merge *forward*
 (conservative over-count), so the `window_cap` ceiling is never exceeded (SPEC §3.1).
+Each successful admission that triggers the merge emits `event_window_merged` with the ledger
+kind, retained timestamp, and merged spend amount or protocol call count (SPEC §9).
 See [Storage rent and TTL cost model](docs/rent-and-ttl.md) for approximate XLM costs,
 who pays extension rent, and the underfunded-expiry failure mode.
 
