@@ -363,6 +363,7 @@ impl Error {
             Self::SelfFunctionNotAllowed,
             Self::CreateContractNotAllowed,
             Self::ProtocolCallRateExceeded,
+            Self::DecisionInvariantViolation,
         ];
         all_errors
             .into_iter()
@@ -443,7 +444,7 @@ pub enum Error {
     Paused = 13,
     /// Current ledger time is outside the configured active interval.
     OutsideActiveWindow = 14,
-    // Per-call decisions (20..=29)
+    // Per-call decisions (20..=30)
     /// Transfer asset is absent from the asset allowlist.
     AssetNotAllowed = 20,
     /// Transfer destination is absent from the recipient allowlist.
@@ -466,6 +467,8 @@ pub enum Error {
     RecipientBlocked = 29,
     /// Rolling protocol-call count would exceed its configured limit.
     ProtocolCallRateExceeded = 30,
+    /// An internal decision-engine invariant failed.
+    DecisionInvariantViolation = 31,
 }
 
 impl Error {
@@ -494,6 +497,7 @@ impl Error {
             Self::SelfFunctionNotAllowed => "self_function_not_allowed",
             Self::CreateContractNotAllowed => "create_contract_not_allowed",
             Self::ProtocolCallRateExceeded => "protocol_call_rate_exceeded",
+            Self::DecisionInvariantViolation => "decision_invariant_violation",
         }
     }
 }

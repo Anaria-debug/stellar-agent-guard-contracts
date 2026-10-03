@@ -223,6 +223,7 @@ fn error_by_name(name: &str) -> Option<Error> {
         "CreateContractNotAllowed" => Error::CreateContractNotAllowed,
         "RecipientBlocked" => Error::RecipientBlocked,
         "ProtocolCallRateExceeded" => Error::ProtocolCallRateExceeded,
+        "DecisionInvariantViolation" => Error::DecisionInvariantViolation,
         _ => return None,
     };
     Some(err)
