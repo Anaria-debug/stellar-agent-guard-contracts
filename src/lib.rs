@@ -138,6 +138,34 @@ struct EventAgentRotated {
     new_fingerprint: BytesN<8>,
 }
 
+/// Admin rotation proposal: data `by` (the current admin that proposed) plus
+/// the `proposed` pending admin awaiting confirmation (SPEC §7.2).
+#[contractevent]
+#[derive(Clone)]
+struct EventAdminRotationProposed {
+    by: Address,
+    proposed: Address,
+}
+
+/// Admin rotation completion: data `old` (the outgoing admin) and `new`
+/// (the incoming admin that confirmed). The confirmer is always `new` — only
+/// the pending admin can complete the handover (SPEC §7.2).
+#[contractevent]
+#[derive(Clone)]
+struct EventAdminRotated {
+    old: Address,
+    new: Address,
+}
+
+/// Admin rotation cancellation: data `by` (the current admin that cancelled)
+/// plus the `cancelled` pending admin that will never take effect.
+#[contractevent]
+#[derive(Clone)]
+struct EventAdminRotationCancelled {
+    by: Address,
+    cancelled: Address,
+}
+
 /// A conservative ledger coalescence at the 8192-entry backstop.
 /// Topic 1 identifies the ledger kind; data carries retained timestamp/value.
 #[contractevent]
