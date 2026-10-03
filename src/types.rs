@@ -347,6 +347,7 @@ impl Error {
             Self::NotInitialized,
             Self::InvalidConfig,
             Self::InvalidAmount,
+            Self::NoPendingAdmin,
             Self::AdminFrozen,
             Self::HeartbeatExpired,
             Self::NoPolicy,
@@ -400,8 +401,12 @@ pub struct CheckDetail {
 pub enum DataKey {
     /// Instance: one-time flag for `initialize`.
     Initialized,
-    /// Instance: policy admin; set once at `initialize`.
+    /// Instance: policy admin; set at `initialize`, rotated via the
+    /// two-step `propose_admin_rotation` / `confirm_admin_rotation` (§7.2).
     Admin,
+    /// Instance: proposed admin awaiting confirmation by
+    /// `confirm_admin_rotation`; absent means no rotation is pending.
+    PendingAdmin,
     /// Instance: the registered agent's Ed25519 public key (32 bytes).
     AgentPubkey,
     /// Persistent: current policy (`None` = default-deny).
@@ -433,6 +438,9 @@ pub enum Error {
     InvalidConfig = 4,
     /// Requested transfer amount is invalid.
     InvalidAmount = 5,
+    /// No admin rotation is pending (`confirm_admin_rotation` /
+    /// `cancel_admin_rotation` with no `PendingAdmin` stored).
+    NoPendingAdmin = 6,
     // Account-level gates (10..=19)
     /// Admin emergency freeze is active.
     AdminFrozen = 10,
@@ -481,6 +489,7 @@ impl Error {
             Self::NotInitialized => "not_initialized",
             Self::InvalidConfig => "invalid_config",
             Self::InvalidAmount => "invalid_amount",
+            Self::NoPendingAdmin => "no_pending_admin",
             Self::AdminFrozen => "admin_frozen",
             Self::HeartbeatExpired => "heartbeat_expired",
             Self::NoPolicy => "no_policy",
