@@ -800,6 +800,24 @@ mod tests {
         ));
     }
 
+    /// SPEC §6.2: a listed asset invoked with anything other than
+    /// `transfer`/`transfer_from` (e.g. `mint`, `burn`) is classified as
+    /// `AssetOther` and denied. The account is an authorizer, never a minter.
+    #[test]
+    fn asset_other_function_is_function_not_allowed() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = Some(base_policy(&env));
+        let mut l = Ledger::empty(&env);
+        // Contract 1 is in `assets`; `mint` is not a SAC transfer function.
+        let ctx = vec![&env, proto_ctx(&env, 1, "mint")];
+        let d = decide(&env, &sa, p.as_ref(), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::FunctionNotAllowed)
+        ));
+    }
+
     #[test]
     fn window_cap_blocks_across_transactions_and_rolls_over() {
         let env = Env::default();
@@ -1276,6 +1294,128 @@ mod tests {
                 .unwrap(),
             Decision::Allowed
         ));
+    }
+
+    /// SPEC §4 rule 5: outside `active_from`/`active_until` every context is
+    /// blocked before classification, and nothing is admitted to the window.
+    #[test]
+    fn outside_active_window_blocks_before_classification() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.active_from = 2_000;
+        p.active_until = 3_000;
+        let mut l = Ledger::empty(&env);
+        // A transfer every other gate would admit, plus the self-call the
+        // dead-man path allows: neither may slip past the account-level gate.
+        let ctx = vec![&env, transfer_ctx(&env, 1, 2, 5), heartbeat_ctx(&env, &sa)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1_000, ctx.clone());
+        assert_eq!(d.len(), 2);
+        for verdict in &d {
+            assert!(matches!(
+                verdict,
+                Decision::Blocked(Error::OutsideActiveWindow)
+            ));
+        }
+        assert_eq!(l.total, 0, "a blocked window must not admit spend");
+    }
+
+    #[test]
+    fn active_window_boundaries_are_inclusive() {
+        // SPEC §4 row 5: block when `now < active_from` or `now > active_until`,
+        // so `now == active_from` and `now == active_until` are allowed. Pin
+        // the exact boundary instants so an off-by-one in a refactor cannot
+        // silently shift operator-defined execution windows.
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.active_from = 1_000;
+        p.active_until = 2_000;
+        let mut l = Ledger::empty(&env);
+
+        // One second before the window opens: blocked.
+        let d_before = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_from - 1,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(
+            d_before.first().unwrap(),
+            Decision::Blocked(Error::OutsideActiveWindow)
+        ));
+
+        // Exactly at `active_from`: allowed (inclusive lower bound).
+        let d_from = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_from,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(d_from.first().unwrap(), Decision::Allowed));
+
+        // Exactly at `active_until`: allowed (inclusive upper bound).
+        let d_until = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_until,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(d_until.first().unwrap(), Decision::Allowed));
+
+        // One second after the window closes: blocked.
+        let d_after = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_until + 1,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(
+            d_after.first().unwrap(),
+            Decision::Blocked(Error::OutsideActiveWindow)
+        ));
+    }
+
+    #[test]
+    fn active_window_open_bounds_are_ignored() {
+        // `active_from == 0` and `active_until == 0` disable the respective
+        // bound entirely, so the boundary semantics above only apply to
+        // configured (non-zero) bounds.
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.active_from = 0;
+        p.active_until = 0;
+        let mut l = Ledger::empty(&env);
+
+        // Far before any configured window and far after: still allowed.
+        for now in [0u64, 1, u64::MAX] {
+            let d = decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                now,
+                vec![&env, transfer_ctx(&env, 1, 2, 5)],
+            );
+            assert!(
+                matches!(d.first().unwrap(), Decision::Allowed),
+                "now={now} should be allowed when both bounds are disabled"
+            );
+        }
     }
 
     #[test]
@@ -1935,5 +2075,47 @@ mod tests {
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx);
         assert!(matches!(d.first().unwrap(), Decision::Allowed));
         assert_eq!(l.total, 100);
+    }
+
+    /// SPEC §3.1 / §6 Invariant: Staged window admissions commit only if every context passes.
+    ///
+    /// When evaluating a multi-context batch where one context passes and another is blocked,
+    /// the staged spend of the passing context must never be committed to the ledger.
+    /// A subsequent transfer within the window must still fit the pre-batch budget.
+    #[test]
+    fn failed_multi_context_batch_never_commits_staged_window_admissions() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.window_cap = 100;
+        p.per_tx_cap = 80;
+        let mut l = Ledger::empty(&env);
+
+        // Batch: context 1 is valid (40 <= 80 per-tx, 40 <= 100 window),
+        // context 2 is blocked (90 > 80 per-tx).
+        let batch = vec![
+            &env,
+            transfer_ctx(&env, 1, 2, 40),
+            transfer_ctx(&env, 1, 2, 90),
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, batch);
+        assert_eq!(d.len(), 2);
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+        assert!(matches!(
+            d.get(1).unwrap(),
+            Decision::Blocked(Error::PerTxCapExceeded)
+        ));
+
+        // Ledger total and entries must be unchanged (all-or-nothing).
+        assert_eq!(l.total, 0);
+        assert_eq!(l.len(), 0);
+
+        // Subsequent in-window transfer of 70 must succeed against the unconsumed budget of 100.
+        // (If the staged 40 had committed, 40 + 70 = 110 would have exceeded window_cap 100).
+        let subsequent = vec![&env, transfer_ctx(&env, 1, 2, 70)];
+        let d2 = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, subsequent);
+        assert!(matches!(d2.first().unwrap(), Decision::Allowed));
+        assert_eq!(l.total, 70);
+        assert_eq!(l.len(), 1);
     }
 }

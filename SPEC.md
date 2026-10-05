@@ -367,6 +367,16 @@ Note the two address shapes: `assets` holds contract (C…) addresses →
 
 ## 4. Policy semantics — decision table
 
+### 4.0 Pre-decision authentication and snapshot pipeline (`__check_auth`)
+
+Before any policy gate or classification rule is evaluated, `__check_auth` executes a strict 3-step authentication sequence:
+
+1. **Agent key registration check:** `DataKey::AgentPubkey` must exist in instance storage (set during `initialize`). If missing, `__check_auth` returns contract error `Error::NotInitialized` (code #3). Crucially, this check precedes cryptographic verification, so an uninitialized account returns `NotInitialized` even when provided arbitrary or invalid signature bytes.
+2. **Ed25519 signature verification:** `env.crypto().ed25519_verify(&agent, &signature_payload, &signatures)`. If verification fails (wrong signer key or corrupted signature bytes), the host crypto function traps the execution frame (`InvokeError::Abort`). Crucially, this host trap occurs before policy snapshot loading, so an unauthorized or wrong-key signature aborts the frame immediately and never proceeds to return `Error::NoPolicy` or leak whether a policy is installed.
+3. **Policy snapshot loading:** `AuthSnapshot::load(&env)`. If `DataKey::Policy` is missing (never set or revoked), `__check_auth` returns contract error `Error::NoPolicy` (code #12).
+
+Once authentication succeeds and the policy snapshot is loaded, the decision table below is evaluated over every auth context:
+
 Evaluation order inside `__check_auth` (first match wins; all states below are evaluated against
 ledger time, which Soroban code cannot forge):
 
@@ -379,6 +389,17 @@ ledger time, which Soroban code cannot forge):
 | 5 | `active_from != 0 && now < active_from`, or `active_until != 0 && now > active_until` | **Block** (`Reason::OutsideActiveWindow`) |
 | 6 | context is a call to this account's own administrative/self functions (`heartbeat`, `check`) | allow into §5 handling (heartbeat state update only) |
 | 7 | per-context classification (§6) applies all allowlist / cap / window rules | allow or **Block** (`Reason::AssetNotAllowed`, `Reason::RecipientNotAllowed`, `Reason::PerTxCapExceeded`, `Reason::WindowCapExceeded`, `Reason::ProtocolNotAllowed`, `Reason::FunctionNotAllowed`, `Reason::UnknownContract`) |
+
+**Machine-readable twin: [`decision-table.json`](decision-table.json).** The table above is
+rendered from it (one JSON row per line, verbatim), and it also records which `Error` variants the
+engine can actually return for each row and which test pins each one. `tests/decision_table.rs`
+fails `cargo test` — and therefore CI — if this table, the JSON, the `README` walkthrough, the
+`Error` enum, and the engine's branches disagree. Edit a decision row in `decision-table.json`
+first, then paste the rendered line back into the table above; never edit only the SPEC side.
+Where this table and the engine still disagree — SPEC row 7 names `Reason::AssetNotAllowed`, which
+the v1 engine never emits — the JSON records the engine's behavior in its `note` and points at the
+audit (see [`docs/scenario-matrix.md`](docs/scenario-matrix.md) findings F-2/F-3); correcting this
+prose is a semantics call for a maintainer, not a doc-generation side effect.
 
 Note the dead-man auto-freeze (`#2`) applies even to `heartbeat` from the registered key: a
 heartbeat arriving after the grace window expired cannot revive the account — revival is the
@@ -603,7 +624,7 @@ To close the CheckResult/Error duality gap, every contract `Error` variant maps 
 
 | Error Code | Error Variant | Reason Symbol (`CheckResult::Blocked`) | Reachable via `check()`? | Rationale for Unreachable Direction |
 |---|---|---|---|---|
-| 1 | `Unauthorized` | `unauthorized` | No | Auth-path only: signature validation or admin auth failure traps before policy check. |
+| 1 | `Unauthorized` | `unauthorized` | No | Auth-path only: `ed25519_verify` traps the host frame (`InvokeError::Abort`) on invalid signature, and admin ops enforce `require_auth(Admin)`. `Unauthorized` is retained in the ABI error enum for protocol completeness. |
 | 2 | `AlreadyInitialized` | `already_initialized` | No | Admin lifecycle op: initialize is run once during deployment setup, not a check parameter. |
 | 3 | `NotInitialized` | `not_initialized` | Yes | Pre-activation guard check. |
 | 4 | `InvalidConfig` | `invalid_config` | No | Admin op: `set_policy` validation error; policies are not passed into `check()`. |
@@ -685,9 +706,11 @@ impl CustomAccountInterface for PolicyEngine {
     type Error = Error;
     fn __check_auth(env, signature_payload: Hash<32>, signatures: BytesN<64>,
                     auth_contexts: Vec<Context>) -> Result<(), Error>;
-    // 1. ed25519_verify(AgentPubkey, signature_payload, signatures) or Unauthorized.
-    // 2. Decision table §4 + classification §6 over every context.
-    // 3. Events (§9) + TTL refreshes (§9.5); spend-accounting writes only on admission.
+    // 1. Agent pubkey registered (initialize done) -> Error::NotInitialized (#3) if absent.
+    // 2. ed25519_verify(AgentPubkey, signature_payload, signatures) -> host crypto trap (InvokeError::Abort) on bad signature / wrong key.
+    // 3. Policy snapshot load (AuthSnapshot::load) -> Error::NoPolicy (#12) if absent / revoked.
+    // 4. Decision table §4 + classification §6 over every context.
+    // 5. Events (§9) + TTL refreshes (§9.5); spend-accounting writes only on admission.
 }
 ```
 
@@ -733,7 +756,7 @@ pub enum PolicyRuleId { AmountSign, WindowRequiresWidth, ActiveWindowOrder,
                         RecipientCapSign, RecipientAllowAndBlocked,
                         ProtocolContractDuplicate, ProtocolFnListInvalid,
                         DurationExceedsBound, AssetListTooLong,
-                        ProtocolListTooLong }
+                        ProtocolListTooLong, PerTxCapExceedsWindowCap }
 
 #[contracttype]
 pub enum ValidationOutcome { Valid, Invalid(PolicyRuleId) }
@@ -864,6 +887,14 @@ exists to drift. Notes:
   authorization scans, validation work, and per-recipient storage.
 - `window_cap != 0` requires `window_secs != 0`.
 - A per-recipient cap `> 0` requires `window_secs != 0`.
+- `per_tx_cap <= window_cap` when both are enabled (`per_tx_cap > 0 && window_cap > 0`; issue #33).
+  Rationale: if `per_tx_cap > window_cap` (both nonzero), every transfer above `window_cap` is
+  double-rejected and transfers between the two values pass per-tx only to fail on window — a
+  config that is legal in raw types but never admits its advertised per-tx range, i.e. operator error
+  the contract catches at install time and rejects as `InvalidConfig` (fail-closed, policy unchanged).
+  When either cap is disabled (`0`), this check is skipped: a per-tx cap with window disabled (`window_cap == 0`)
+  is legal, as is a window cap with per-tx limit disabled (`per_tx_cap == 0`). Equal caps
+  (`per_tx_cap == window_cap`) are explicitly allowed.
 - `window_secs <= MAX_WINDOW_SECS` and `dms_grace_secs <= MAX_DMS_GRACE_SECS`
   (both `315_360_000` seconds = 86_400 × 3_650 ≈ 10 years, `types::MAX_WINDOW_SECS` /
   `types::MAX_DMS_GRACE_SECS`, issue #34). Rationale: both fields are `u64`, so a
@@ -935,6 +966,7 @@ order:
 | `RecipientAllowAndBlocked` | a recipient in both `recipients` and `blocked_recipients` |
 | `ProtocolContractDuplicate` | the same contract in two protocol rules |
 | `ProtocolFnListInvalid` | a protocol rule's fn list empty or containing duplicates |
+| `PerTxCapExceedsWindowCap` | `per_tx_cap > window_cap` when both are enabled (`> 0`; issue #33) |
 | `DurationExceedsBound` | `window_secs` or `dms_grace_secs` over `MAX_WINDOW_SECS` (`315_360_000` s ≈ 10 years; evaluated last so the other variant ordinals stay wire-stable) |
 
 `validate_policy` is a read: no auth, no events, no state writes (read-path

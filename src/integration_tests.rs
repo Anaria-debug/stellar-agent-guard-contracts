@@ -42,7 +42,7 @@ use soroban_sdk::xdr::{
     SorobanCredentials, WriteXdr,
 };
 use soroban_sdk::{
-    contract, contractimpl, vec, Address, BytesN, Env, FromVal, IntoVal, Symbol, Val,
+    contract, contractimpl, vec, Address, BytesN, Env, FromVal, IntoVal, InvokeError, Symbol, Val,
 };
 use std::format;
 
@@ -748,6 +748,56 @@ impl Harness {
             memory_read_entries: detailed.resources.memory_read_entries,
             memcmp: memcmp_charges(&self.env),
         }
+    }
+
+    /// Invoke `__check_auth` directly via host routing and return the exact outcome:
+    /// `Ok(())` on authorization success,
+    /// `Err(Ok(err))` if `__check_auth` returned contract error `err`, or
+    /// `Err(Err(InvokeError::Abort))` if host verification trapped (e.g. invalid signature).
+    fn invoke_check_auth_transfer(
+        &mut self,
+        guard: &Address,
+        signer: &SigningKey,
+        to: &Address,
+        amount: i128,
+    ) -> Result<(), Result<GuardError, InvokeError>> {
+        let root = self.transfer_invocation(guard, to, amount);
+        let nonce = self.guard_nonce;
+        self.guard_nonce += 1;
+        let payload = self.payload(nonce, &root);
+        let sig = signer.sign(&payload).to_bytes();
+
+        let mut args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&self.env);
+        args.push_back(guard.clone().into_val(&self.env));
+        args.push_back(to.clone().into_val(&self.env));
+        args.push_back(amount.into_val(&self.env));
+        let contexts = vec![
+            &self.env,
+            Context::Contract(ContractContext {
+                contract: self.asset.clone(),
+                fn_name: Symbol::new(&self.env, "transfer"),
+                args,
+            }),
+        ];
+
+        let payload = BytesN::<32>::from_array(&self.env, &payload);
+        let signature: Val = BytesN::<64>::from_array(&self.env, &sig).into_val(&self.env);
+        self.env
+            .try_invoke_contract_check_auth::<GuardError>(guard, &payload, signature, &contexts)
+    }
+
+    /// Invoke `__check_auth` with explicit raw payload and raw signature bytes.
+    fn invoke_check_auth_raw(
+        &self,
+        guard: &Address,
+        payload_bytes: &[u8; 32],
+        sig_bytes: &[u8; 64],
+        contexts: &soroban_sdk::Vec<Context>,
+    ) -> Result<(), Result<GuardError, InvokeError>> {
+        let payload = BytesN::<32>::from_array(&self.env, payload_bytes);
+        let signature: Val = BytesN::<64>::from_array(&self.env, sig_bytes).into_val(&self.env);
+        self.env
+            .try_invoke_contract_check_auth::<GuardError>(guard, &payload, signature, contexts)
     }
 
     /// The fixed entry `memory_read_entries` reports for *every* invocation of
@@ -3294,6 +3344,127 @@ fn batch_events_emit_in_order_with_context_index() {
     assert_eq!(auth_events[2].1, build_map(2, revision));
 }
 
+/// SPEC §3.1 / §6 Invariant: Staged window admissions commit only if every context passes (all-or-nothing).
+///
+/// **Invariant (window)** (SPEC §3.1):
+/// > "for every authorization decision, the global `total` after any admission equals the sum
+/// > of `entries[i].amount` over global entries with `ts + window_secs > now`, and a new asset
+/// > transfer is admitted only if the running total (plus amounts already staged in the same request)
+/// > ≤ the effective cap for that transfer."
+///
+/// **All-or-nothing commit** (SPEC §6, README §6):
+/// > "Each `Context` in `auth_contexts` is classified independently; every context must pass or the
+/// > whole authorization fails (`__check_auth` returns an error → transaction rejected)."
+/// > "Window admissions are staged and only committed to storage if *every* context passes.
+/// > A partially-validating batch can never spend."
+///
+/// This test constructs a two-context authorization batch `[valid transfer, blocked transfer]`
+/// and asserts:
+/// 1. `__check_auth` returns `Err(GuardError::PerTxCapExceeded)`.
+/// 2. The window total in storage is unchanged afterward (staged admission was not committed).
+/// 3. A subsequent in-window transfer still fits the pre-batch budget and succeeds on-chain.
+#[test]
+#[allow(clippy::too_many_lines)] // pins pre-batch and post-spend batch behavior in one sequential flow
+fn failed_multi_context_batch_never_commits_staged_window_admissions() {
+    let mut h = Harness::new();
+    let mut p = h.base_policy();
+    p.window_cap = 100;
+    p.per_tx_cap = 80;
+    p.allow_any_recipient = true;
+    h.install_policy(&p);
+
+    let to = Address::generate(&h.env);
+    assert_eq!(h.status().window_remaining, Some(100));
+
+    let env = h.env.clone();
+    let guard = h.guard.clone();
+    let asset = h.asset.clone();
+    let agent = h.agent.clone();
+
+    let transfer_ctx = |to: &Address, amount: i128| {
+        soroban_sdk::auth::Context::Contract(soroban_sdk::auth::ContractContext {
+            contract: asset.clone(),
+            fn_name: Symbol::new(&env, "transfer"),
+            args: soroban_sdk::vec![
+                &env,
+                guard.clone().into_val(&env),
+                to.clone().into_val(&env),
+                amount.into_val(&env),
+            ],
+        })
+    };
+
+    let check_batch = |contexts: soroban_sdk::Vec<soroban_sdk::auth::Context>, nonce: u8| {
+        let payload_bytes = [nonce; 32];
+        let payload = soroban_sdk::BytesN::from_array(&env, &payload_bytes);
+        let sig = agent.sign(&payload_bytes).to_bytes();
+        let signatures = soroban_sdk::BytesN::from_array(&env, &sig);
+        env.as_contract(&guard, || {
+            <PolicyEngine as soroban_sdk::auth::CustomAccountInterface>::__check_auth(
+                env.clone(),
+                unsafe {
+                    std::mem::transmute::<soroban_sdk::BytesN<32>, soroban_sdk::crypto::Hash<32>>(
+                        payload,
+                    )
+                },
+                signatures,
+                contexts,
+            )
+        })
+    };
+
+    let read_window_total = || {
+        env.as_contract(&guard, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, crate::types::WindowState>(&DataKey::Window)
+                .as_ref()
+                .map_or(0i128, |w| w.total)
+        })
+    };
+
+    // Two-context auth batch: ctx1 (40, valid), ctx2 (90, exceeds per_tx_cap 80).
+    let contexts = soroban_sdk::vec![&h.env, transfer_ctx(&to, 40), transfer_ctx(&to, 90)];
+    let res = check_batch(contexts, 0);
+
+    // 1. Assert __check_auth returns Err.
+    assert_eq!(res, Err(GuardError::PerTxCapExceeded));
+
+    // 2. Assert the window total is unchanged afterward in persistent storage.
+    assert_eq!(
+        read_window_total(),
+        0i128,
+        "window total must remain 0 after failed batch"
+    );
+    assert_eq!(h.status().window_remaining, Some(100));
+
+    // 3. Subsequent transfer of 70 fits the uncommitted budget (70 <= 100).
+    // If ctx1's staged 40 had committed, 40 + 70 = 110 > 100 would fail.
+    h.transfer(&to, 70);
+    assert_eq!(h.status().window_remaining, Some(30));
+    assert_eq!(read_window_total(), 70i128);
+
+    // 4. Invariant holds when the window already contains prior spend:
+    // Batch with ctx3 (20, valid) and ctx4 (90, blocked).
+    let contexts2 = soroban_sdk::vec![&h.env, transfer_ctx(&to, 20), transfer_ctx(&to, 90)];
+    let res2 = check_batch(contexts2, 1);
+    assert_eq!(res2, Err(GuardError::PerTxCapExceeded));
+
+    // Staged 20 must not be added to the existing 70 total.
+    assert_eq!(
+        read_window_total(),
+        70i128,
+        "window total must remain 70 after second failed batch"
+    );
+    assert_eq!(h.status().window_remaining, Some(30));
+
+    // Subsequent transfer of 25 fits the remaining 30 budget (70 + 25 = 95 <= 100).
+    // If staged 20 had committed, 70 + 20 + 25 = 115 > 100 would have been blocked.
+    h.transfer(&to, 25);
+    assert_eq!(h.status().window_remaining, Some(5));
+    assert_eq!(read_window_total(), 95i128);
+}
+
 #[test]
 fn per_recipient_window_cap_enforced_on_chain() {
     let mut h = Harness::new();
@@ -3605,6 +3776,67 @@ fn status_outside_active_window_matches_check_block_reason() {
     assert_eq!(detail.result, CheckResult::Allowed);
 }
 
+// ── active-window boundary semantics (SPEC §4 row 5) ─────────────────────
+// SPEC §4 row 5 blocks when `now < active_from` or `now > active_until`,
+// which makes both boundaries *inclusive*: a transfer at exactly
+// `active_from` or exactly `active_until` is inside the operator-defined
+// execution window. `set_policy` validates `active_until > active_from`,
+// so the window is never empty. These tests pin the exact boundary
+// instants so an off-by-one introduced in a refactor cannot silently
+// change financial timing behavior.
+
+#[test]
+fn active_window_boundaries_are_inclusive() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.active_from = 1_500;
+    p.active_until = 1_600;
+    h.install_policy(&p);
+
+    // One second before the window opens: blocked.
+    h.set_time(1_499);
+    h.transfer_expect_blocked(&recv, 5);
+
+    // Exactly at `active_from`: allowed (inclusive lower boundary).
+    h.set_time(1_500);
+    h.transfer(&recv, 5);
+
+    // Exactly at `active_until`: allowed (inclusive upper boundary).
+    h.set_time(1_600);
+    h.transfer(&recv, 5);
+
+    // One second after the window closes: blocked.
+    h.set_time(1_601);
+    h.transfer_expect_blocked(&recv, 5);
+}
+
+#[test]
+fn active_window_boundaries_match_check_block_reason() {
+    // The on-chain gate and the `check` decision must agree at every
+    // boundary instant: `outside_active_window` iff the timestamp is
+    // strictly outside `[active_from, active_until]`.
+    let h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.active_from = 1_500;
+    p.active_until = 1_600;
+    h.install_policy(&p);
+
+    let outside = Symbol::new(&h.env, "outside_active_window");
+    let check = |now: u64| {
+        h.env.ledger().set_timestamp(now);
+        h.env.as_contract(&h.guard, || {
+            PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
+        })
+    };
+
+    assert_eq!(check(1_499).result, CheckResult::Blocked(outside.clone()));
+    assert_eq!(check(1_500).result, CheckResult::Allowed);
+    assert_eq!(check(1_600).result, CheckResult::Allowed);
+    assert_eq!(check(1_601).result, CheckResult::Blocked(outside));
+}
+
 #[test]
 fn status_reads_never_write_window_or_emit_events() {
     // `status` is an event-free, write-free read. `env.events().all()` holds
@@ -3806,6 +4038,82 @@ fn validate_policy_reports_window_requires_width() {
         },
     ];
     assert_rejects_with(&h, &p, &PolicyRuleId::WindowRequiresWidth);
+}
+
+#[test]
+fn validate_policy_reports_per_tx_cap_exceeds_window_cap() {
+    let h = Harness::new();
+
+    // When both caps are enabled (> 0) and per_tx_cap > window_cap:
+    // rejected as PolicyRuleId::PerTxCapExceedsWindowCap in validate_policy
+    // and as InvalidConfig in set_policy (fail-closed; issue #33).
+    let mut p = h.base_policy();
+    p.per_tx_cap = 200;
+    p.window_cap = 100;
+    assert_rejects_with(&h, &p, &PolicyRuleId::PerTxCapExceedsWindowCap);
+}
+
+#[test]
+fn validate_policy_accepts_equal_per_tx_and_window_caps() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // When both caps are enabled and equal, the config is valid and installable.
+    let mut p = h.base_policy();
+    p.per_tx_cap = 100;
+    p.window_cap = 100;
+    assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
+    client.set_policy(&p);
+    let installed = client.policy().expect("policy installed");
+    assert_eq!(installed.per_tx_cap, 100);
+    assert_eq!(installed.window_cap, 100);
+}
+
+#[test]
+fn validate_policy_skips_cap_comparison_when_either_is_zero() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // 1. per_tx_cap > 0, window_cap == 0: per-tx limit only (window cap disabled).
+    let mut p = h.base_policy();
+    p.per_tx_cap = 500;
+    p.window_cap = 0;
+    assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
+    client.set_policy(&p);
+    assert_eq!(client.policy().expect("policy installed").per_tx_cap, 500);
+
+    // 2. per_tx_cap == 0, window_cap > 0: window limit only (per-tx cap disabled).
+    let mut p = h.base_policy();
+    p.per_tx_cap = 0;
+    p.window_cap = 500;
+    assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
+    client.set_policy(&p);
+    assert_eq!(client.policy().expect("policy installed").window_cap, 500);
+
+    // 3. per_tx_cap == 0, window_cap == 0: both disabled.
+    let mut p = h.base_policy();
+    p.per_tx_cap = 0;
+    p.window_cap = 0;
+    assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
+    client.set_policy(&p);
+    assert_eq!(client.policy().expect("policy installed").per_tx_cap, 0);
+    assert_eq!(client.policy().expect("policy installed").window_cap, 0);
+}
+
+#[test]
+fn validate_policy_accepts_per_tx_cap_less_than_window_cap() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // Normal configuration: per_tx_cap < window_cap.
+    let mut p = h.base_policy();
+    p.per_tx_cap = 50;
+    p.window_cap = 100;
+    assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
+    client.set_policy(&p);
+    let installed = client.policy().expect("policy installed");
+    assert_eq!(installed.per_tx_cap, 50);
+    assert_eq!(installed.window_cap, 100);
 }
 
 #[test]
@@ -4239,4 +4547,206 @@ fn validate_policy_reports_duration_exceeds_bound() {
     assert_eq!(client.validate_policy(&p), ValidationOutcome::Valid);
     client.set_policy(&p);
     assert!(client.policy().is_some());
+}
+
+// ── Auth verification ordering (Issue #27, SPEC §4 & §7) ───────────────────
+//
+// __check_auth executes in a strict 3-step authentication sequence before any
+// policy decision table gate is reached:
+//   1. Check `DataKey::AgentPubkey` in instance storage:
+//      - If uninitialized: returns contract error `GuardError::NotInitialized` (code #3).
+//      - Crucially: this check precedes crypto verification, so an uninitialized
+//        account returns `NotInitialized` even if provided arbitrary/invalid signature bytes.
+//   2. Verify Ed25519 signature via `env.crypto().ed25519_verify`:
+//      - If invalid (wrong signer key or corrupted signature bytes): host crypto
+//        verification fails and traps the execution frame (`InvokeError::Abort`).
+//      - Crucially: this host abort precedes policy snapshot lookup, so a wrong-key
+//        signature aborts the frame even if NO policy is installed on the contract
+//        (it never proceeds to return `GuardError::NoPolicy`).
+//   3. Load policy snapshot via `AuthSnapshot::load`:
+//      - If no policy is installed (never set or revoked): returns contract error
+//        `GuardError::NoPolicy` (code #12).
+//   4. If policy snapshot is loaded:
+//      - Evaluates the policy decision table (§4) over all auth contexts.
+//
+// Exact observable difference for triage:
+//   - Uninitialized contract: returns contract error `GuardError::NotInitialized`.
+//   - Bad signature / wrong key: host crypto trap (`InvokeError::Abort`), NOT a contract error.
+//   - Good signature + no policy: returns contract error `GuardError::NoPolicy`.
+//   - Good signature + valid policy: returns `Ok(())`.
+
+#[test]
+fn auth_verification_order_uninitialized_account_rejects_with_not_initialized() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let uninit_guard = h.env.register(PolicyEngine, ());
+
+    // Case 1: uninitialized account with completely arbitrary / zeroed signature bytes.
+    let arbitrary_sig = [0u8; 64];
+    let arbitrary_payload = [1u8; 32];
+    let contexts = soroban_sdk::Vec::new(&h.env);
+    let res = h.invoke_check_auth_raw(&uninit_guard, &arbitrary_payload, &arbitrary_sig, &contexts);
+    assert_eq!(
+        res,
+        Err(Ok(GuardError::NotInitialized)),
+        "uninitialized account with arbitrary sig must return NotInitialized, not trap"
+    );
+
+    // Case 2: uninitialized account with transfer context and signature from an arbitrary key.
+    let any_key = SigningKey::from_bytes(&[99u8; 32]);
+    let res_transfer = h.invoke_check_auth_transfer(&uninit_guard, &any_key, &recv, 100);
+    assert_eq!(
+        res_transfer,
+        Err(Ok(GuardError::NotInitialized)),
+        "uninitialized account with validly-signed payload from any key must still return NotInitialized"
+    );
+
+    // Case 3: even with the harness agent key, an uninitialized contract returns NotInitialized.
+    let res_agent = h.invoke_check_auth_transfer(&uninit_guard, &h.agent.clone(), &recv, 100);
+    assert_eq!(
+        res_agent,
+        Err(Ok(GuardError::NotInitialized)),
+        "uninitialized account must return NotInitialized before attempting crypto verification"
+    );
+}
+
+#[test]
+fn auth_verification_order_initialized_account_wrong_signature_traps_as_host_abort() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let wrong_key = SigningKey::from_bytes(&[42u8; 32]);
+
+    // Subcase A: Account is initialized, but NO policy is installed.
+    // Presenting a signature from a wrong key MUST trap the frame via host crypto
+    // (`InvokeError::Abort`), and MUST NOT reach policy loading to return `NoPolicy`.
+    let res_no_policy_wrong_sig =
+        h.invoke_check_auth_transfer(&h.guard.clone(), &wrong_key, &recv, 50);
+    assert_eq!(
+        res_no_policy_wrong_sig,
+        Err(Err(InvokeError::Abort)),
+        "wrong-key signature on account with no policy must trap with host abort, not return NoPolicy"
+    );
+
+    // Corrupted signature bytes also trap the host crypto frame.
+    let root = h.transfer_invocation(&h.guard, &recv, 50);
+    let payload = h.payload(h.guard_nonce, &root);
+    let corrupted_sig = [0xffu8; 64];
+    let contexts = soroban_sdk::vec![
+        &h.env,
+        Context::Contract(ContractContext {
+            contract: h.asset.clone(),
+            fn_name: Symbol::new(&h.env, "transfer"),
+            args: soroban_sdk::vec![
+                &h.env,
+                h.guard.clone().into_val(&h.env),
+                recv.clone().into_val(&h.env),
+                50i128.into_val(&h.env),
+            ],
+        }),
+    ];
+    let res_corrupted =
+        h.invoke_check_auth_raw(&h.guard.clone(), &payload, &corrupted_sig, &contexts);
+    assert_eq!(
+        res_corrupted,
+        Err(Err(InvokeError::Abort)),
+        "corrupted signature on account with no policy must trap with host abort"
+    );
+
+    // Subcase B: Account is initialized, AND policy IS installed.
+    // Wrong signature must still trap with host abort (`InvokeError::Abort`).
+    h.install_policy(&h.base_policy());
+    let res_with_policy_wrong_sig =
+        h.invoke_check_auth_transfer(&h.guard.clone(), &wrong_key, &recv, 50);
+    assert_eq!(
+        res_with_policy_wrong_sig,
+        Err(Err(InvokeError::Abort)),
+        "wrong-key signature on account with policy installed must trap with host abort"
+    );
+}
+
+#[test]
+fn auth_verification_order_initialized_account_valid_signature_no_policy_yields_no_policy() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let agent_key = h.agent.clone();
+
+    // Subcase A: Freshly initialized account (no policy ever set).
+    // Valid signature by the registered agent key verifies crypto successfully,
+    // then proceeds to policy loading, returning contract error `GuardError::NoPolicy`.
+    let res_fresh = h.invoke_check_auth_transfer(&h.guard.clone(), &agent_key, &recv, 10);
+    assert_eq!(
+        res_fresh,
+        Err(Ok(GuardError::NoPolicy)),
+        "registered agent signature with no policy installed must return NoPolicy"
+    );
+
+    // Subcase B: Account has policy installed, then admin revokes the policy.
+    // Valid signature by the registered agent key must again return `GuardError::NoPolicy`.
+    h.install_policy(&h.base_policy());
+    // Control: with policy installed, the exact same transfer succeeds.
+    let res_allowed = h.invoke_check_auth_transfer(&h.guard.clone(), &agent_key, &recv, 10);
+    assert_eq!(
+        res_allowed,
+        Ok(()),
+        "registered agent signature with installed policy must succeed"
+    );
+
+    // Now revoke policy.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    client.revoke_policy();
+    assert!(client.policy().is_none());
+
+    // Subsequent authorization with registered agent signature now yields NoPolicy again.
+    let res_revoked = h.invoke_check_auth_transfer(&h.guard.clone(), &agent_key, &recv, 10);
+    assert_eq!(
+        res_revoked,
+        Err(Ok(GuardError::NoPolicy)),
+        "registered agent signature after policy revocation must return NoPolicy"
+    );
+}
+
+#[test]
+fn auth_verification_ordering_matrix_pins_exact_observables() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let agent_key = h.agent.clone();
+    let wrong_key = SigningKey::from_bytes(&[88u8; 32]);
+    let uninit_guard = h.env.register(PolicyEngine, ());
+
+    // Matrix Row 1: Uninitialized guard + any signature -> Contract Error #3 (NotInitialized).
+    // Does not reach host crypto verification.
+    let r1 = h.invoke_check_auth_transfer(&uninit_guard, &wrong_key, &recv, 25);
+    assert_eq!(
+        r1,
+        Err(Ok(GuardError::NotInitialized)),
+        "Row 1: uninitialized guard must return NotInitialized regardless of signature"
+    );
+
+    // Matrix Row 2: Initialized guard (no policy) + wrong signature -> Host Error (InvokeError::Abort).
+    // Traps in host crypto; does not reach policy loading.
+    let r2 = h.invoke_check_auth_transfer(&h.guard.clone(), &wrong_key, &recv, 25);
+    assert_eq!(
+        r2,
+        Err(Err(InvokeError::Abort)),
+        "Row 2: wrong-key signature must trap in host crypto with InvokeError::Abort"
+    );
+
+    // Matrix Row 3: Initialized guard (no policy) + valid signature -> Contract Error #12 (NoPolicy).
+    // Passes crypto verification, fails policy load.
+    let r3 = h.invoke_check_auth_transfer(&h.guard.clone(), &agent_key, &recv, 25);
+    assert_eq!(
+        r3,
+        Err(Ok(GuardError::NoPolicy)),
+        "Row 3: registered signature without policy must return NoPolicy"
+    );
+
+    // Matrix Row 4: Initialized guard (policy installed) + valid signature -> Success (Ok(())).
+    // Passes crypto verification and passes policy evaluation.
+    h.install_policy(&h.base_policy());
+    let r4 = h.invoke_check_auth_transfer(&h.guard.clone(), &agent_key, &recv, 25);
+    assert_eq!(
+        r4,
+        Ok(()),
+        "Row 4: registered signature with policy installed must approve"
+    );
 }
