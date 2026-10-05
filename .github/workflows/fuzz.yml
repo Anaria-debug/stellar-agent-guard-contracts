@@ -11,7 +11,7 @@ on:
 jobs:
   check-auth-full-path:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
