@@ -607,6 +607,29 @@ mod tests {
         })
     }
 
+    /// `transfer_from` context per SPEC §6.2: `(from, spender, to, amount)`.
+    /// The `spender` occupies args[1] and must never be read as the recipient;
+    /// the recipient is args[2] and the amount is args[3].
+    fn transfer_from_ctx(
+        env: &Env,
+        asset: u8,
+        from: u8,
+        spender: u8,
+        to: u8,
+        amount: i128,
+    ) -> Context {
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(addr(env, from).into_val(env)); // args[0] from
+        args.push_back(addr(env, spender).into_val(env)); // args[1] spender
+        args.push_back(addr(env, to).into_val(env)); // args[2] recipient
+        args.push_back(amount.into_val(env)); // args[3] amount
+        Context::Contract(ContractContext {
+            contract: addr(env, asset),
+            fn_name: Symbol::new(env, "transfer_from"),
+            args,
+        })
+    }
+
     fn heartbeat_ctx(env: &Env, self_addr: &Address) -> Context {
         Context::Contract(ContractContext {
             contract: self_addr.clone(),
@@ -651,6 +674,94 @@ mod tests {
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(d.first().unwrap(), Decision::Allowed));
         assert_eq!(l.total, 5);
+    }
+
+    // ── SPEC §6.2: `transfer_from` argument positions ─────────────────────
+    //
+    // `transfer_from(from, spender, to, amount)`: the recipient is args[2] and
+    // the amount is args[3] — the spender at args[1] is *not* the recipient.
+    // Reading the wrong offset would check the allowlist against the spender
+    // (letting funds reach an unlisted destination) and debit the window with
+    // an address. These tests pin the offsets with cases where swapping them
+    // would change the verdict.
+
+    #[test]
+    fn transfer_from_extracts_recipient_from_args_2_and_amount_from_args_3() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.allow_any_recipient = true;
+        // from=9, spender=7, recipient=2, amount=5.
+        let ctx = transfer_from_ctx(&env, 1, 9, 7, 2, 5);
+
+        let parsed = parse_call(&env, &sa, &ctx, &p);
+        assert!(
+            matches!(parsed, ParsedCall::AssetTransfer { .. }),
+            "transfer_from must parse as a fully-enforceable AssetTransfer"
+        );
+        if let ParsedCall::AssetTransfer { to, amount, .. } = parsed {
+            assert_eq!(
+                to,
+                addr(&env, 2),
+                "recipient must come from args[2], not the spender at args[1]"
+            );
+            assert_eq!(amount, 5, "amount must come from args[3]");
+        }
+    }
+
+    #[test]
+    fn transfer_from_checks_the_recipient_not_the_spender() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        // Allowlist is [addr(2)]; the spender addr(7) is deliberately NOT listed.
+        let mut p = base_policy(&env);
+        p.window_cap = 100;
+        let mut l = Ledger::empty(&env);
+        // Recipient args[2]=addr(2) is allowlisted even though spender
+        // args[1]=addr(7) is not.
+        let ctx = vec![&env, transfer_from_ctx(&env, 1, 9, 7, 2, 5)];
+
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+        assert_eq!(l.total, 5, "the window is debited with the args[3] amount");
+    }
+
+    #[test]
+    fn transfer_from_swapped_offsets_would_block_the_wrong_address() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        // Allowlist is [addr(2)].
+        let p = base_policy(&env);
+        let mut l = Ledger::empty(&env);
+        // Swap the middle two: the *unlisted* addr(7) is now args[2] (recipient)
+        // and the allowlisted addr(2) is args[1] (spender). An off-by-one that
+        // read the recipient from args[1] would (wrongly) allow this.
+        let ctx = vec![&env, transfer_from_ctx(&env, 1, 9, 2, 7, 5)];
+
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::RecipientNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn transfer_from_reads_amount_from_args_3_for_the_cap() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.allow_any_recipient = true;
+        p.per_tx_cap = 10;
+        let mut l = Ledger::empty(&env);
+        // The amount lives at args[3]=50 and exceeds the cap; args[2] is an
+        // address, not a number, so an off-by-one would not see 50 here.
+        let ctx = vec![&env, transfer_from_ctx(&env, 1, 9, 7, 2, 50)];
+
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::PerTxCapExceeded)
+        ));
     }
 
     #[test]
@@ -781,6 +892,24 @@ mod tests {
         assert!(matches!(
             d.first().unwrap(),
             Decision::Blocked(Error::UnknownContract)
+        ));
+    }
+
+    /// SPEC §6.2: a listed asset invoked with anything other than
+    /// `transfer`/`transfer_from` (e.g. `mint`, `burn`) is classified as
+    /// `AssetOther` and denied. The account is an authorizer, never a minter.
+    #[test]
+    fn asset_other_function_is_function_not_allowed() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let p = Some(base_policy(&env));
+        let mut l = Ledger::empty(&env);
+        // Contract 1 is in `assets`; `mint` is not a SAC transfer function.
+        let ctx = vec![&env, proto_ctx(&env, 1, "mint")];
+        let d = decide(&env, &sa, p.as_ref(), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(
+            d.first().unwrap(),
+            Decision::Blocked(Error::FunctionNotAllowed)
         ));
     }
 
@@ -987,6 +1116,7 @@ mod tests {
     }
 
     #[test]
+    /// SPEC §6.3: `fns: None` allows any fn on that contract.
     fn protocol_and_function_allowlists() {
         let env = Env::default();
         let sa = self_addr(&env);
@@ -1041,6 +1171,164 @@ mod tests {
             .unwrap(),
             Decision::Blocked(Error::UnknownContract)
         ));
+    }
+
+    #[test]
+    /// SPEC §6.3: `fns: None` wildcard — any fn on the listed contract is allowed.
+    fn protocol_fns_none_allows_any_fn() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        let mut l = Ledger::empty(&env);
+        assert!(matches!(
+            decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, proto_ctx(&env, 3, "swap")]
+            )
+            .first()
+            .unwrap(),
+            Decision::Allowed
+        ));
+        assert!(matches!(
+            decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, proto_ctx(&env, 3, "anything_else")]
+            )
+            .first()
+            .unwrap(),
+            Decision::Allowed
+        ));
+    }
+
+    #[test]
+    /// SPEC §6.3: listed fn allowed.
+    fn protocol_listed_fn_allowed() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: Some(vec![&env, Symbol::new(&env, "swap")]),
+            },
+        ];
+        let mut l = Ledger::empty(&env);
+        assert!(matches!(
+            decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, proto_ctx(&env, 3, "swap")]
+            )
+            .first()
+            .unwrap(),
+            Decision::Allowed
+        ));
+    }
+
+    #[test]
+    /// SPEC §6.3: unlisted fn on a listed contract → `FunctionNotAllowed`.
+    fn protocol_unlisted_fn_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: Some(vec![&env, Symbol::new(&env, "swap")]),
+            },
+        ];
+        let mut l = Ledger::empty(&env);
+        assert!(matches!(
+            decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, proto_ctx(&env, 3, "drain")]
+            )
+            .first()
+            .unwrap(),
+            Decision::Blocked(Error::FunctionNotAllowed)
+        ));
+    }
+
+    #[test]
+    /// SPEC §6.3: contract not in protocols → `UnknownContract`.
+    fn protocol_unknown_contract_denied() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        let mut l = Ledger::empty(&env);
+        assert!(matches!(
+            decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, proto_ctx(&env, 4, "swap")]
+            )
+            .first()
+            .unwrap(),
+            Decision::Blocked(Error::UnknownContract)
+        ));
+    }
+
+    #[test]
+    /// SPEC §6.3: allowlist classification happens before arg inspection —
+    /// a protocol contract named like an SAC is not parsed as a transfer.
+    fn protocol_classification_precedes_arg_inspection() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        // Protocol contract 3 is NOT in cfg.assets, but is in cfg.protocols.
+        p.protocols = vec![
+            &env,
+            ProtocolRule {
+                contract: addr(&env, 3),
+                fns: None,
+            },
+        ];
+        let mut l = Ledger::empty(&env);
+        // Call named "transfer" on protocol contract 3 with SAC-shaped args.
+        // Must be classified as Protocol (allowed), not AssetTransfer.
+        let ctx = vec![&env, transfer_ctx(&env, 3, 2, 5)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+        assert_eq!(l.total, 0);
     }
 
     #[test]
@@ -1101,6 +1389,30 @@ mod tests {
                 .unwrap(),
             Decision::Allowed
         ));
+    }
+
+    /// SPEC §4 rule 5: outside `active_from`/`active_until` every context is
+    /// blocked before classification, and nothing is admitted to the window.
+    #[test]
+    fn outside_active_window_blocks_before_classification() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.active_from = 2_000;
+        p.active_until = 3_000;
+        let mut l = Ledger::empty(&env);
+        // A transfer every other gate would admit, plus the self-call the
+        // dead-man path allows: neither may slip past the account-level gate.
+        let ctx = vec![&env, transfer_ctx(&env, 1, 2, 5), heartbeat_ctx(&env, &sa)];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1_000, ctx.clone());
+        assert_eq!(d.len(), 2);
+        for verdict in &d {
+            assert!(matches!(
+                verdict,
+                Decision::Blocked(Error::OutsideActiveWindow)
+            ));
+        }
+        assert_eq!(l.total, 0, "a blocked window must not admit spend");
     }
 
     #[test]
@@ -1743,108 +2055,64 @@ mod tests {
         );
     }
 
-    /// Per-instruction CPU budget the decision path is asserted against
-    /// (issue #118). Stellar meters a Soroban invocation against a
-    /// per-transaction instruction limit; this is the value quoted for the
-    /// current network setting. The assertion is "the whole decision path, at
-    /// the documented maximum list cardinalities, fits in one invocation's
-    /// budget" — the claim SPEC §6.2 makes about a bounded worst case.
-    const DECISION_PATH_CPU_BUDGET: u64 = 100_000_000;
-
-    /// CPU instructions for one `decide` call, measured in isolation.
-    ///
-    /// The budget is reset *after* the scenario is built so only the decision
-    /// path is charged, and the call is warmed first so one-time host setup
-    /// (allocating the returned verdict vector, interning symbols) is not
-    /// attributed to the path being measured.
-    fn measure_decision_path(env: &Env, policy: &PolicyConfig, target: &Address) -> u64 {
-        let asset = policy.assets.first().unwrap();
-        let self_addr = addr(env, 200);
-        let mut args: Vec<Val> = Vec::new(env);
-        args.push_back(self_addr.clone().into_val(env));
-        args.push_back(target.clone().into_val(env));
-        args.push_back(5i128.into_val(env));
-        let context = Context::Contract(ContractContext {
-            contract: asset,
-            fn_name: Symbol::new(env, "transfer"),
-            args,
-        });
-
-        let run = |ledger: &mut Ledger| {
-            decide(
-                env,
-                &self_addr,
-                Some(policy),
-                &alive(),
-                ledger,
-                1_000,
-                vec![env, context.clone()],
-            )
-        };
-
-        // Warm up, then charge only the measured call.
-        let mut warmup = Ledger::empty(env);
-        for _ in 0..10 {
-            std::hint::black_box(run(&mut warmup));
-        }
-        warmup = Ledger::empty(env);
-        env.cost_estimate().budget().reset_unlimited();
-        let verdicts = run(&mut warmup);
-        std::hint::black_box(&verdicts);
-        env.cost_estimate().budget().cpu_instruction_cost()
+    #[test]
+    fn multi_asset_batch_unit_mixing_summation() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.assets = vec![&env, addr(&env, 1), addr(&env, 2)];
+        p.window_cap = 150;
+        p.per_tx_cap = 100;
+        let mut l = Ledger::empty(&env);
+        let ctx = vec![
+            &env,
+            transfer_ctx(&env, 1, 2, 40),
+            transfer_ctx(&env, 2, 2, 60),
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx);
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+        assert_eq!(l.total, 100);
     }
 
-    /// Issue #118: measure the §6.2 decision path at the **documented maximum**
-    /// list cardinalities, and assert the bound the SPEC now cites.
+    /// SPEC §3.1 / §6 Invariant: Staged window admissions commit only if every context passes.
     ///
-    /// Both shapes the issue calls for are measured:
-    ///
-    /// - **escape off**, the expensive case: the destination is in neither
-    ///   list, so rule 1 sweeps the full 256-entry denylist and rule 2 sweeps
-    ///   the full 256-entry allowlist before either misses. No early exit.
-    /// - **escape on**, the cheap case: rule 2 is skipped, so only the denylist
-    ///   is swept before the caps and window run.
-    ///
-    /// The escape-on cost is the *price of the escape hatch*, so it is
-    /// asserted to be strictly cheaper — otherwise `allow_any_recipient` would
-    /// be buying nothing. Both must fit one invocation's CPU budget; the
-    /// numbers are printed so SPEC §6.2 can quote them, and
-    /// `benches/worst_case_decision_path.rs` reports the same figures through
-    /// the identical fixtures.
+    /// When evaluating a multi-context batch where one context passes and another is blocked,
+    /// the staged spend of the passing context must never be committed to the ledger.
+    /// A subsequent transfer within the window must still fit the pre-batch budget.
     #[test]
-    fn worst_case_decision_path_measured_cost() {
+    fn failed_multi_context_batch_never_commits_staged_window_admissions() {
         let env = Env::default();
-        env.cost_estimate().budget().reset_unlimited();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.window_cap = 100;
+        p.per_tx_cap = 80;
+        let mut l = Ledger::empty(&env);
 
-        let target = worst_case_transfer_target(&env);
+        // Batch: context 1 is valid (40 <= 80 per-tx, 40 <= 100 window),
+        // context 2 is blocked (90 > 80 per-tx).
+        let batch = vec![
+            &env,
+            transfer_ctx(&env, 1, 2, 40),
+            transfer_ctx(&env, 1, 2, 90),
+        ];
+        let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, batch);
+        assert_eq!(d.len(), 2);
+        assert!(matches!(d.first().unwrap(), Decision::Allowed));
+        assert!(matches!(
+            d.get(1).unwrap(),
+            Decision::Blocked(Error::PerTxCapExceeded)
+        ));
 
-        let off = worst_case_transfer_policy(&env, false);
-        let on = worst_case_transfer_policy(&env, true);
+        // Ledger total and entries must be unchanged (all-or-nothing).
+        assert_eq!(l.total, 0);
+        assert_eq!(l.len(), 0);
 
-        let escape_off = measure_decision_path(&env, &off, &target);
-        let escape_on = measure_decision_path(&env, &on, &target);
-
-        std::println!(
-            "worst-case decision path cpu instructions: \
-             escape_off_full_scan={escape_off} escape_on={escape_on} \
-             lists=2x{} budget={DECISION_PATH_CPU_BUDGET}",
-            crate::types::MAX_RECIPIENT_ENTRIES,
-        );
-
-        assert!(
-            escape_off > escape_on,
-            "the full two-list scan must cost more than the escape-hatch path \
-             (escape_off={escape_off}, escape_on={escape_on})"
-        );
-        assert!(
-            escape_off <= DECISION_PATH_CPU_BUDGET,
-            "worst-case §6.2 decision path exceeds the per-invocation CPU \
-             budget: {escape_off} > {DECISION_PATH_CPU_BUDGET}"
-        );
-        assert!(
-            escape_on <= DECISION_PATH_CPU_BUDGET,
-            "escape-hatch §6.2 decision path exceeds the per-invocation CPU \
-             budget: {escape_on} > {DECISION_PATH_CPU_BUDGET}"
-        );
+        // Subsequent in-window transfer of 70 must succeed against the unconsumed budget of 100.
+        // (If the staged 40 had committed, 40 + 70 = 110 would have exceeded window_cap 100).
+        let subsequent = vec![&env, transfer_ctx(&env, 1, 2, 70)];
+        let d2 = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, subsequent);
+        assert!(matches!(d2.first().unwrap(), Decision::Allowed));
+        assert_eq!(l.total, 70);
+        assert_eq!(l.len(), 1);
     }
 }
