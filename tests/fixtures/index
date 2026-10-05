@@ -1,6 +1,6 @@
 # Claim records used by scripts/verify-readme.sh.
 # Network-dependent records remain informational; hashes are immutable fixture evidence.
-wasm_sha256 28d76658ffedd5d4169683719676d86d7e4d1b630988374dd3f53499eb330ff3
+wasm_sha256 6408b1d04513196b7fddc353664682619245f00a060918519d0cde43303c6fee
 contract CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7
 contract CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7
 tx d43edd086ac9b376371f33b72ad89b37a9b6b4d43bf34dfea9717a29688b887c

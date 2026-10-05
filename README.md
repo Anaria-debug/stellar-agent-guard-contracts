@@ -96,7 +96,7 @@ Full recipient/amount enforcement — spend caps, allowlists, per-transaction li
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 68 tests, isolated (no network)
+cargo test                                      # 198 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only)
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
@@ -760,6 +760,23 @@ Phase 1 was proven end-to-end against a **real deployed contract** on Stellar te
 - **Admin unfreeze** (DMS reversal):
   `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5`
 
+The fixture index records these setup and transfer transactions:
+
+| Fixture transaction | Hash |
+|---|---|
+| Upload guard WASM | `d43edd086ac9b376371f33b72ad89b37a9b6b4d43bf34dfea9717a29688b887c` |
+| Create guard contract | `a968bc517af34b0cb1ed53a4523d1cb8b9e562e9a9b1e8367acfabcbf18211b1` |
+| Create token (SAC) | `19f1e36cf4c67feab4e6eb490b4ef424a7fbcc978fcbfa2cad96a079e93ec828` |
+| Mint tokens to guard | `bdeab1808f83c8db3c7a8cf675690afa7039a7aaae5e92fdc9fb7d6700adfeb2` |
+| Initialize guard | `cb17b7b1c65bff74b6bc99f67fe3cf1070c7a28f14bdd71527ba60c9d4a81264` |
+| Policy for scenarios 1-4 | `6f17c5707d86754cc64f7f5adf6d9b9840904f0bea4d10ae5620ffe065c61174` |
+| Recipient trustline | `81479a058dd03457fb91e7b129f941eef64e0bc0752a7f0a5fb3928d5f644fb4` |
+| Policy with DMS grace | `1ddad388f914e267b282855ddc8e5478fabfb8542e7798e4402447e5341e3f9a` |
+| Admin unfreeze | `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5` |
+| Allowed transfer | `4c5759298c0364b01d386a5935b964532b04978ea595d96d904d9011f58d64b8` |
+| Debug-era transfer | `6f5dd410d62e8d83b4d70330d3541ac40678f05b545a4584cbf8e4dce6d07d9b` |
+| Transfer after unfreeze | `b39457afa59f20d6ac90cd137e917c7efd51e27af4913c6c6308a6e5d0eff512` |
+
 The five scenarios — allowed transfer, per-tx cap block, rolling-window cap block,
 recipient-allowlist block, and dead-man trigger + reversal — plus the setup transaction
 hashes, the event output from the contract's own `auth_checked` topics, and full
@@ -786,11 +803,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-68 tests (unit + integration) cover the policy decision engine — including the regression
+198 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `68 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `198 passed; 0 failed`.
 
 ```bash
 cargo test

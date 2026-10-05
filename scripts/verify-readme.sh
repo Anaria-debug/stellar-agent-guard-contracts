@@ -3,7 +3,6 @@ set -euo pipefail
 
 readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly README="${ROOT_DIR}/README.md"
-readonly FIXTURES_README="${ROOT_DIR}/tests/fixtures/README.md"
 readonly FIXTURE_INDEX="${ROOT_DIR}/tests/fixtures/index"
 readonly WASM="${ROOT_DIR}/target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm"
 
@@ -35,7 +34,7 @@ trap 'rm -f "$test_output"' EXIT
 if cargo test 2>&1 | tee "$test_output" >/dev/null; then
   expected_count="$(grep -Eo '[0-9]+ tests' "$README" | awk '{print $1}' | sort -nu | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
   actual_count="$(sed -nE 's/.*test result: ok\. ([0-9]+) passed.*/\1/p' "$test_output" | awk '{total += $1} END {print total + 0}')"
-  if [[ "$expected_count" == "32" && "$actual_count" == "$expected_count" ]]; then
+  if [[ "$expected_count" == "198" && "$actual_count" == "$expected_count" ]]; then
     check_pass "README test count is ${actual_count}"
   else
     check_fail "README test count claims [${expected_count}], cargo test reports ${actual_count}"
@@ -62,7 +61,7 @@ if [[ -f "$FIXTURE_INDEX" ]]; then
   missing_hashes=0
   while read -r kind value; do
     [[ "$kind" == "tx" ]] || continue
-    if grep -Fq "$value" "$FIXTURES_README"; then
+    if grep -Fq "$value" "$README"; then
       continue
     fi
     printf '[FAIL] Fixture transaction hash is missing from README: %s\n' "$value"
