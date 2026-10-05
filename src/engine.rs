@@ -148,6 +148,21 @@ fn effective_window_cap(cfg: &PolicyConfig, recipient: &Address) -> Option<i128>
         .or_else(|| (cfg.window_cap > 0).then_some(cfg.window_cap))
 }
 
+/// Effective per-transaction cap for `asset`: a per-asset override when
+/// present, otherwise the global `per_tx_cap`. Returns `None` when no cap
+/// applies.
+#[allow(clippy::must_use_candidate)]
+pub fn effective_per_tx_cap(cfg: &PolicyConfig, asset: &Address) -> Option<i128> {
+    for i in 0..cfg.asset_caps.len() {
+        if let Some(ac) = cfg.asset_caps.get(i) {
+            if &ac.asset == asset {
+                return (ac.per_tx_cap > 0).then_some(ac.per_tx_cap);
+            }
+        }
+    }
+    (cfg.per_tx_cap > 0).then_some(cfg.per_tx_cap)
+}
+
 // ── Context parsing (SPEC §6) ────────────────────────────────────────────
 
 /// Classifies one auth context into a [`ParsedCall`] (SPEC §6); test-only entry point.
@@ -332,14 +347,14 @@ pub fn decide(
             ParsedCall::CreateContract => Decision::Blocked(Error::CreateContractNotAllowed),
             ParsedCall::Unknown { .. } => Decision::Blocked(Error::UnknownContract),
             ParsedCall::AssetOther { .. } => Decision::Blocked(Error::FunctionNotAllowed),
-            ParsedCall::AssetTransfer { to, amount, .. } => {
+            ParsedCall::AssetTransfer { asset, to, amount } => {
                 if amount <= 0 {
                     Decision::Blocked(Error::InvalidAmount)
                 } else if contains_addr(&cfg.blocked_recipients, &to) {
                     Decision::Blocked(Error::RecipientBlocked)
                 } else if !cfg.allow_any_recipient && !contains_addr(&cfg.recipients, &to) {
                     Decision::Blocked(Error::RecipientNotAllowed)
-                } else if cfg.per_tx_cap > 0 && amount > cfg.per_tx_cap {
+                } else if effective_per_tx_cap(cfg, &asset).is_some_and(|cap| amount > cap) {
                     Decision::Blocked(Error::PerTxCapExceeded)
                 } else {
                     // Window accounting: global cap plus an optional
@@ -489,6 +504,7 @@ mod tests {
             recipients: vec![env, addr(env, 2)],
             recipient_window_caps: Vec::new(env),
             blocked_recipients: Vec::new(env),
+            asset_caps: Vec::new(env),
             allow_any_recipient: false,
             active_from: 0,
             active_until: 0,

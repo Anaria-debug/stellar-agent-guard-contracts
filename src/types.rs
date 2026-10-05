@@ -34,6 +34,10 @@ pub const MAX_POLICY_PROTOCOLS: usize = 256;
 /// storage bounded and predictable (SPEC §3 / §8).
 pub const MAX_RECIPIENT_ENTRIES: usize = 256;
 
+/// Hard bound on the number of entries in `asset_caps`. Keeps per-asset cap
+/// admission and validation scans bounded and predictable (SPEC §3 / §8).
+pub const MAX_ASSET_CAP_ENTRIES: usize = 256;
+
 /// Upper bound on `window_secs` and `dms_grace_secs` (issue #34). `3_650` days
 /// ≈ 10 years: far beyond any legitimate rolling spend window or dead-man
 /// grace, while still catching the classic seconds/milliseconds confusion
@@ -85,6 +89,12 @@ pub enum PolicyRuleId {
     ProtocolListTooLong,
     /// `per_tx_cap > window_cap` when both are enabled (both > 0; issue #33).
     PerTxCapExceedsWindowCap,
+    /// `asset_caps` exceeds `MAX_ASSET_CAP_ENTRIES`.
+    AssetCapListTooLong,
+    /// An `asset_caps` entry overrides an asset not present in `assets`.
+    AssetCapUnknownAsset,
+    /// The same asset appears twice in `asset_caps`.
+    DuplicateAssetCap,
 }
 
 /// Result of the `validate_policy` read (issue #35): whether a candidate
@@ -152,6 +162,19 @@ pub struct RecipientCap {
     pub cap: i128,
 }
 
+/// Per-asset per-tx cap override.
+///
+/// Absent from `PolicyConfig::asset_caps` means the asset falls back to the
+/// global `per_tx_cap`. An override of 0 disables the per-tx cap for that
+/// asset only (the global window cap still applies).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetCap {
+    pub asset: Address,
+    /// Per-tx cap for this asset; 0 = disabled / fall back to global.
+    pub per_tx_cap: i128,
+}
+
 /// The policy an admin installs on the account. See SPEC §3/§4.
 #[contracttype]
 #[derive(Clone, PartialEq, Eq)]
@@ -174,6 +197,10 @@ pub struct PolicyConfig {
     /// Denied SAC transfer destinations. Checked before the allowlist and
     /// before `allow_any_recipient`; an empty list leaves behavior unchanged.
     pub blocked_recipients: Vec<Address>,
+
+    /// Per-asset per-tx cap overrides; assets not listed here use the global
+    /// `per_tx_cap`. Storage bounded by `MAX_ASSET_CAP_ENTRIES`.
+    pub asset_caps: Vec<AssetCap>,
     /// Escape hatch: skip the recipient allowlist (caps still apply).
     pub allow_any_recipient: bool,
     /// Active window start (unix seconds); 0 = unrestricted.
@@ -207,6 +234,7 @@ impl core::fmt::Debug for PolicyConfig {
             .field("recipients", &self.recipients)
             .field("recipient_window_caps", &self.recipient_window_caps)
             .field("blocked_recipients", &self.blocked_recipients)
+            .field("asset_caps", &self.asset_caps)
             .field("allow_any_recipient", &self.allow_any_recipient)
             .field("active_from", &self.active_from)
             .field("active_until", &self.active_until)

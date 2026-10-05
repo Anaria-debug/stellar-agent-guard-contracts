@@ -96,7 +96,7 @@ Full recipient/amount enforcement — spend caps, allowlists, per-transaction li
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 198 tests, isolated (no network)
+cargo test                                      # 206 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only)
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
@@ -155,6 +155,7 @@ Tooling can validate this CLI JSON shape against the checked-in
 | Field | Type | Meaning |
 |---|---|---|
 | `per_tx_cap` | `i128` | per asset-transfer call cap; `0` = disabled |
+| `asset_caps` | `Vec<AssetCap>` | optional per-asset `per_tx_cap` overrides (asset + cap); unlisted assets fall back to the global `per_tx_cap` |
 | `window_secs` | `u64` | rolling window width in seconds (default 86_400) |
 | `window_cap` | `i128` | rolling cap within `window_secs`; `0` = disabled |
 | `assets` | `Vec<Address>` | SAC token contracts whose transfers get parsed and enforced |
@@ -189,6 +190,15 @@ assets/recipients/blocked_recipients/protocol contracts, duplicate recipients in
 than 256 `blocked_recipients` or per-recipient cap entries), empty per-protocol fn
 lists, or the self-address in `assets`/`protocols`/`recipients`/`blocked_recipients`
 all fail with `InvalidConfig`.
+
+Per-asset caps are additive: an absent `asset_caps` entry (or an empty
+vector) leaves the global `per_tx_cap` in force for every asset, so existing
+policies encode byte-identically. A `asset_caps` entry whose asset is not
+listed in `assets` is rejected with `InvalidConfig` rather than silently
+ignored, and every per-asset cap must be `>= 0`. Window accounting stays a
+single rolling window: an admitted transfer is compared against the asset's
+*effective* per-tx cap (override if present, else the global `per_tx_cap`),
+and the shared `window_cap` still bounds total spend across assets.
 
 **Not sure where to start?** Copy-paste presets for common operator personas —
 day-trader agent, payments bot, watch-only + heartbeat, max security — each with
@@ -792,6 +802,7 @@ and honestly reports the DMS has since expired, exactly as designed.
 |---|---|
 | Custom-account `__check_auth` enforcement | ✅ |
 | Per-transaction spend cap | ✅ |
+| Per-asset per-transaction spend caps (override global `per_tx_cap`) | ✅ |
 | Rolling window spend cap | ✅ |
 | Recipient allowlist (SAC transfers) | ✅ |
 | Recipient denylist / blocklist (SAC transfers) | ✅ |
@@ -803,11 +814,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-198 tests (unit + integration) cover the policy decision engine — including the regression
+206 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `198 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `206 passed; 0 failed`.
 
 ```bash
 cargo test
