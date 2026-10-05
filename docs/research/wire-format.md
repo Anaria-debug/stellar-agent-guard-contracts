@@ -59,6 +59,12 @@ Returns account status snapshot.
 }
 ```
 
+`policy_revision` is the `PolicyRevision` sequence counter (issue #38): it
+increments on every `set_policy`/`revoke_policy` (starting at 1 after the first
+install, never reset by a revoke) and is the join key that ties `auth_checked`
+events to the policy generation in force — the `policy_set`, `policy_revoked`,
+and `auth_checked` events stamp the same counter as additive `revision` data.
+
 ### Additive operational fields (issue #29):
 
 `status()` additionally returns three operational fields. They are additive —
@@ -125,6 +131,7 @@ Pre-flight simulation of an SAC transfer decision. Returns an enum with two vari
 | `not_initialized` | `NotInitialized` |
 | `invalid_config` | `InvalidConfig` |
 | `invalid_amount` | `InvalidAmount` |
+| `no_pending_admin` | `NoPendingAdmin` |
 | `admin_frozen` | `AdminFrozen` |
 | `heartbeat_expired` | `HeartbeatExpired` |
 | `no_policy` | `NoPolicy` |
