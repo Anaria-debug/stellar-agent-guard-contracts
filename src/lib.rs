@@ -762,9 +762,10 @@ impl PolicyEngine {
     /// If the account is not expired, or already recorded, this is a no-op.
     pub fn refresh_deadman(env: Env) {
         let now = env.ledger().timestamp();
-        let grace = persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
+        let grace =
+            persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
         let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
-        
+
         if grace > 0 && last_heartbeat != 0 && now.saturating_sub(last_heartbeat) > grace {
             let recorded = persist_get::<u64>(&env, &DataKey::AutoFrozenAt).unwrap_or(0);
             if recorded == 0 {
