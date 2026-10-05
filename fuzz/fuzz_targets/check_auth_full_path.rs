@@ -123,11 +123,14 @@ fn setup(env: &Env) -> (Address, Address, SigningKey) {
         assets: soroban_sdk::vec![env, asset.clone()],
         protocols: Vec::new(env),
         recipients: Vec::new(env),
+        recipient_window_caps: Vec::new(env),
+        blocked_recipients: Vec::new(env),
         allow_any_recipient: true,
         active_from: 0,
         active_until: 0,
         paused: false,
         dms_grace_secs: 0,
+        protocol_calls_per_window: 0,
     });
     (guard, asset, key)
 }
@@ -136,11 +139,10 @@ fuzz_target!(|input: &[u8]| {
     let env = Env::default();
     let (guard, asset, signing_key) = setup(&env);
     let contexts = contexts(&env, &guard, &asset, input);
-    let payload = env.crypto().sha256(&Bytes::from_slice(&env, b"fuzz-payload"));
-    let signature = BytesN::from_array(
-        &env,
-        &signing_key.sign(&payload.to_array()).to_bytes(),
-    );
+    let payload = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, b"fuzz-payload"));
+    let signature = BytesN::from_array(&env, &signing_key.sign(&payload.to_array()).to_bytes());
     let result = env.as_contract(&guard, || {
         <PolicyEngine as CustomAccountInterface>::__check_auth(
             env.clone(),
