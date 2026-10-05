@@ -518,10 +518,6 @@ fn emit_dms_auto_frozen(env: &Env, at: u64) {
     EventDmsAutoFrozen { at }.publish(env);
 }
 
-fn emit_dms_auto_frozen(env: &Env, at: u64) {
-    EventDmsAutoFrozen { at }.publish(env);
-}
-
 fn emit_initialized(env: &Env, by: &Address) {
     EventInitialized { by: by.clone() }.publish(env);
 }
