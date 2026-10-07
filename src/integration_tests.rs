@@ -2891,6 +2891,8 @@ fn error_and_block_reason_round_trip() {
         GuardError::UnknownContract,
         GuardError::SelfFunctionNotAllowed,
         GuardError::CreateContractNotAllowed,
+        GuardError::ProtocolCallRateExceeded,
+        GuardError::DecisionInvariantViolation,
     ];
 
     for err in all_errors {
