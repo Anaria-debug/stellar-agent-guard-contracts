@@ -390,6 +390,7 @@ impl Error {
             Self::WindowCapExceeded,
             Self::ProtocolNotAllowed,
             Self::FunctionNotAllowed,
+            Self::AssetFnNotAllowed,
             Self::UnknownContract,
             Self::SelfFunctionNotAllowed,
             Self::CreateContractNotAllowed,
@@ -484,7 +485,7 @@ pub enum Error {
     Paused = 13,
     /// Current ledger time is outside the configured active interval.
     OutsideActiveWindow = 14,
-    // Per-call decisions (20..=30)
+    // Per-call decisions (20..=32)
     /// Transfer asset is absent from the asset allowlist.
     AssetNotAllowed = 20,
     /// Transfer destination is absent from the recipient allowlist.
@@ -497,7 +498,8 @@ pub enum Error {
     ProtocolNotAllowed = 24,
     /// Called function is not allowlisted for its protocol.
     FunctionNotAllowed = 25,
-    /// Call targets an unknown contract.
+    /// A call invokes a non-transfer function on an allowlisted asset.
+    AssetFnNotAllowed = 32,
     UnknownContract = 26,
     /// Account self-call is not permitted by the fixed self-call policy.
     SelfFunctionNotAllowed = 27,
@@ -534,6 +536,7 @@ impl Error {
             Self::WindowCapExceeded => "window_cap_exceeded",
             Self::ProtocolNotAllowed => "protocol_not_allowed",
             Self::FunctionNotAllowed => "function_not_allowed",
+            Self::AssetFnNotAllowed => "asset_fn_not_allowed",
             Self::UnknownContract => "unknown_contract",
             Self::SelfFunctionNotAllowed => "self_function_not_allowed",
             Self::CreateContractNotAllowed => "create_contract_not_allowed",

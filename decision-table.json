@@ -174,8 +174,13 @@
         {
           "error": "FunctionNotAllowed",
           "tests": [
-            "asset_other_function_is_function_not_allowed",
             "protocol_unlisted_fn_denied"
+          ]
+        },
+        {
+          "error": "AssetFnNotAllowed",
+          "tests": [
+            "asset_other_function_is_asset_fn_not_allowed"
           ]
         },
         {

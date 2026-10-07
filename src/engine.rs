@@ -346,7 +346,7 @@ pub fn decide(
             }
             ParsedCall::CreateContract => Decision::Blocked(Error::CreateContractNotAllowed),
             ParsedCall::Unknown { .. } => Decision::Blocked(Error::UnknownContract),
-            ParsedCall::AssetOther { .. } => Decision::Blocked(Error::FunctionNotAllowed),
+            ParsedCall::AssetOther { .. } => Decision::Blocked(Error::AssetFnNotAllowed),
             ParsedCall::AssetTransfer { asset, to, amount } => {
                 if amount <= 0 {
                     Decision::Blocked(Error::InvalidAmount)
@@ -825,7 +825,7 @@ mod tests {
     /// `transfer`/`transfer_from` (e.g. `mint`, `burn`) is classified as
     /// `AssetOther` and denied. The account is an authorizer, never a minter.
     #[test]
-    fn asset_other_function_is_function_not_allowed() {
+    fn asset_other_function_is_asset_fn_not_allowed() {
         let env = Env::default();
         let sa = self_addr(&env);
         let p = Some(base_policy(&env));
@@ -835,7 +835,7 @@ mod tests {
         let d = decide(&env, &sa, p.as_ref(), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.first().unwrap(),
-            Decision::Blocked(Error::FunctionNotAllowed)
+            Decision::Blocked(Error::AssetFnNotAllowed)
         ));
     }
 
