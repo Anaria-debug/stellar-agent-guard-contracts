@@ -1,5 +1,5 @@
 <p align="center">
-<img src="Gemini_Generated_Image_mvimg2mvimg2mvim.jpeg" alt="Stellar Agent Guard" width="700"/>
+<img src="assets/logo.jpeg" alt="Stellar Agent Guard" width="700"/>
 </p>
 <p align="center">
 <a href="https://github.com/aigbagbobila/stellar-agent-guard-contracts/actions/workflows/ci.yml">
@@ -14,7 +14,7 @@
 <a href="https://www.rust-lang.org/">
 <img src="https://img.shields.io/badge/rust-1.85%2B-blue" alt="Rust 1.85+"/>
 </a>
-<a href="https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/">
+<a href="https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/">....
 <img src="https://img.shields.io/badge/docs-GitBook-blue" alt="Documentation"/>
 </a>
 </p>
@@ -96,7 +96,7 @@ Full recipient/amount enforcement — spend caps, allowlists, per-transaction li
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 68 tests, isolated (no network)
+cargo test                                      # 208 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only)
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
@@ -149,9 +149,13 @@ Admin-only (`require_auth(Admin)`). Replaces the policy, resets the rolling wind
 starts the dead-man-switch clock at install time (a fresh policy gets full grace). The
 `PolicyConfig` fields:
 
+Tooling can validate this CLI JSON shape against the checked-in
+[`policy.schema.json`](policy.schema.json); the contract remains the authoritative validator.
+
 | Field | Type | Meaning |
 |---|---|---|
 | `per_tx_cap` | `i128` | per asset-transfer call cap; `0` = disabled |
+| `asset_caps` | `Vec<AssetCap>` | optional per-asset `per_tx_cap` overrides (asset + cap); unlisted assets fall back to the global `per_tx_cap` |
 | `window_secs` | `u64` | rolling window width in seconds (default 86_400) |
 | `window_cap` | `i128` | rolling cap within `window_secs`; `0` = disabled |
 | `assets` | `Vec<Address>` | SAC token contracts whose transfers get parsed and enforced |
@@ -186,6 +190,15 @@ assets/recipients/blocked_recipients/protocol contracts, duplicate recipients in
 than 256 `blocked_recipients` or per-recipient cap entries), empty per-protocol fn
 lists, or the self-address in `assets`/`protocols`/`recipients`/`blocked_recipients`
 all fail with `InvalidConfig`.
+
+Per-asset caps are additive: an absent `asset_caps` entry (or an empty
+vector) leaves the global `per_tx_cap` in force for every asset, so existing
+policies encode byte-identically. A `asset_caps` entry whose asset is not
+listed in `assets` is rejected with `InvalidConfig` rather than silently
+ignored, and every per-asset cap must be `>= 0`. Window accounting stays a
+single rolling window: an admitted transfer is compared against the asset's
+*effective* per-tx cap (override if present, else the global `per_tx_cap`),
+and the shared `window_cap` still bounds total spend across assets.
 
 **Not sure where to start?** Copy-paste presets for common operator personas —
 day-trader agent, payments bot, watch-only + heartbeat, max security — each with
@@ -757,6 +770,23 @@ Phase 1 was proven end-to-end against a **real deployed contract** on Stellar te
 - **Admin unfreeze** (DMS reversal):
   `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5`
 
+The fixture index records these setup and transfer transactions:
+
+| Fixture transaction | Hash |
+|---|---|
+| Upload guard WASM | `d43edd086ac9b376371f33b72ad89b37a9b6b4d43bf34dfea9717a29688b887c` |
+| Create guard contract | `a968bc517af34b0cb1ed53a4523d1cb8b9e562e9a9b1e8367acfabcbf18211b1` |
+| Create token (SAC) | `19f1e36cf4c67feab4e6eb490b4ef424a7fbcc978fcbfa2cad96a079e93ec828` |
+| Mint tokens to guard | `bdeab1808f83c8db3c7a8cf675690afa7039a7aaae5e92fdc9fb7d6700adfeb2` |
+| Initialize guard | `cb17b7b1c65bff74b6bc99f67fe3cf1070c7a28f14bdd71527ba60c9d4a81264` |
+| Policy for scenarios 1-4 | `6f17c5707d86754cc64f7f5adf6d9b9840904f0bea4d10ae5620ffe065c61174` |
+| Recipient trustline | `81479a058dd03457fb91e7b129f941eef64e0bc0752a7f0a5fb3928d5f644fb4` |
+| Policy with DMS grace | `1ddad388f914e267b282855ddc8e5478fabfb8542e7798e4402447e5341e3f9a` |
+| Admin unfreeze | `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5` |
+| Allowed transfer | `4c5759298c0364b01d386a5935b964532b04978ea595d96d904d9011f58d64b8` |
+| Debug-era transfer | `6f5dd410d62e8d83b4d70330d3541ac40678f05b545a4584cbf8e4dce6d07d9b` |
+| Transfer after unfreeze | `b39457afa59f20d6ac90cd137e917c7efd51e27af4913c6c6308a6e5d0eff512` |
+
 The five scenarios — allowed transfer, per-tx cap block, rolling-window cap block,
 recipient-allowlist block, and dead-man trigger + reversal — plus the setup transaction
 hashes, the event output from the contract's own `auth_checked` topics, and full
@@ -772,6 +802,7 @@ and honestly reports the DMS has since expired, exactly as designed.
 |---|---|
 | Custom-account `__check_auth` enforcement | ✅ |
 | Per-transaction spend cap | ✅ |
+| Per-asset per-transaction spend caps (override global `per_tx_cap`) | ✅ |
 | Rolling window spend cap | ✅ |
 | Recipient allowlist (SAC transfers) | ✅ |
 | Recipient denylist / blocklist (SAC transfers) | ✅ |
@@ -783,11 +814,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-68 tests (unit + integration) cover the policy decision engine — including the regression
+208 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `68 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `208 passed; 0 failed`.
 
 ```bash
 cargo test

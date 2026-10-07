@@ -7,11 +7,15 @@ use crate::window::Ledger;
 use soroban_sdk::auth::{Context, ContractContext};
 use soroban_sdk::{Address, Env, Symbol, TryFromVal, Vec};
 
+/// Account-level state the account gates (SPEC §4 rows 1–2) are evaluated against.
 pub struct AccountState {
+    /// Admin-initiated freeze flag (`AdminFrozen`).
     pub admin_frozen: bool,
+    /// Unix seconds of the last agent heartbeat; `0` = never.
     pub last_heartbeat: u64,
 }
 
+/// Verdict for one authorization context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Context admitted.
@@ -97,6 +101,7 @@ pub fn dms_health(
 
 // ── Small contains helpers (soroban Vec has no `contains`) ───────────────
 
+/// Whether `a` is in `list` (soroban `Vec` has no `contains`).
 #[allow(clippy::must_use_candidate)]
 pub fn contains_addr(list: &Vec<Address>, a: &Address) -> bool {
     for i in 0..list.len() {
@@ -247,8 +252,24 @@ fn effective_window_cap(cfg: &PolicyConfig, recipient: &Address) -> Option<i128>
         .or_else(|| (cfg.window_cap > 0).then_some(cfg.window_cap))
 }
 
+/// Effective per-transaction cap for `asset`: a per-asset override when
+/// present, otherwise the global `per_tx_cap`. Returns `None` when no cap
+/// applies.
+#[allow(clippy::must_use_candidate)]
+pub fn effective_per_tx_cap(cfg: &PolicyConfig, asset: &Address) -> Option<i128> {
+    for i in 0..cfg.asset_caps.len() {
+        if let Some(ac) = cfg.asset_caps.get(i) {
+            if &ac.asset == asset {
+                return (ac.per_tx_cap > 0).then_some(ac.per_tx_cap);
+            }
+        }
+    }
+    (cfg.per_tx_cap > 0).then_some(cfg.per_tx_cap)
+}
+
 // ── Context parsing (SPEC §6) ────────────────────────────────────────────
 
+/// Classifies one auth context into a [`ParsedCall`] (SPEC §6); test-only entry point.
 #[cfg(feature = "testutils")]
 #[allow(clippy::must_use_candidate)]
 pub fn parse_call(env: &Env, self_addr: &Address, ctx: &Context, cfg: &PolicyConfig) -> ParsedCall {
@@ -345,6 +366,9 @@ fn parse_call_inner(
 
 // ── Decision ─────────────────────────────────────────────────────────────
 
+/// Evaluates the SPEC §4 decision table over every auth context, returning one
+/// [`Decision`] per context. Window admissions are staged and committed to
+/// `ledger` only when every context is allowed.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // by-value host Vec avoids slice/coercion limits
 pub fn decide(
     env: &Env,
@@ -357,6 +381,13 @@ pub fn decide(
 ) -> alloc::vec::Vec<Decision> {
     let mut verdicts = alloc::vec::Vec::new();
 
+    if state.admin_frozen {
+        for _ in 0..contexts.len() {
+            verdicts.push(Decision::Blocked(Error::AdminFrozen));
+        }
+        return verdicts;
+    }
+
     let Some(cfg) = policy else {
         for _ in 0..contexts.len() {
             verdicts.push(Decision::Blocked(Error::NoPolicy));
@@ -364,9 +395,7 @@ pub fn decide(
         return verdicts;
     };
 
-    let account_error = if state.admin_frozen {
-        Some(Error::AdminFrozen)
-    } else if cfg.dms_grace_secs > 0
+    let account_error = if cfg.dms_grace_secs > 0
         && state.last_heartbeat != 0
         && now.saturating_sub(state.last_heartbeat) > cfg.dms_grace_secs
     {
@@ -421,15 +450,15 @@ pub fn decide(
             }
             ParsedCall::CreateContract => Decision::Blocked(Error::CreateContractNotAllowed),
             ParsedCall::Unknown { .. } => Decision::Blocked(Error::UnknownContract),
-            ParsedCall::AssetOther { .. } => Decision::Blocked(Error::FunctionNotAllowed),
-            ParsedCall::AssetTransfer { to, amount, .. } => {
+            ParsedCall::AssetOther { .. } => Decision::Blocked(Error::AssetFnNotAllowed),
+            ParsedCall::AssetTransfer { asset, to, amount } => {
                 if amount <= 0 {
                     Decision::Blocked(Error::InvalidAmount)
                 } else if contains_addr(&cfg.blocked_recipients, &to) {
                     Decision::Blocked(Error::RecipientBlocked)
                 } else if !cfg.allow_any_recipient && !contains_addr(&cfg.recipients, &to) {
                     Decision::Blocked(Error::RecipientNotAllowed)
-                } else if cfg.per_tx_cap > 0 && amount > cfg.per_tx_cap {
+                } else if effective_per_tx_cap(cfg, &asset).is_some_and(|cap| amount > cap) {
                     Decision::Blocked(Error::PerTxCapExceeded)
                 } else {
                     // Window accounting: global cap plus an optional
@@ -579,6 +608,7 @@ mod tests {
             recipients: vec![env, addr(env, 2)],
             recipient_window_caps: Vec::new(env),
             blocked_recipients: Vec::new(env),
+            asset_caps: Vec::new(env),
             allow_any_recipient: false,
             active_from: 0,
             active_until: 0,
@@ -899,7 +929,7 @@ mod tests {
     /// `transfer`/`transfer_from` (e.g. `mint`, `burn`) is classified as
     /// `AssetOther` and denied. The account is an authorizer, never a minter.
     #[test]
-    fn asset_other_function_is_function_not_allowed() {
+    fn asset_other_function_is_asset_fn_not_allowed() {
         let env = Env::default();
         let sa = self_addr(&env);
         let p = Some(base_policy(&env));
@@ -909,7 +939,7 @@ mod tests {
         let d = decide(&env, &sa, p.as_ref(), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.first().unwrap(),
-            Decision::Blocked(Error::FunctionNotAllowed)
+            Decision::Blocked(Error::AssetFnNotAllowed)
         ));
     }
 
@@ -1413,6 +1443,104 @@ mod tests {
             ));
         }
         assert_eq!(l.total, 0, "a blocked window must not admit spend");
+    }
+
+    #[test]
+    fn active_window_boundaries_are_inclusive() {
+        // SPEC §4 row 5: block when `now < active_from` or `now > active_until`,
+        // so `now == active_from` and `now == active_until` are allowed. Pin
+        // the exact boundary instants so an off-by-one in a refactor cannot
+        // silently shift operator-defined execution windows.
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.active_from = 1_000;
+        p.active_until = 2_000;
+        let mut l = Ledger::empty(&env);
+
+        // One second before the window opens: blocked.
+        let d_before = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_from - 1,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(
+            d_before.first().unwrap(),
+            Decision::Blocked(Error::OutsideActiveWindow)
+        ));
+
+        // Exactly at `active_from`: allowed (inclusive lower bound).
+        let d_from = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_from,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(d_from.first().unwrap(), Decision::Allowed));
+
+        // Exactly at `active_until`: allowed (inclusive upper bound).
+        let d_until = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_until,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(d_until.first().unwrap(), Decision::Allowed));
+
+        // One second after the window closes: blocked.
+        let d_after = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            p.active_until + 1,
+            vec![&env, transfer_ctx(&env, 1, 2, 5)],
+        );
+        assert!(matches!(
+            d_after.first().unwrap(),
+            Decision::Blocked(Error::OutsideActiveWindow)
+        ));
+    }
+
+    #[test]
+    fn active_window_open_bounds_are_ignored() {
+        // `active_from == 0` and `active_until == 0` disable the respective
+        // bound entirely, so the boundary semantics above only apply to
+        // configured (non-zero) bounds.
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.active_from = 0;
+        p.active_until = 0;
+        let mut l = Ledger::empty(&env);
+
+        // Far before any configured window and far after: still allowed.
+        for now in [0u64, 1, u64::MAX] {
+            let d = decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                now,
+                vec![&env, transfer_ctx(&env, 1, 2, 5)],
+            );
+            assert!(
+                matches!(d.first().unwrap(), Decision::Allowed),
+                "now={now} should be allowed when both bounds are disabled"
+            );
+        }
     }
 
     #[test]

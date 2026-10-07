@@ -26,8 +26,8 @@
 //! transfer).
 
 use crate::types::{
-    CheckResult, DataKey, DmsHealthStatus, Error as GuardError, PolicyConfig, PolicyRuleId,
-    ProtocolRule, RecipientCap, ValidationOutcome, WindowState,
+    AssetCap, CheckResult, DataKey, DmsHealthStatus, Error as GuardError, PolicyConfig,
+    PolicyRuleId, ProtocolRule, RecipientCap, ValidationOutcome, WindowState,
 };
 use crate::{AuthSnapshot, PolicyEngine, PolicyEngineClient};
 
@@ -364,6 +364,7 @@ impl Harness {
             protocols: soroban_sdk::Vec::new(&self.env),
             recipients: soroban_sdk::vec![&self.env, self.recv.clone()],
             recipient_window_caps: soroban_sdk::Vec::new(&self.env),
+            asset_caps: soroban_sdk::Vec::new(&self.env),
             blocked_recipients: soroban_sdk::Vec::new(&self.env),
             allow_any_recipient: false,
             active_from: 0,
@@ -1473,6 +1474,82 @@ fn unfreeze_while_dms_fresh_emits_rearmed_dms_false() {
     h.unfreeze();
     assert_unfrozen_event_rearmed(&h.env, false);
     assert_eq!(h.status().last_heartbeat, 1_000_010);
+}
+
+#[test]
+fn refresh_deadman_records_auto_freeze_and_emits_event() {
+    let mut h = Harness::new();
+    let mut p = h.base_policy();
+    p.dms_grace_secs = 60;
+    h.set_time(1_000_000);
+    h.install_policy(&p);
+
+    // Within grace, refresh_deadman does nothing
+    h.set_time(1_000_010);
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).refresh_deadman();
+    // Verify no event emitted
+    let mut events = std::vec::Vec::new();
+    for e in h.env.events().all().events() {
+        let soroban_sdk::xdr::ContractEventBody::V0(v0) = &e.body;
+        let want_event = soroban_sdk::xdr::ScVal::Symbol(
+            soroban_sdk::xdr::ScSymbol::try_from(std::vec::Vec::from("event_dms_auto_frozen"))
+                .unwrap(),
+        );
+        if v0.topics.first() == Some(&want_event) {
+            events.push(v0.topics.clone());
+        }
+    }
+    assert_eq!(
+        events.len(),
+        0,
+        "No event should be emitted when not expired"
+    );
+
+    // Grace elapsed, it should record and emit
+    h.set_time(1_000_100);
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).refresh_deadman();
+
+    let mut events2 = std::vec::Vec::new();
+    for e in h.env.events().all().events() {
+        let soroban_sdk::xdr::ContractEventBody::V0(v0) = &e.body;
+        let want_event = soroban_sdk::xdr::ScVal::Symbol(
+            soroban_sdk::xdr::ScSymbol::try_from(std::vec::Vec::from("event_dms_auto_frozen"))
+                .unwrap(),
+        );
+        if v0.topics.first() == Some(&want_event) {
+            events2.push(v0.topics.clone());
+        }
+    }
+    assert_eq!(
+        events2.len(),
+        1,
+        "Should emit exactly one auto-freeze event"
+    );
+
+    // Calling it again should no-op
+    PolicyEngineClient::new(&h.env, &h.guard).refresh_deadman();
+    let mut events3 = std::vec::Vec::new();
+    for e in h.env.events().all().events() {
+        let soroban_sdk::xdr::ContractEventBody::V0(v0) = &e.body;
+        let want_event = soroban_sdk::xdr::ScVal::Symbol(
+            soroban_sdk::xdr::ScSymbol::try_from(std::vec::Vec::from("event_dms_auto_frozen"))
+                .unwrap(),
+        );
+        if v0.topics.first() == Some(&want_event) {
+            events3.push(v0.topics.clone());
+        }
+    }
+    assert_eq!(
+        events3.len(),
+        0,
+        "Second call should be a no-op (no new events)"
+    );
+
+    // Ensure subsequent spends are still identically blocked (no change to lazy evaluation)
+    let recv = h.recv.clone();
+    h.transfer_expect_blocked(&recv, 5);
 }
 
 #[test]
@@ -2810,9 +2887,12 @@ fn error_and_block_reason_round_trip() {
         GuardError::WindowCapExceeded,
         GuardError::ProtocolNotAllowed,
         GuardError::FunctionNotAllowed,
+        GuardError::AssetFnNotAllowed,
         GuardError::UnknownContract,
         GuardError::SelfFunctionNotAllowed,
         GuardError::CreateContractNotAllowed,
+        GuardError::ProtocolCallRateExceeded,
+        GuardError::DecisionInvariantViolation,
     ];
 
     for err in all_errors {
@@ -3183,6 +3263,13 @@ fn policy_config_debug_snapshot() {
                 cap: 10_000,
             },
         ],
+        asset_caps: vec![
+            &env,
+            AssetCap {
+                asset: asset_a.clone(),
+                per_tx_cap: 500,
+            },
+        ],
         blocked_recipients: vec![&env],
         allow_any_recipient: false,
         active_from: 1_700_000_000,
@@ -3203,6 +3290,7 @@ fn policy_config_debug_snapshot() {
         "recipients",
         "recipient_window_caps",
         "blocked_recipients",
+        "asset_caps",
         "allow_any_recipient",
         "active_from",
         "active_until",
@@ -3607,6 +3695,174 @@ fn detailed_check_reports_per_recipient_headroom() {
     assert_eq!(detail.remaining_window, Some(60)); // 100 cap - 40 already admitted
     assert_eq!(detail.effective_window_cap, Some(100));
 }
+#[test]
+fn per_asset_cap_override_wins_over_global() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.per_tx_cap = 100;
+    p.asset_caps = soroban_sdk::vec![
+        &h.env,
+        AssetCap {
+            asset: h.asset.clone(),
+            per_tx_cap: 10,
+        },
+    ];
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // Under the asset override: allowed.
+    h.transfer(&recv, 10);
+    // Above the asset override but below the global cap: must be blocked by
+    // the override (proves the override wins, not the global).
+    h.transfer_expect_blocked(&recv, 50);
+}
+
+#[test]
+fn per_asset_cap_falls_back_to_global_when_absent() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.per_tx_cap = 100;
+    // No asset_caps entry for h.asset: global per_tx_cap applies.
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    h.transfer(&recv, 100);
+    h.transfer_expect_blocked(&recv, 101);
+}
+
+#[test]
+fn per_asset_cap_zero_override_disables_cap_for_that_asset() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.per_tx_cap = 100;
+    p.asset_caps = soroban_sdk::vec![
+        &h.env,
+        AssetCap {
+            asset: h.asset.clone(),
+            per_tx_cap: 0,
+        },
+    ];
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // per_tx_cap = 0 means "no cap" for this asset, overriding the global 100.
+    h.transfer(&recv, 1_000_000);
+}
+
+#[test]
+fn per_asset_cap_window_still_uses_global_window() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    // Global per-tx cap must not exceed the window cap (validate_policy rejects
+    // that combination); the per-asset override is the binding per-tx limit here.
+    p.per_tx_cap = 100;
+    p.window_cap = 100;
+    p.asset_caps = soroban_sdk::vec![
+        &h.env,
+        AssetCap {
+            asset: h.asset.clone(),
+            per_tx_cap: 50,
+        },
+    ];
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // Per-tx override allows up to 50 per tx; window still caps total at 100.
+    h.transfer(&recv, 50);
+    h.transfer(&recv, 50);
+    h.transfer_expect_blocked(&recv, 1); // window full
+}
+
+#[test]
+fn invalid_negative_per_asset_cap_rejected() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.asset_caps = soroban_sdk::vec![
+        &h.env,
+        AssetCap {
+            asset: h.asset.clone(),
+            per_tx_cap: -1,
+        },
+    ];
+    h.env.mock_all_auths();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&p);
+    }));
+    assert!(res.is_err(), "negative per-asset cap must be rejected");
+}
+
+#[test]
+fn invalid_unknown_asset_override_rejected() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    // `other` is not in `assets`; an override for it must be rejected rather
+    // than silently ignored.
+    p.asset_caps = soroban_sdk::vec![
+        &h.env,
+        AssetCap {
+            asset: h.other.clone(),
+            per_tx_cap: 10,
+        },
+    ];
+    h.env.mock_all_auths();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&p);
+    }));
+    assert!(
+        res.is_err(),
+        "override for an asset not in `assets` must be rejected"
+    );
+}
+
+#[test]
+fn invalid_duplicate_per_asset_cap_rejected() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.asset_caps = soroban_sdk::vec![
+        &h.env,
+        AssetCap {
+            asset: h.asset.clone(),
+            per_tx_cap: 10,
+        },
+        AssetCap {
+            asset: h.asset.clone(),
+            per_tx_cap: 20,
+        },
+    ];
+    h.env.mock_all_auths();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&p);
+    }));
+    assert!(res.is_err(), "duplicate per-asset cap must be rejected");
+}
+
+#[test]
+fn detailed_check_reports_effective_per_asset_cap() {
+    let h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.per_tx_cap = 100;
+    p.asset_caps = soroban_sdk::vec![
+        &h.env,
+        AssetCap {
+            asset: h.asset.clone(),
+            per_tx_cap: 25,
+        },
+    ];
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    let detail = h.env.as_contract(&h.guard, || {
+        PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 10)
+    });
+    assert_eq!(detail.result, CheckResult::Allowed);
+    assert_eq!(detail.per_tx_cap, Some(100));
+    assert_eq!(detail.effective_per_tx_cap, Some(25));
+}
 
 // ── status() operational fields (issue #29) ──────────────────────────────
 
@@ -3774,6 +4030,67 @@ fn status_outside_active_window_matches_check_block_reason() {
         PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
     });
     assert_eq!(detail.result, CheckResult::Allowed);
+}
+
+// ── active-window boundary semantics (SPEC §4 row 5) ─────────────────────
+// SPEC §4 row 5 blocks when `now < active_from` or `now > active_until`,
+// which makes both boundaries *inclusive*: a transfer at exactly
+// `active_from` or exactly `active_until` is inside the operator-defined
+// execution window. `set_policy` validates `active_until > active_from`,
+// so the window is never empty. These tests pin the exact boundary
+// instants so an off-by-one introduced in a refactor cannot silently
+// change financial timing behavior.
+
+#[test]
+fn active_window_boundaries_are_inclusive() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.active_from = 1_500;
+    p.active_until = 1_600;
+    h.install_policy(&p);
+
+    // One second before the window opens: blocked.
+    h.set_time(1_499);
+    h.transfer_expect_blocked(&recv, 5);
+
+    // Exactly at `active_from`: allowed (inclusive lower boundary).
+    h.set_time(1_500);
+    h.transfer(&recv, 5);
+
+    // Exactly at `active_until`: allowed (inclusive upper boundary).
+    h.set_time(1_600);
+    h.transfer(&recv, 5);
+
+    // One second after the window closes: blocked.
+    h.set_time(1_601);
+    h.transfer_expect_blocked(&recv, 5);
+}
+
+#[test]
+fn active_window_boundaries_match_check_block_reason() {
+    // The on-chain gate and the `check` decision must agree at every
+    // boundary instant: `outside_active_window` iff the timestamp is
+    // strictly outside `[active_from, active_until]`.
+    let h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.active_from = 1_500;
+    p.active_until = 1_600;
+    h.install_policy(&p);
+
+    let outside = Symbol::new(&h.env, "outside_active_window");
+    let check = |now: u64| {
+        h.env.ledger().set_timestamp(now);
+        h.env.as_contract(&h.guard, || {
+            PolicyEngine::check_detailed(h.env.clone(), h.asset.clone(), recv.clone(), 1)
+        })
+    };
+
+    assert_eq!(check(1_499).result, CheckResult::Blocked(outside.clone()));
+    assert_eq!(check(1_500).result, CheckResult::Allowed);
+    assert_eq!(check(1_600).result, CheckResult::Allowed);
+    assert_eq!(check(1_601).result, CheckResult::Blocked(outside));
 }
 
 #[test]

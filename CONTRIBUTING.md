@@ -21,6 +21,9 @@ cd stellar-agent-guard-contracts
 # Run tests (31 unit + integration tests, no network needed)
 cargo test
 
+# Audit numeric, hash, transaction, and contract-ID claims before README PRs
+scripts/verify-readme.sh
+
 # Lint (clippy all + pedantic are denied via [lints.clippy])
 cargo clippy --all-targets --all-features
 
@@ -103,6 +106,10 @@ This removes all `target/` directories and `*.wasm` artifacts. The `.gitignore` 
    its agent/operator/auditor columns instead of inventing new phrasing.
 
 ## Commit Discipline (strict)
+
+`PolicyConfig` changes must update `policy.schema.json` and its conformance test in the same
+PR. The Rust contract remains authoritative; the schema is the tooling/editor fast-feedback
+layer and must not silently diverge.
 
 1. **One commit per logical unit.** A bug fix, a feature, a doc change, a test
    change — each is its own commit. Do **not** batch unrelated fixes into one
