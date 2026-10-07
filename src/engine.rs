@@ -157,7 +157,10 @@ pub fn worst_case_addr(env: &Env, tag: u8, index: u8) -> Address {
     hash[0] = tag;
     hash[1..].fill(index);
     let sc = ScAddress::Contract(ContractId(Hash(hash)));
-    Address::try_from_val(env, &sc).unwrap()
+    let Ok(addr) = Address::try_from_val(env, &sc) else {
+        panic!("worst-case fixture address must decode");
+    };
+    addr
 }
 
 /// The policy whose decision path is the documented worst case (SPEC §6.2).
@@ -193,7 +196,9 @@ pub fn worst_case_transfer_policy(env: &Env, allow_any_recipient: bool) -> Polic
         // Two indices that alias would silently shorten the measured sweep and
         // understate the worst case, so a bound that no longer fits fails
         // loudly instead.
-        let index = u8::try_from(i).expect("MAX_RECIPIENT_ENTRIES must fit in a u8 index");
+        let Ok(index) = u8::try_from(i) else {
+            panic!("MAX_RECIPIENT_ENTRIES must fit in a u8 index");
+        };
         recipients.push_back(worst_case_addr(env, WC_RECIPIENTS, index));
         blocked_recipients.push_back(worst_case_addr(env, WC_BLOCKED, index));
     }
@@ -212,6 +217,7 @@ pub fn worst_case_transfer_policy(env: &Env, allow_any_recipient: bool) -> Polic
         recipients,
         recipient_window_caps: Vec::new(env),
         blocked_recipients,
+        asset_caps: Vec::new(env),
         allow_any_recipient,
         active_from: 0,
         active_until: 0,
@@ -2242,5 +2248,110 @@ mod tests {
         assert!(matches!(d2.first().unwrap(), Decision::Allowed));
         assert_eq!(l.total, 70);
         assert_eq!(l.len(), 1);
+    }
+
+    /// Per-instruction CPU budget the decision path is asserted against
+    /// (issue #118). Stellar meters a Soroban invocation against a
+    /// per-transaction instruction limit; this is the value quoted for the
+    /// current network setting. The assertion is "the whole decision path, at
+    /// the documented maximum list cardinalities, fits in one invocation's
+    /// budget" — the claim SPEC §6.2 makes about a bounded worst case.
+    const DECISION_PATH_CPU_BUDGET: u64 = 100_000_000;
+
+    /// CPU instructions for one `decide` call, measured in isolation.
+    ///
+    /// The budget is reset *after* the scenario is built so only the decision
+    /// path is charged, and the call is warmed first so one-time host setup
+    /// (allocating the returned verdict vector, interning symbols) is not
+    /// attributed to the path being measured.
+    fn measure_decision_path(env: &Env, policy: &PolicyConfig, target: &Address) -> u64 {
+        let asset = policy.assets.first().unwrap();
+        let self_addr = addr(env, 200);
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(self_addr.clone().into_val(env));
+        args.push_back(target.clone().into_val(env));
+        args.push_back(5i128.into_val(env));
+        let context = Context::Contract(ContractContext {
+            contract: asset,
+            fn_name: Symbol::new(env, "transfer"),
+            args,
+        });
+
+        let run = |ledger: &mut Ledger| {
+            decide(
+                env,
+                &self_addr,
+                Some(policy),
+                &alive(),
+                ledger,
+                1_000,
+                vec![env, context.clone()],
+            )
+        };
+
+        // Warm up, then charge only the measured call.
+        let mut warmup = Ledger::empty(env);
+        for _ in 0..10 {
+            std::hint::black_box(run(&mut warmup));
+        }
+        warmup = Ledger::empty(env);
+        env.cost_estimate().budget().reset_unlimited();
+        let verdicts = run(&mut warmup);
+        std::hint::black_box(&verdicts);
+        env.cost_estimate().budget().cpu_instruction_cost()
+    }
+
+    /// Issue #118: measure the §6.2 decision path at the **documented maximum**
+    /// list cardinalities, and assert the bound the SPEC now cites.
+    ///
+    /// Both shapes the issue calls for are measured:
+    ///
+    /// - **escape off**, the expensive case: the destination is in neither
+    ///   list, so rule 1 sweeps the full 256-entry denylist and rule 2 sweeps
+    ///   the full 256-entry allowlist before either misses. No early exit.
+    /// - **escape on**, the cheap case: rule 2 is skipped, so only the denylist
+    ///   is swept before the caps and window run.
+    ///
+    /// The escape-on cost is the *price of the escape hatch*, so it is
+    /// asserted to be strictly cheaper — otherwise `allow_any_recipient` would
+    /// be buying nothing. Both must fit one invocation's CPU budget; the
+    /// numbers are printed so SPEC §6.2 can quote them, and
+    /// `benches/worst_case_decision_path.rs` reports the same figures through
+    /// the identical fixtures.
+    #[test]
+    fn worst_case_decision_path_measured_cost() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+
+        let target = worst_case_transfer_target(&env);
+
+        let off = worst_case_transfer_policy(&env, false);
+        let on = worst_case_transfer_policy(&env, true);
+
+        let escape_off = measure_decision_path(&env, &off, &target);
+        let escape_on = measure_decision_path(&env, &on, &target);
+
+        std::println!(
+            "worst-case decision path cpu instructions: \
+             escape_off_full_scan={escape_off} escape_on={escape_on} \
+             lists=2x{} budget={DECISION_PATH_CPU_BUDGET}",
+            crate::types::MAX_RECIPIENT_ENTRIES,
+        );
+
+        assert!(
+            escape_off > escape_on,
+            "the full two-list scan must cost more than the escape-hatch path \
+             (escape_off={escape_off}, escape_on={escape_on})"
+        );
+        assert!(
+            escape_off <= DECISION_PATH_CPU_BUDGET,
+            "worst-case §6.2 decision path exceeds the per-invocation CPU \
+             budget: {escape_off} > {DECISION_PATH_CPU_BUDGET}"
+        );
+        assert!(
+            escape_on <= DECISION_PATH_CPU_BUDGET,
+            "escape-hatch §6.2 decision path exceeds the per-invocation CPU \
+             budget: {escape_on} > {DECISION_PATH_CPU_BUDGET}"
+        );
     }
 }

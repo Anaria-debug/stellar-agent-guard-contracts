@@ -580,9 +580,9 @@ the linear sweeps the dominant term:
 | Configuration | Instructions | % of the 100,000,000 per-invocation CPU budget |
 |---|---|---|
 | `allow_any_recipient = false` — full 2×256 scan, miss on the last element of each | **338,315** | 0.34% |
-| `allow_any_recipient = true` — denylist swept, rule 2 skipped | 179,552 | 0.18% |
+| `allow_any_recipient = true` — denylist swept, rule 2 skipped | 179,674 | 0.18% |
 
-The escape hatch saves 158,763 instructions by skipping the 256-entry allowlist, which is
+The escape hatch saves 158,641 instructions by skipping the 256-entry allowlist, which is
 precisely what it buys: under the escape hatch the remaining linear work is a single sweep, not
 two. Reproduce with `cargo test worst_case_decision_path_measured_cost -- --nocapture`, which
 also asserts both figures fit one invocation's budget, or
