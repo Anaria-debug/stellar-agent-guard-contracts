@@ -60,8 +60,14 @@ jobs:
       - name: Unit + integration tests
         run: cargo test
 
+      - name: Public API documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
       - name: Contract build (wasm32v1-none)
         run: cargo build --release --target wasm32v1-none
+
+      - name: Verify README claims
+        run: scripts/verify-readme.sh
 
       - name: Agent submission tool build (tools/agent-tx)
         run: cargo build --release --manifest-path tools/agent-tx/Cargo.toml
