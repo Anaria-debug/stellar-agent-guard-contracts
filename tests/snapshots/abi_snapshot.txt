@@ -170,6 +170,7 @@ struct RecipientLedger
 23 WindowCapExceeded window_cap_exceeded
 24 ProtocolNotAllowed protocol_not_allowed
 25 FunctionNotAllowed function_not_allowed
+32 AssetFnNotAllowed asset_fn_not_allowed
 26 UnknownContract unknown_contract
 27 SelfFunctionNotAllowed self_function_not_allowed
 28 CreateContractNotAllowed create_contract_not_allowed

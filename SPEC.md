@@ -566,9 +566,34 @@ Rules applied (in order; the denylist is checked before the allowlist/escape hat
 
 An asset contract listed in `assets` invoked with any other function (e.g. `mint`, `burn`,
 `set_admin`, `clawback` — none of which the account should ever call as authorizer) is blocked
-(`FunctionNotAllowed`). Asset addresses *not* listed in `assets` are blocked
+(`AssetFnNotAllowed`). Asset addresses *not* listed in `assets` are blocked
 (`AssetNotAllowed`) — an agent cannot silently move balances on an unregistered SAC. This keeps
 the "we know what we're enforcing" promise exact.
+
+**Measured worst case: evaluation ≈ 338,315 CPU instructions.** Rules 1 and 2 are the only
+steps whose cost depends on a policy list length, and §8 caps every recipient list at
+`MAX_RECIPIENT_ENTRIES = 256`, so the decision path is bounded by construction. Measured in the
+Soroban test environment with both `recipients` and `blocked_recipients` filled to exactly 256
+entries and the transfer destination deliberately in **neither** — the configuration that makes
+the linear sweeps the dominant term:
+
+| Configuration | Instructions | % of the 100,000,000 per-invocation CPU budget |
+|---|---|---|
+| `allow_any_recipient = false` — full 2×256 scan, miss on the last element of each | **338,315** | 0.34% |
+| `allow_any_recipient = true` — denylist swept, rule 2 skipped | 179,674 | 0.18% |
+
+The escape hatch saves 158,641 instructions by skipping the 256-entry allowlist, which is
+precisely what it buys: under the escape hatch the remaining linear work is a single sweep, not
+two. Reproduce with `cargo test worst_case_decision_path_measured_cost -- --nocapture`, which
+also asserts both figures fit one invocation's budget, or
+`cargo run --manifest-path benches/Cargo.toml --bin worst_case_decision_path`. Both drive the
+same `testutils` fixtures (`worst_case_transfer_policy` / `worst_case_transfer_target`), so the
+table and the assertion cannot drift apart. As elsewhere in §3.1/§4.1 these are test-environment
+instruction counts; on-chain cost also carries host overhead, metering, and fee accounting.
+
+This bound covers the *allowlist* worst case only. The rolling window has its own, much larger
+one — a single lazy prune of 8192 stale entries — which is measured separately in §3.1 and
+tracked in [issue #113](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/issues/113).
 
 ### 6.3 Protocol calls — allowlist only (window/pause state still enforced)
 
@@ -666,6 +691,7 @@ To close the CheckResult/Error duality gap, every contract `Error` variant maps 
 | 23 | `WindowCapExceeded` | `window_cap_exceeded` | Yes | Evaluated against rolling window ledger in `check()`. |
 | 24 | `ProtocolNotAllowed` | `protocol_not_allowed` | No | Auth-path only: non-SAC protocol calls do not use `check()`. |
 | 25 | `FunctionNotAllowed` | `function_not_allowed` | No | Auth-path only: restricted functions apply to auth contexts, not `check()`. |
+| 32 | `AssetFnNotAllowed` | `asset_fn_not_allowed` | No | Auth-path only: non-transfer functions on listed SAC contracts. |
 | 26 | `UnknownContract` | `unknown_contract` | No | Auth-path only: unlisted contracts are encountered in auth contexts. |
 | 27 | `SelfFunctionNotAllowed` | `self_function_not_allowed` | No | Auth-path only: self-calls are part of `__check_auth` context dispatch. |
 | 28 | `CreateContractNotAllowed` | `create_contract_not_allowed` | No | Auth-path only: contract creation host functions occur in auth contexts. |
@@ -815,6 +841,7 @@ pub enum Error {            // values stable; see tests/fixtures
     CreateContractNotAllowed = 28,
     RecipientBlocked = 29, ProtocolCallRateExceeded = 30,
     DecisionInvariantViolation = 31,
+    AssetFnNotAllowed = 32,
 }
 ```
 

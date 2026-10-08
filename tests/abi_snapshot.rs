@@ -219,6 +219,7 @@ fn error_by_name(name: &str) -> Option<Error> {
         "WindowCapExceeded" => Error::WindowCapExceeded,
         "ProtocolNotAllowed" => Error::ProtocolNotAllowed,
         "FunctionNotAllowed" => Error::FunctionNotAllowed,
+        "AssetFnNotAllowed" => Error::AssetFnNotAllowed,
         "UnknownContract" => Error::UnknownContract,
         "SelfFunctionNotAllowed" => Error::SelfFunctionNotAllowed,
         "CreateContractNotAllowed" => Error::CreateContractNotAllowed,

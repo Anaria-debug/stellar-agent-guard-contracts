@@ -130,7 +130,7 @@ fn reference_model(row: GateRow, input: ContextInput) -> Decision {
         match input.kind {
             CallKind::SelfCall if !input.self_call_ok => Some(Error::SelfFunctionNotAllowed),
             CallKind::AssetTransfer if !input.valid_detail => Some(Error::InvalidAmount),
-            CallKind::AssetOther => Some(Error::FunctionNotAllowed),
+            CallKind::AssetOther => Some(Error::AssetFnNotAllowed),
             CallKind::Protocol if !input.valid_detail => Some(Error::FunctionNotAllowed),
             CallKind::CreateContract => Some(Error::CreateContractNotAllowed),
             CallKind::Unknown => Some(Error::UnknownContract),

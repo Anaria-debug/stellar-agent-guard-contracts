@@ -21,7 +21,7 @@ vocabulary. For each reason this table gives the seat-specific read:
 > incident noise. SDK middleware that turns the agent column into
 > user-facing messages must reproduce this constraint verbatim.
 
-> **Vocabulary note.** The enum in `src/types.rs` has 22 variants; this table
+> **Vocabulary note.** The enum in `src/types.rs` has 23 variants; this table
 > covers every current policy-decision reason. `decision_invariant_violation`
 > is an internal guard for impossible verdict data and is surfaced as a stable
 > contract error if triggered.
@@ -48,6 +48,7 @@ vocabulary. For each reason this table gives the seat-specific read:
 | `window_cap_exceeded` | 23 | A transfer that would push the rolling-window total over `window_cap`. | Wait for window entries to expire (`window_secs`) before retrying; escalate. Do not re-route spend outside the accounting path to evade the window. | Raise `window_cap` if legitimately needed, or reset cadence expectations. | Rolling cap held over the [T − `window_secs`, T] span (invariant, §3.1). | §3.1, §6.2 |
 | `protocol_not_allowed` | 24 | A call to a contract not in `protocols`. | Only call allowlisted protocol contracts. | Add the protocol to the allowlist if intended. | Protocol allowlist compliance at T. | §6.3 |
 | `function_not_allowed` | 25 | A call to a function not in the protocol's `fns` list. | Only call allowlisted functions. | Extend the per-protocol `fns` list if intended. | Function-level allowlist compliance at T. | §6.3 |
+| `asset_fn_not_allowed` | 32 | A call to a listed SAC function other than `transfer` or `transfer_from`. | Use only the SAC transfer functions supported by the policy; do not attempt a different asset operation. | Use an admin-approved path if the asset operation is intended; the guard does not authorize SAC minting or burning. | Records that a non-transfer function on a listed asset was denied. | §6.2 |
 | `unknown_contract` | 26 | A call to a contract that is neither this account, an allowlisted asset, nor an allowlisted protocol. | Unknown contracts are default-deny in v1; consult `policy()` and do not attempt workarounds. | Allowlist the contract if it should be callable under v1 intent. | Default-deny held at T. | §6.4 |
 | `self_function_not_allowed` | 27 | A call to one of the account's own functions outside the agent-allowed path (only `heartbeat` — and the `check` pre-flight — are agent-facing). | The agent may only call its own `heartbeat`; management functions belong to the admin seat. | Use the admin path for management; align tooling, no contract change needed. | Records the self-call surface being contained to the heartbeat/check path. | §6.1, §7 |
 | `create_contract_not_allowed` | 28 | Authorizing a host `CreateContract` context. | The account never authorizes contract creation in v1 — route creation to a dedicated operator-owned account. | Create contracts from a non-guarded account. | Proves the account never authorizes creation. | §6.4, §7 (enum) |
