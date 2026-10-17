@@ -10,6 +10,12 @@
 //! The ledger now holds a global rolling window plus per-recipient rolling
 //! windows for recipients that carry a cap override in the active policy.
 //!
+//! Per-asset spend caps (SPEC §3.1/§6.2) are enforced by the engine against
+//! the *effective* per-tx cap for the asset being spent. Window accounting
+//! remains a single global rolling window: each asset's spend is admitted to
+//! the same window and compared against that asset's effective cap. Full
+//! per-asset windows are out of scope (see issue).
+//!
 //! Persistent `WindowState` TTL management belongs to the storage boundary in
 //! `lib.rs` (`persist_get`/`save_ledger`); this module transforms only the
 //! in-memory snapshot after storage has loaded it.
@@ -19,6 +25,22 @@ use crate::types::{
 };
 use soroban_sdk::{contracttype, Address, Env};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowMergeKind {
+    GlobalSpend,
+    RecipientSpend,
+    ProtocolCalls,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowMerge {
+    pub kind: WindowMergeKind,
+    pub merged_ts: u64,
+    /// Spend amount, or protocol call count when `kind` is `ProtocolCalls`.
+    pub merged_value: i128,
+}
+
+/// Per-recipient rolling ledger used when a recipient carries a cap override.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientLedger {
@@ -28,6 +50,7 @@ pub struct RecipientLedger {
 }
 
 impl RecipientLedger {
+    /// Create an empty ledger for `recipient`.
     #[allow(clippy::must_use_candidate)]
     fn empty(env: &Env, recipient: Address) -> Self {
         Self {
@@ -38,9 +61,13 @@ impl RecipientLedger {
     }
 }
 
+/// In-memory rolling spend window (SPEC §3.1): the global ledger plus
+/// per-recipient and protocol-call counters, loaded from and saved to `Window`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ledger {
+    /// Cached rolling total (sum of non-expired global entries).
     pub total: i128,
+    /// Chronological global spend entries (oldest first).
     pub entries: soroban_sdk::Vec<SpendEntry>,
     /// Per-recipient rolling windows, populated only for recipients that have a
     /// configured per-recipient cap override. Storage is bounded by the same
@@ -50,9 +77,12 @@ pub struct Ledger {
     pub protocol_call_entries: soroban_sdk::Vec<ProtocolCallEntry>,
     /// Cached rolling total of protocol calls (sum of non-expired entries).
     pub protocol_call_total: u32,
+    /// Ephemeral telemetry accumulated during staged admissions; never persisted.
+    pub merges: alloc::vec::Vec<WindowMerge>,
 }
 
 impl Ledger {
+    /// An empty window with no entries.
     #[allow(clippy::must_use_candidate)]
     pub fn empty(env: &Env) -> Self {
         Self {
@@ -61,6 +91,7 @@ impl Ledger {
             recipients: soroban_sdk::Vec::new(env),
             protocol_call_entries: soroban_sdk::Vec::new(env),
             protocol_call_total: 0,
+            merges: alloc::vec::Vec::new(),
         }
     }
 
@@ -87,6 +118,7 @@ impl Ledger {
             recipients,
             protocol_call_entries: proto_call_info.entries,
             protocol_call_total: proto_call_info.total,
+            merges: alloc::vec::Vec::new(),
         }
     }
 
@@ -113,6 +145,7 @@ impl Ledger {
         }
     }
 
+    /// Number of global spend entries.
     #[allow(clippy::must_use_candidate, clippy::len_without_is_empty)]
     pub fn len(&self) -> u32 {
         self.entries.len()
@@ -144,7 +177,15 @@ impl Ledger {
 
     /// Record a spend against the global window at `now`.
     pub fn admit(&mut self, now: u64, amount: i128) {
-        admit_to_ledger(&mut self.total, &mut self.entries, now, amount);
+        if let Some((merged_ts, merged_value)) =
+            admit_to_ledger(&mut self.total, &mut self.entries, now, amount)
+        {
+            self.merges.push(WindowMerge {
+                kind: WindowMergeKind::GlobalSpend,
+                merged_ts,
+                merged_value,
+            });
+        }
     }
 
     /// Current rolling total for a recipient, or zero if no per-recipient
@@ -170,24 +211,45 @@ impl Ledger {
             if let Some(r) = self.recipients.get(i) {
                 if r.recipient == recipient {
                     let mut updated = r;
-                    admit_to_ledger(&mut updated.total, &mut updated.entries, now, amount);
+                    let merge =
+                        admit_to_ledger(&mut updated.total, &mut updated.entries, now, amount);
                     self.recipients.set(i, updated);
+                    if let Some((merged_ts, merged_value)) = merge {
+                        self.merges.push(WindowMerge {
+                            kind: WindowMergeKind::RecipientSpend,
+                            merged_ts,
+                            merged_value,
+                        });
+                    }
                     return;
                 }
             }
         }
         let mut created = RecipientLedger::empty(env, recipient);
-        admit_to_ledger(&mut created.total, &mut created.entries, now, amount);
+        let merge = admit_to_ledger(&mut created.total, &mut created.entries, now, amount);
         self.recipients.push_back(created);
+        if let Some((merged_ts, merged_value)) = merge {
+            self.merges.push(WindowMerge {
+                kind: WindowMergeKind::RecipientSpend,
+                merged_ts,
+                merged_value,
+            });
+        }
     }
 
     /// Record a protocol call at `now`.
     pub fn admit_protocol_call(&mut self, now: u64) {
-        admit_to_protocol_call_ledger(
+        if let Some((merged_ts, merged_count)) = admit_to_protocol_call_ledger(
             &mut self.protocol_call_total,
             &mut self.protocol_call_entries,
             now,
-        );
+        ) {
+            self.merges.push(WindowMerge {
+                kind: WindowMergeKind::ProtocolCalls,
+                merged_ts,
+                merged_value: i128::from(merged_count),
+            });
+        }
     }
 }
 
@@ -208,12 +270,14 @@ fn ledger_from_entries(env: &Env, mut entries: soroban_sdk::Vec<SpendEntry>) -> 
     }
 }
 
+/// Internal single-window accumulator used while rebuilding totals.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SingleLedger {
     total: i128,
     entries: soroban_sdk::Vec<SpendEntry>,
 }
 
+/// Drop fully-expired entries from a single window and update its total.
 fn prune_entries(
     total: &mut i128,
     entries: &mut soroban_sdk::Vec<SpendEntry>,
@@ -233,12 +297,13 @@ fn prune_entries(
     }
 }
 
+/// Admit `amount` into a single window at `now`, coalescing same-second spends.
 fn admit_to_ledger(
     total: &mut i128,
     entries: &mut soroban_sdk::Vec<SpendEntry>,
     now: u64,
     amount: i128,
-) {
+) -> Option<(u64, i128)> {
     debug_assert!(amount > 0);
     let n = entries.len();
     if n > 0 {
@@ -252,7 +317,7 @@ fn admit_to_ledger(
                     },
                 );
                 *total = total.saturating_add(amount);
-                return;
+                return None;
             }
         }
     }
@@ -266,11 +331,14 @@ fn admit_to_ledger(
         entries.pop_front();
         let newer = entries.first().unwrap_or(SpendEntry { ts: 0, amount: 0 });
         entries.pop_front();
-        entries.push_front(SpendEntry {
+        let merged = SpendEntry {
             ts: newer.ts,
             amount: older.amount.saturating_add(newer.amount),
-        });
+        };
+        entries.push_front(merged.clone());
+        return Some((merged.ts, merged.amount));
     }
+    None
 }
 
 fn prune_protocol_call_entries(
@@ -320,7 +388,7 @@ fn admit_to_protocol_call_ledger(
     total: &mut u32,
     entries: &mut soroban_sdk::Vec<ProtocolCallEntry>,
     now: u64,
-) {
+) -> Option<(u64, u32)> {
     let n = entries.len();
     if n > 0 {
         if let Some(last) = entries.get(n - 1) {
@@ -333,7 +401,7 @@ fn admit_to_protocol_call_ledger(
                     },
                 );
                 *total = total.saturating_add(1);
-                return;
+                return None;
             }
         }
     }
@@ -349,18 +417,39 @@ fn admit_to_protocol_call_ledger(
             .first()
             .unwrap_or(ProtocolCallEntry { ts: 0, count: 0 });
         entries.pop_front();
-        entries.push_front(ProtocolCallEntry {
+        let merged = ProtocolCallEntry {
             ts: newer.ts,
             count: older.count.saturating_add(newer.count),
-        });
+        };
+        entries.push_front(merged.clone());
+        return Some((merged.ts, merged.count));
     }
+    None
 }
 
+/// Unit tests for the rolling-window ledger.
 #[cfg(test)]
 mod tests {
+    #![allow(unused_must_use)] // helper return values are asserted in backstop-specific tests
     use super::*;
+
+    #[test]
+    fn ledger_second_changes_window_membership_at_boundary() {
+        let env = Env::default();
+        let mut ledger = Ledger::empty(&env);
+        ledger.admit(100, 7);
+
+        ledger.prune(100, 1);
+        assert_eq!(ledger.total, 7);
+
+        // With a one-second window, timestamp t expires when now reaches t+1.
+        ledger.prune(101, 1);
+        assert_eq!(ledger.total, 0);
+        assert!(ledger.entries.is_empty());
+    }
     use soroban_sdk::{vec, Address, Env};
 
+    /// Build a `SingleLedger` from a slice of `(ts, amount)` pairs.
     fn led(env: &Env, entries: &[(u64, i128)]) -> SingleLedger {
         let mut v: soroban_sdk::Vec<SpendEntry> = soroban_sdk::Vec::new(env);
         for (ts, amount) in entries {
@@ -372,6 +461,7 @@ mod tests {
         ledger_from_entries(env, v)
     }
 
+    /// Deterministic test address derived from a single byte.
     fn addr(env: &Env, n: u8) -> Address {
         use soroban_sdk::xdr::{ContractId, Hash, ScAddress};
         use soroban_sdk::TryFromVal;
@@ -379,6 +469,7 @@ mod tests {
         Address::try_from_val(env, &sc).unwrap()
     }
 
+    /// Pruning drops only entries whose window has fully elapsed.
     #[test]
     fn prune_drops_only_expired() {
         let env = Env::default();
@@ -389,6 +480,7 @@ mod tests {
         assert_eq!(l.entries.first().unwrap().ts, 200);
     }
 
+    /// Same-second admissions coalesce into a single entry.
     #[test]
     fn admit_coalesces_three_same_second_spends() {
         let env = Env::default();
@@ -406,6 +498,25 @@ mod tests {
         assert_eq!(ledger.entries.get(0).unwrap().amount, 12);
         assert_eq!(ledger.entries.get(1).unwrap().ts, 101);
         assert_eq!(ledger.entries.get(1).unwrap().amount, 6);
+    }
+
+    #[test]
+    fn admit_saturates_rather_than_trapping_near_i128_max() {
+        // Issue #17 defense-in-depth: the ledger helper is a non-trapping
+        // backstop. Even if a caller hands it an amount that pushes the cached
+        // total past the i128 ceiling, it saturates instead of aborting under
+        // `overflow-checks = true` / `panic = "abort"`. The decision engine is
+        // the layer that turns this case into a deliberate stable error.
+        let env = Env::default();
+        let mut total = i128::MAX - 1;
+        let mut entries: soroban_sdk::Vec<SpendEntry> = soroban_sdk::Vec::new(&env);
+        entries.push_back(SpendEntry {
+            ts: 0,
+            amount: total,
+        });
+        admit_to_ledger(&mut total, &mut entries, 1, 10);
+        assert_eq!(total, i128::MAX);
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
@@ -427,6 +538,7 @@ mod tests {
         assert_eq!(ledger.total, 18);
     }
 
+    /// The window is genuinely rolling, not bucket-aligned.
     #[test]
     fn window_is_genuinely_rolling() {
         let env = Env::default();
@@ -440,6 +552,7 @@ mod tests {
         assert_eq!(total, 50);
     }
 
+    /// Entry at `ts + window_secs == now` is exactly expired.
     #[test]
     fn exact_boundary_semantics() {
         let env = Env::default();
@@ -450,6 +563,7 @@ mod tests {
         assert_eq!(total, 0);
     }
 
+    /// Regression: low-timestamp entries must not be wrongly expired.
     #[test]
     fn prune_keeps_recent_entries_at_low_timestamps() {
         // Regression: `now.saturating_sub(window_secs)` clips to 0 at low
@@ -462,6 +576,28 @@ mod tests {
         prune_entries(&mut total, &mut entries, 50, 100); // 50s later; entry is only 50s old -> must survive
         assert_eq!(total, 30);
         assert_eq!(entries.len(), 1);
+    }
+
+    /// Backstop merge is conservative (over-counts) and bounded in size.
+    #[test]
+    fn prune_boundary_is_addition_form_at_zero_timestamp() {
+        // Issue #18: pin the exact expiry boundary. With `now = 0` the
+        // subtraction form `now - window_secs` saturates to 0 and would wrongly
+        // expire an entry recorded at ts 0; the addition form must retain it.
+        let env = Env::default();
+        let mut total = 0i128;
+        let mut entries: soroban_sdk::Vec<SpendEntry> = soroban_sdk::Vec::new(&env);
+
+        admit_to_ledger(&mut total, &mut entries, 0, 7);
+        // 0 + 1 <= 0 is false -> inside the window, retained.
+        prune_entries(&mut total, &mut entries, 0, 1);
+        assert_eq!(total, 7);
+        assert_eq!(entries.len(), 1);
+
+        // Exactly on the boundary: 0 + 1 <= 1 -> expired, per SPEC §3.1.
+        prune_entries(&mut total, &mut entries, 1, 1);
+        assert_eq!(total, 0);
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]
@@ -477,6 +613,44 @@ mod tests {
         assert_eq!(total, (MAX_WINDOW_ENTRIES + 10) as i128);
     }
 
+    /// Rebuilding from entries recomputes the total from scratch.
+    #[test]
+    fn max_window_entries_merges_forward_at_exact_bound() {
+        // Issue #19: the merge backstop must trigger only once the write would
+        // exceed the named bound, keep the newer timestamp, and stay bounded.
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let mut total = 0i128;
+        let mut entries: soroban_sdk::Vec<SpendEntry> = soroban_sdk::Vec::new(&env);
+
+        // Fill to exactly MAX_WINDOW_ENTRIES with distinct seconds: no merge.
+        for i in 0..MAX_WINDOW_ENTRIES as u64 {
+            admit_to_ledger(&mut total, &mut entries, i, 1);
+        }
+        assert_eq!(entries.len() as usize, MAX_WINDOW_ENTRIES);
+        assert_eq!(total, MAX_WINDOW_ENTRIES as i128);
+        assert_eq!(entries.first().unwrap().ts, 0);
+        assert_eq!(
+            entries.get(entries.len() - 1).unwrap().ts,
+            (MAX_WINDOW_ENTRIES - 1) as u64
+        );
+
+        // The next distinct second crosses the bound and merges the two oldest
+        // entries forward into one entry at the NEWER timestamp.
+        admit_to_ledger(&mut total, &mut entries, MAX_WINDOW_ENTRIES as u64, 1);
+        assert_eq!(entries.len() as usize, MAX_WINDOW_ENTRIES);
+        assert_eq!(total, (MAX_WINDOW_ENTRIES + 1) as i128);
+        let head = entries.first().unwrap();
+        assert_eq!(head.ts, 1, "merged ts is the newer of {{0, 1}}");
+        assert_eq!(head.amount, 2, "merged amount is the sum");
+        // The tail and the ascending order are untouched.
+        assert_eq!(entries.get(1).unwrap().ts, 2);
+        assert_eq!(
+            entries.get(entries.len() - 1).unwrap().ts,
+            MAX_WINDOW_ENTRIES as u64
+        );
+    }
+
     #[test]
     fn from_entries_recomputes_total() {
         let env = Env::default();
@@ -488,6 +662,7 @@ mod tests {
         assert_eq!(ledger_from_entries(&env, v).total, 15);
     }
 
+    /// Ledger round-trips through persisted `WindowState`.
     #[test]
     fn ledger_round_trips_through_state() {
         let env = Env::default();
@@ -506,6 +681,7 @@ mod tests {
         assert_eq!(restored.recipients.len(), 2);
     }
 
+    /// Per-recipient ledgers prune in lockstep with the global window.
     #[test]
     fn recipient_ledger_prunes_with_global() {
         let env = Env::default();
@@ -521,6 +697,7 @@ mod tests {
         assert_eq!(ledger.recipient_total(&r), 5);
     }
 
+    /// Per-recipient admissions coalesce same-second spends.
     #[test]
     fn recipient_admit_coalesces_same_second() {
         let env = Env::default();
