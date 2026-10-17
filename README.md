@@ -157,7 +157,7 @@ Tooling can validate this CLI JSON shape against the checked-in
 | `per_tx_cap` | `i128` | per asset-transfer call cap; `0` = disabled |
 | `asset_caps` | `Vec<AssetCap>` | optional per-asset `per_tx_cap` overrides (asset + cap); unlisted assets fall back to the global `per_tx_cap` |
 | `window_secs` | `u64` | rolling window width in seconds (default 86_400) |
-| `window_cap` | `i128` | rolling cap within `window_secs`; `0` = disabled |
+| `window_cap` | `i128` | rolling cap within `window_secs` (shared across all assets in `assets`); `0` = disabled |
 | `assets` | `Vec<Address>` | SAC token contracts whose transfers get parsed and enforced |
 | `protocols` | `Vec<ProtocolRule>` | allowlisted non-asset contracts (`contract` + optional `fns: Option<Vec<Symbol>>`) |
 | `recipients` | `Vec<Address>` | allowed SAC transfer destinations |

@@ -469,6 +469,8 @@ pub fn decide(
                 } else {
                     // Window accounting: global cap plus an optional
                     // per-recipient override keyed by the destination.
+                    // The rolling window aggregates every asset listed in
+                    // `cfg.assets` into a single shared total (`ledger.total`).
                     // Projections are computed first; staging happens only
                     // when this context clears both caps.
                     let recip_cap = recipient_override_cap(cfg, &to);
