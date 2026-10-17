@@ -96,7 +96,7 @@ Full recipient/amount enforcement — spend caps, allowlists, per-transaction li
 git clone https://github.com/aigbagbobila/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 209 tests, isolated (no network)
+cargo test                                      # 211 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only)
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
@@ -648,7 +648,11 @@ Walkthrough, matching the real code path in `src/lib.rs` / `src/engine.rs`:
    ledger time are loaded. No policy stored ⇒ `NoPolicy` — the account is default-deny.
 3. **Account-level gates** (in this order): admin freeze, dead-man switch (grace elapsed
    since last heartbeat), pause, active window. Any one firing rejects the transaction
-   regardless of what the call is.
+   regardless of what the call is. Every context in the transaction is evaluated against
+   the pre-transaction snapshot, so the dead-man gate evaluates the pre-transaction
+   heartbeat for every context in the transaction, including the heartbeat self-call — a
+   bundle of `[heartbeat, transfer]` against an expired account is judged against the
+   expired state and blocked, never updating `LastHeartbeat`.
 4. **Per-context classification.** `parse_call` turns each `Context` into a typed call:
    `SelfCall` (only `heartbeat` is allowed), `CreateContract` (denied in v1),
    `Unknown`/`AssetOther` (denied), `AssetTransfer` (a known SAC transfer with parsed
@@ -814,11 +818,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-209 tests (unit + integration) cover the policy decision engine — including the regression
+211 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `209 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `211 passed; 0 failed`.
 
 ```bash
 cargo test

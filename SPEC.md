@@ -425,7 +425,7 @@ prose is a semantics call for a maintainer, not a doc-generation side effect.
 
 Note the dead-man auto-freeze (`#2`) applies even to `heartbeat` from the registered key: a
 heartbeat arriving after the grace window expired cannot revive the account — revival is the
-admin's `unfreeze` (§7). This is the precise freeze/reversal boundary.
+admin's `unfreeze` (§7). This is the precise freeze/reversal boundary. The dead-man gate is evaluated against the pre-transaction heartbeat for every context in the transaction, including the heartbeat self-call.
 
 ### 4.1 Gate cost order (measured)
 
