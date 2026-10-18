@@ -534,7 +534,7 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
             VecM::try_from(vec![build_auth_entry(
                 &args.guard,
                 &invocation,
-                seq,
+                fresh_auth_nonce(latest),
                 sig_exp,
                 &network_id,
                 agent,
@@ -652,13 +652,10 @@ fn invoke_op(invocation: &InvokeContractArgs, auth: VecM<SorobanAuthorizationEnt
 /// over the `HashIdPreimage::SorobanAuthorization` payload. This is the same
 /// payload the host hands to `__check_auth`.
 ///
-/// The nonce must be a value this address has never used before: the host
-/// records every consumed nonce in ledger state (`(address, LedgerKeyNonce)`)
-/// and rejects replays ("nonce already exists for address"). The guard's own
-/// `__check_auth` ignores nonces, but the *token contract's* `require_auth`
-/// on the inner call still enforces them, so each transaction needs a fresh
-/// one. The agent's strictly-increasing tx sequence is unique per transaction
-/// and never reused, so it doubles as the auth nonce.
+/// The nonce must be one this address has no live record of: the host records
+/// every consumed nonce in ledger state (`(address, LedgerKeyNonce)`) until
+/// the entry's signature expiration and rejects replays ("nonce already
+/// exists for address"). See [`auth_nonce`] for how it is chosen.
 fn build_auth_entry(
     guard: &ScAddress,
     invocation: &InvokeContractArgs,
@@ -692,6 +689,37 @@ fn build_auth_entry(
             sub_invocations: VecM::default(),
         },
     }
+}
+
+/// The guard auth nonce: the latest ledger sequence in the high 32 bits and
+/// 32 bits of entropy in the low 32 (the bit pattern, reinterpreted as `i64`).
+///
+/// Replay argument. Replay protection is the host's: a consumed nonce stays
+/// recorded for the guard address until the entry's signature expiration
+/// ledger, and a second use while recorded is rejected. That holds for any
+/// nonce choice, so the choice only affects liveness — a collision makes a
+/// fresh transaction fail spuriously, never makes a signed one run twice.
+///
+/// Collision argument. Ledger sequences never repeat, so nonces drawn in
+/// different ledgers differ in their high half and cannot collide. Two drawn
+/// in the same ledger collide only if their entropy matches: 2^-32 per pair.
+/// Nothing depends on the transaction sequence, which the previous scheme
+/// reused as the nonce: a retry after an attempt that never consumed its
+/// sequence (a `txBAD_SEQ`, a rejected or dropped submission) or one that
+/// did (a failed apply) draws a new nonce either way. Nonces from that older
+/// scheme carry the agent account's *creation* ledger in their high half
+/// (Stellar starts an account's sequence at `ledger << 32`), which is always
+/// below the current ledger, so the two schemes cannot overlap either.
+fn auth_nonce(latest_ledger: u32, entropy: u32) -> i64 {
+    ((u64::from(latest_ledger) << 32) | u64::from(entropy)) as i64
+}
+
+/// [`auth_nonce`] with the low half drawn from the OS's secure RNG.
+fn fresh_auth_nonce(latest_ledger: u32) -> i64 {
+    let mut entropy = [0u8; 4];
+    getrandom::getrandom(&mut entropy)
+        .unwrap_or_else(|e| exit_with(format!("cannot draw an auth nonce: OS RNG failed: {e}")));
+    auth_nonce(latest_ledger, u32::from_le_bytes(entropy))
 }
 
 fn sign_envelope(
@@ -778,14 +806,14 @@ fn run(call: &Call, args: &Args) {
     let latest = args.rpc.latest_ledger();
     let sig_exp = latest.saturating_add(10_000);
 
-    // Build the call and the guard's auth entry (agent-signed) once. The tx
-    // sequence doubles as the auth nonce (fresh per transaction, never
-    // reused), keeping the SAC's replay protection satisfied.
+    // Build the call and the guard's auth entry (agent-signed) once, so the
+    // simulated and the submitted transaction carry the same nonce. It is
+    // drawn per invocation, independent of the tx sequence (see `auth_nonce`).
     let invocation = call.invocation(guard);
     let auth = VecM::try_from(vec![build_auth_entry(
         guard,
         &invocation,
-        seq,
+        fresh_auth_nonce(latest),
         sig_exp,
         &network_id,
         &agent,
@@ -1463,6 +1491,8 @@ mod tests {
         sequence_reads: std::cell::Cell<u32>,
         simulations: std::cell::Cell<u32>,
         response: serde_json::Value,
+        ledger: std::cell::Cell<u32>,
+        envelopes: std::cell::RefCell<Vec<String>>,
     }
 
     impl PreflightRpc for MockPreflightRpc {
@@ -1472,11 +1502,12 @@ mod tests {
         }
 
         fn latest_ledger(&self) -> u32 {
-            100
+            self.ledger.get()
         }
 
-        fn simulate(&self, _envelope: &str) -> serde_json::Value {
+        fn simulate(&self, envelope: &str) -> serde_json::Value {
             self.simulations.set(self.simulations.get() + 1);
+            self.envelopes.borrow_mut().push(envelope.to_string());
             self.response.clone()
         }
 
@@ -1536,6 +1567,104 @@ mod tests {
         assert_eq!(rpc.sequence_reads.get(), 1);
         assert_eq!(rpc.simulations.get(), 1);
         assert_eq!(rpc.sequence.get(), 7);
+    }
+
+    // ── Guard auth nonce (issue #384) ────────────────────────────────────
+
+    /// The nonce of the guard auth entry in each envelope the mock simulated.
+    fn simulated_nonces(rpc: &MockPreflightRpc) -> Vec<i64> {
+        rpc.envelopes
+            .borrow()
+            .iter()
+            .map(|b64| {
+                let TransactionEnvelope::Tx(env) = xdr::<TransactionEnvelope>(b64) else {
+                    panic!("unexpected envelope variant");
+                };
+                let OperationBody::InvokeHostFunction(op) = &env.tx.operations[0].body else {
+                    panic!("not an invoke operation");
+                };
+                let SorobanCredentials::Address(creds) = &op.auth[0].credentials else {
+                    panic!("guard auth entry missing");
+                };
+                creds.nonce
+            })
+            .collect()
+    }
+
+    fn signed_preflight_args() -> Args {
+        Args {
+            rpc: Rpc { url: String::new() },
+            passphrase: Network::Testnet.passphrase().to_string(),
+            guard: VALID_GUARD.parse().unwrap(),
+            secret: Some(VALID_SECRET.to_string()),
+            expect_blocked: false,
+        }
+    }
+
+    #[test]
+    fn auth_nonce_is_the_ledger_over_the_entropy() {
+        let nonce = auth_nonce(65_008_194, 0xdead_beef);
+        assert_eq!((nonce as u64) >> 32, 65_008_194);
+        assert_eq!(nonce as u64 & 0xffff_ffff, 0xdead_beef);
+        // Injective: any change to either half changes the nonce.
+        assert_ne!(auth_nonce(7, 1), auth_nonce(7, 2));
+        assert_ne!(auth_nonce(7, 1), auth_nonce(8, 1));
+        // Past ledger 2^31 the bit pattern wraps negative but stays distinct.
+        assert_ne!(auth_nonce(u32::MAX, 0), auth_nonce(u32::MAX - 1, 0));
+    }
+
+    #[test]
+    fn two_submissions_in_the_same_ledger_get_distinct_nonces() {
+        let rpc = MockPreflightRpc {
+            sequence: std::cell::Cell::new(7),
+            ledger: std::cell::Cell::new(5_000),
+            response: serde_json::json!({ "minResourceFee": "200" }),
+            ..Default::default()
+        };
+        let args = signed_preflight_args();
+        preflight(&Call::Heartbeat, &args, &rpc).unwrap();
+        preflight(&Call::Heartbeat, &args, &rpc).unwrap();
+
+        let nonces = simulated_nonces(&rpc);
+        assert_eq!(nonces.len(), 2);
+        // Fails with probability 2^-32: two equal 32-bit draws.
+        assert_ne!(nonces[0], nonces[1], "same-ledger nonces collided");
+        for nonce in nonces {
+            assert_eq!((nonce as u64) >> 32, 5_000, "ledger is the high half");
+        }
+    }
+
+    #[test]
+    fn a_retry_after_a_failed_attempt_draws_a_fresh_nonce() {
+        // Attempt one is blocked/fails before its sequence is consumed, so the
+        // retry runs at the *same* sequence (7 -> 8). Under the old scheme the
+        // nonce was that sequence, so both attempts carried nonce 8.
+        let rpc = MockPreflightRpc {
+            sequence: std::cell::Cell::new(7),
+            ledger: std::cell::Cell::new(5_000),
+            response: serde_json::json!({
+                "error": { "code": "simulation", "message": "failed", "data": {} }
+            }),
+            ..Default::default()
+        };
+        let args = signed_preflight_args();
+        assert_eq!(preflight(&Call::Heartbeat, &args, &rpc), Err(1));
+        assert_eq!(rpc.sequence.get(), 7, "the failed attempt consumed nothing");
+
+        // The retry lands a ledger later at the same sequence.
+        rpc.ledger.set(5_001);
+        assert_eq!(preflight(&Call::Heartbeat, &args, &rpc), Err(1));
+
+        let nonces = simulated_nonces(&rpc);
+        assert_eq!(nonces.len(), 2);
+        assert_ne!(nonces[0], nonces[1]);
+        assert!(
+            nonces.iter().all(|&n| n != 8),
+            "nonce must not be the sequence"
+        );
+        // Different ledgers: disjoint high halves, so no collision is possible.
+        assert_eq!((nonces[0] as u64) >> 32, 5_000);
+        assert_eq!((nonces[1] as u64) >> 32, 5_001);
     }
 
     // ── Input validation and network presets (issues #52, #54) ───────────
