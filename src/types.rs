@@ -741,15 +741,20 @@ mod tests {
         let keys = every_data_key();
         for (i, key) in keys.iter().enumerate() {
             let val: Val = key.clone().into_val(&env);
-            let scval = ScVal::try_from_val(&env, &val).expect("DataKey converts to ScVal");
+            let scval = ScVal::try_from_val(&env, &val)
+                .unwrap_or_else(|err| panic!("DataKey {key:?} does not convert to ScVal: {err:?}"));
             let ScVal::Vec(Some(parts)) = &scval else {
                 panic!("DataKey {key:?} is not encoded as an ScVec: {scval:?}");
             };
             let [ScVal::Symbol(name)] = parts.as_slice() else {
                 panic!("DataKey {key:?} is not a unit variant [Symbol]: {scval:?}");
             };
-            let name = name.to_utf8_string().expect("variant symbol is utf8");
-            let xdr = scval.to_xdr(Limits::none()).expect("ScVal XDR");
+            let name = name
+                .to_utf8_string()
+                .unwrap_or_else(|err| panic!("DataKey {key:?} symbol is not utf8: {err:?}"));
+            let xdr = scval
+                .to_xdr(Limits::none())
+                .unwrap_or_else(|err| panic!("DataKey {key:?} does not encode to XDR: {err:?}"));
             let hex: String = xdr.iter().fold(String::new(), |mut s, b| {
                 let _ = write!(s, "{b:02x}");
                 s
