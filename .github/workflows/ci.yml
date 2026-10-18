@@ -72,6 +72,12 @@ jobs:
       - name: Agent submission tool build (tools/agent-tx)
         run: cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 
+      # agent-tx is a separate cargo project, so the root `cargo test` never
+      # runs its suite. It must run here: it holds the check that agent-tx's
+      # footprint keys still match the contract's `DataKey` encoding (#383).
+      - name: Agent submission tool tests (tools/agent-tx)
+        run: cargo test --manifest-path tools/agent-tx/Cargo.toml
+
   # Issue #67: the released artifact ships with a SHA-256 that downstream
   # bytecode verification pins, so "two clean builds of this commit agree"
   # has to be a checked property, not an assumption. Separate job from `ci`
