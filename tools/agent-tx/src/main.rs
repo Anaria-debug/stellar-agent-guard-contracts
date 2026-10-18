@@ -40,6 +40,7 @@ mod strkey;
 use ed25519_dalek::{Signer, SigningKey};
 use network::{Endpoint, Network};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use stellar_xdr::*;
 use strkey::KeyKind;
 
@@ -218,8 +219,89 @@ fn contract_strkey(id: &[u8; 32]) -> String {
 
 // ── RPC ──────────────────────────────────────────────────────────────────
 
+/// Per-request RPC timeout when `--rpc-timeout` is not given. It bounds the
+/// whole request — connect, send, and reading the response — so a stalled or
+/// black-holed endpoint fails the invocation instead of hanging it.
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct Rpc {
     url: String,
+    timeout: Duration,
+    agent: ureq::Agent,
+}
+
+/// Why an RPC request produced no usable result.
+#[derive(Debug)]
+enum RpcError {
+    /// No complete response within the timeout (connect, send, or read).
+    Timeout {
+        method: String,
+        url: String,
+        after: Duration,
+    },
+    /// The request could not be made or was refused: DNS, connection, TLS,
+    /// or an HTTP error status.
+    Transport {
+        method: String,
+        url: String,
+        detail: String,
+    },
+    /// The endpoint answered with something that is not a JSON-RPC response.
+    BadResponse { method: String, detail: String },
+    /// The endpoint answered with a JSON-RPC `error` object.
+    JsonRpc { method: String, error: String },
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout { method, url, after } => write!(
+                f,
+                "RPC {method} to {url} timed out after {}s without a response. The endpoint \
+                 may be down or overloaded: retry, raise --rpc-timeout <secs>, or pick another \
+                 endpoint with --network/--rpc-url",
+                after.as_secs_f64()
+            ),
+            Self::Transport {
+                method,
+                url,
+                detail,
+            } => write!(
+                f,
+                "RPC {method} to {url} failed: {detail}. Check the URL (--network/--rpc-url) \
+                 and the network connection"
+            ),
+            Self::BadResponse { method, detail } => {
+                write!(f, "RPC {method} returned an unreadable response: {detail}")
+            }
+            Self::JsonRpc { method, error } => write!(f, "RPC {method} error: {error}"),
+        }
+    }
+}
+
+impl RpcError {
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout { .. })
+    }
+}
+
+/// Whether an error, or anything in its source chain, is an I/O timeout.
+/// ureq reports its overall timeout as `io::ErrorKind::TimedOut` (and some
+/// platforms surface a socket read timeout as `WouldBlock`).
+fn is_io_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
 }
 
 trait PreflightRpc {
@@ -230,23 +312,83 @@ trait PreflightRpc {
 }
 
 impl Rpc {
-    fn post(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+    fn new(url: String, timeout: Duration) -> Self {
+        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+        Self {
+            url,
+            timeout,
+            agent,
+        }
+    }
+
+    /// One JSON-RPC request, bounded by the timeout, with every failure
+    /// classified rather than panicking.
+    fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
             "params": params,
         });
-        let resp = ureq::post(&self.url)
+        let timeout = || RpcError::Timeout {
+            method: method.to_string(),
+            url: self.url.clone(),
+            after: self.timeout,
+        };
+        let resp = match self
+            .agent
+            .post(&self.url)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string())
-            .unwrap_or_else(|e| panic!("RPC {method} request failed: {e}"));
+        {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(code, resp)) => {
+                return Err(RpcError::Transport {
+                    method: method.to_string(),
+                    url: self.url.clone(),
+                    detail: format!("HTTP {code} {}", resp.status_text()),
+                })
+            }
+            Err(ureq::Error::Transport(t)) if is_io_timeout(&t) => return Err(timeout()),
+            Err(ureq::Error::Transport(t)) => {
+                return Err(RpcError::Transport {
+                    method: method.to_string(),
+                    url: self.url.clone(),
+                    detail: t.to_string(),
+                })
+            }
+        };
+        // The timeout also bounds reading the body: a server that sends
+        // headers and then stalls ends here, not in a hang.
+        let text = resp.into_string().map_err(|e| {
+            if is_io_timeout(&e) {
+                timeout()
+            } else {
+                RpcError::BadResponse {
+                    method: method.to_string(),
+                    detail: e.to_string(),
+                }
+            }
+        })?;
         let json: serde_json::Value =
-            serde_json::from_reader(resp.into_reader()).expect("RPC response JSON");
+            serde_json::from_str(&text).map_err(|e| RpcError::BadResponse {
+                method: method.to_string(),
+                detail: e.to_string(),
+            })?;
         if let Some(err) = json.get("error") {
-            panic!("RPC {method} error: {err}");
+            return Err(RpcError::JsonRpc {
+                method: method.to_string(),
+                error: err.to_string(),
+            });
         }
-        json["result"].clone()
+        Ok(json["result"].clone())
+    }
+
+    /// [`Rpc::call`] for paths with nothing to recover: a failure ends the
+    /// invocation with exit code 1 and the classified, actionable message.
+    fn post(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.call(method, params)
+            .unwrap_or_else(|e| exit_with(e.to_string()))
     }
 
     fn latest_ledger(&self) -> u32 {
@@ -282,15 +424,15 @@ impl Rpc {
         )
     }
 
-    fn send(&self, envelope: &str) -> serde_json::Value {
-        self.post(
+    fn send(&self, envelope: &str) -> Result<serde_json::Value, RpcError> {
+        self.call(
             "sendTransaction",
             serde_json::json!({ "transaction": envelope }),
         )
     }
 
-    fn get_tx(&self, hash: &str) -> serde_json::Value {
-        self.post("getTransaction", serde_json::json!({ "hash": hash }))
+    fn get_tx(&self, hash: &str) -> Result<serde_json::Value, RpcError> {
+        self.call("getTransaction", serde_json::json!({ "hash": hash }))
     }
 }
 
@@ -722,6 +864,17 @@ fn fresh_auth_nonce(latest_ledger: u32) -> i64 {
     auth_nonce(latest_ledger, u32::from_le_bytes(entropy))
 }
 
+/// The transaction hash: SHA-256 over `network_id || ENVELOPE_TYPE_TX || tx`.
+/// It is what the agent signs and what the network reports the tx under.
+fn tx_hash(tx: &Transaction, network_id: &[u8; 32]) -> [u8; 32] {
+    let tx_xdr = tx.to_xdr(Limits::none()).expect("tx XDR");
+    let mut msg = Vec::with_capacity(36 + tx_xdr.len());
+    msg.extend_from_slice(network_id);
+    msg.extend_from_slice(&(EnvelopeType::Tx as i32).to_be_bytes());
+    msg.extend_from_slice(&tx_xdr);
+    Sha256::digest(&msg).into()
+}
+
 fn sign_envelope(
     env: &TransactionEnvelope,
     network_id: &[u8; 32],
@@ -734,12 +887,7 @@ fn sign_envelope(
         other => panic!("unexpected envelope variant {other:?}"),
     };
     debug_assert!(signatures.is_empty());
-    let tx_xdr = tx.to_xdr(Limits::none()).expect("tx XDR");
-    let mut msg = Vec::with_capacity(36 + tx_xdr.len());
-    msg.extend_from_slice(network_id);
-    msg.extend_from_slice(&(EnvelopeType::Tx as i32).to_be_bytes());
-    msg.extend_from_slice(&tx_xdr);
-    let digest: [u8; 32] = Sha256::digest(&msg).into();
+    let digest = tx_hash(tx, network_id);
     let sig = agent.sign(&digest).to_bytes();
     let pubkey = agent.verifying_key().to_bytes();
     let mut hint = [0u8; 4];
@@ -926,7 +1074,22 @@ fn run(call: &Call, args: &Args) {
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!("envelope: {}", b64_encode_xdr(&env2));
     }
-    let sent = args.rpc.send(&b64_encode_xdr(&env2));
+    let sent = match args.rpc.send(&b64_encode_xdr(&env2)) {
+        Ok(sent) => sent,
+        Err(e) if e.is_timeout() => {
+            // The endpoint may have relayed the tx before stalling. Name the
+            // hash so the operator checks it before resubmitting.
+            let TransactionEnvelope::Tx(v1) = &env2 else {
+                unreachable!("sign_envelope builds a v1 envelope")
+            };
+            exit_with(format!(
+                "{e}. The transaction may still have been accepted: check tx {} (getTransaction) \
+                 before resubmitting",
+                hex::encode(tx_hash(&v1.tx, &network_id))
+            ))
+        }
+        Err(e) => exit_with(e.to_string()),
+    };
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!("send response: {sent}");
     }
@@ -946,9 +1109,18 @@ fn run(call: &Call, args: &Args) {
     let status = sent["status"].as_str().unwrap_or("?").to_string();
     println!("submitted: hash={hash} status={status}");
 
+    // Each poll is bounded by the RPC timeout, so the loop is bounded by
+    // 20 × (3 s + timeout). A poll that times out counts as still pending.
     for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let gt = args.rpc.get_tx(&hash);
+        std::thread::sleep(Duration::from_secs(3));
+        let gt = match args.rpc.get_tx(&hash) {
+            Ok(gt) => gt,
+            Err(e) if e.is_timeout() => {
+                eprintln!("{e}; still polling tx={hash}");
+                continue;
+            }
+            Err(e) => exit_with(e.to_string()),
+        };
         let st = gt["status"].as_str().unwrap_or("PENDING");
         if st == "SUCCESS" {
             println!("RESULT: ALLOWED tx={hash}");
@@ -1087,9 +1259,11 @@ fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
     let mut network = None;
     let mut rpc_url = None;
     let mut passphrase = None;
+    let mut rpc_timeout = None;
     let mut positionals: Vec<String> = Vec::new();
     while let Some(token) = cli.next() {
         match token.as_str() {
+            "--rpc-timeout" => rpc_timeout = Some(parse_rpc_timeout(&cli.value("--rpc-timeout")?)?),
             "--network" => network = Some(cli.value("--network")?),
             "--rpc-url" => rpc_url = Some(cli.value("--rpc-url")?),
             "--network-passphrase" => passphrase = Some(cli.value("--network-passphrase")?),
@@ -1118,9 +1292,7 @@ fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
             .or(positionals.get(1).map(String::as_str)),
     )?;
 
-    let rpc = Rpc {
-        url: endpoint.rpc_url,
-    };
+    let rpc = Rpc::new(endpoint.rpc_url, rpc_timeout.unwrap_or(DEFAULT_RPC_TIMEOUT));
     verify_guard(&rpc, &address, &endpoint.passphrase)?;
 
     let mut reg = load_registry();
@@ -1525,7 +1697,7 @@ mod tests {
             ..Default::default()
         };
         let args = Args {
-            rpc: Rpc { url: String::new() },
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
             guard: "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7"
                 .parse()
@@ -1554,7 +1726,7 @@ mod tests {
             ..Default::default()
         };
         let args = Args {
-            rpc: Rpc { url: String::new() },
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
             guard: "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7"
                 .parse()
@@ -1567,6 +1739,103 @@ mod tests {
         assert_eq!(rpc.sequence_reads.get(), 1);
         assert_eq!(rpc.simulations.get(), 1);
         assert_eq!(rpc.sequence.get(), 7);
+    }
+
+    // ── RPC timeout (issue #385) ─────────────────────────────────────────
+
+    /// A loopback endpoint that accepts connections, optionally writes
+    /// `preamble`, and then never answers — a black-holed RPC.
+    fn hung_endpoint(preamble: &'static [u8]) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.write_all(preamble);
+                let _ = stream.flush();
+                held.push(stream); // keep it open, never respond
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        url
+    }
+
+    #[test]
+    fn a_hung_endpoint_times_out_with_an_error_naming_the_method() {
+        let rpc = Rpc::new(hung_endpoint(b""), Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let err = rpc
+            .call("getLatestLedger", serde_json::json!({}))
+            .expect_err("a silent endpoint must not produce a result");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded by the timeout"
+        );
+        assert!(
+            matches!(&err, RpcError::Timeout { method, .. } if method == "getLatestLedger"),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("getLatestLedger"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("--rpc-timeout"), "{message}");
+    }
+
+    #[test]
+    fn a_stall_after_the_headers_is_also_a_timeout() {
+        let preamble =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{";
+        let rpc = Rpc::new(hung_endpoint(preamble), Duration::from_millis(300));
+        let err = rpc
+            .call("simulateTransaction", serde_json::json!({}))
+            .expect_err("a truncated body must not produce a result");
+        assert!(
+            matches!(&err, RpcError::Timeout { method, .. } if method == "simulateTransaction"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_transport_error_not_a_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+        let err = Rpc::new(url, Duration::from_secs(5))
+            .call("getLatestLedger", serde_json::json!({}))
+            .expect_err("nothing is listening");
+        assert!(matches!(err, RpcError::Transport { .. }), "{err:?}");
+        assert!(!err.is_timeout());
+    }
+
+    #[test]
+    fn a_responsive_endpoint_is_unaffected_by_the_timeout() {
+        let mock = MockRpc::start();
+        let result = Rpc::new(mock.url.clone(), Duration::from_secs(5))
+            .call("getLatestLedger", serde_json::json!({}))
+            .expect("mock answers");
+        assert_eq!(result["sequence"], 1);
+    }
+
+    #[test]
+    fn rpc_timeout_flag_sets_the_request_timeout() {
+        let args = argv(&["--guard", VALID_GUARD]);
+        let request = parse_request("status", &args).expect("default");
+        assert_eq!(request.rpc_timeout, DEFAULT_RPC_TIMEOUT);
+
+        let args = argv(&["--guard", VALID_GUARD, "--rpc-timeout", "5"]);
+        let request = parse_request("status", &args).expect("explicit timeout");
+        assert_eq!(request.rpc_timeout, Duration::from_secs(5));
+        assert_eq!(request.rpc().timeout, Duration::from_secs(5));
+
+        for bad in ["0", "-1", "1.5", "soon"] {
+            let args = argv(&["--guard", VALID_GUARD, "--rpc-timeout", bad]);
+            let err = parse_request("status", &args).expect_err(bad);
+            assert!(err.contains("invalid --rpc-timeout"), "{err}");
+        }
     }
 
     // ── Guard auth nonce (issue #384) ────────────────────────────────────
@@ -1593,7 +1862,7 @@ mod tests {
 
     fn signed_preflight_args() -> Args {
         Args {
-            rpc: Rpc { url: String::new() },
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
             guard: VALID_GUARD.parse().unwrap(),
             secret: Some(VALID_SECRET.to_string()),
@@ -2159,6 +2428,15 @@ fn validate_address(field: &str, kind: KeyKind, value: &str) -> Result<ScAddress
     })
 }
 
+fn parse_rpc_timeout(raw: &str) -> Result<Duration, String> {
+    match raw.parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "invalid --rpc-timeout '{raw}': expected a whole number of seconds greater than 0"
+        )),
+    }
+}
+
 fn parse_amount(raw: &str) -> Result<i128, String> {
     raw.parse::<i128>().map_err(|e| {
         format!("invalid --amount '{raw}': {e}; expected a signed integer in whole units")
@@ -2176,6 +2454,7 @@ struct Request {
     amount: Option<i128>,
     secret: Option<String>,
     endpoint: Endpoint,
+    rpc_timeout: Duration,
     expect_blocked: bool,
 }
 
@@ -2187,9 +2466,7 @@ impl Request {
     }
 
     fn rpc(&self) -> Rpc {
-        Rpc {
-            url: self.endpoint.rpc_url.clone(),
-        }
+        Rpc::new(self.endpoint.rpc_url.clone(), self.rpc_timeout)
     }
 
     fn args(&self) -> Args {
@@ -2216,6 +2493,7 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     let mut network = None;
     let mut rpc_url = None;
     let mut passphrase = None;
+    let mut rpc_timeout = DEFAULT_RPC_TIMEOUT;
     let mut expect_blocked = false;
 
     while let Some(flag) = cli.next() {
@@ -2234,6 +2512,7 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
             "--network" => network = Some(cli.value("--network")?),
             "--rpc-url" => rpc_url = Some(cli.value("--rpc-url")?),
             "--network-passphrase" => passphrase = Some(cli.value("--network-passphrase")?),
+            "--rpc-timeout" => rpc_timeout = parse_rpc_timeout(&cli.value("--rpc-timeout")?)?,
             "--expect-blocked" => expect_blocked = true,
             other => return Err(cli.unknown(other)),
         }
@@ -2305,6 +2584,7 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
         amount,
         secret,
         endpoint,
+        rpc_timeout,
         expect_blocked,
     })
 }
@@ -2334,6 +2614,11 @@ fn print_help() {
     println!("                                        refused together with an explicit --network");
     println!("  --network-passphrase <passphrase>     override the preset's passphrase (advanced:");
     println!("                                        private or non-standard networks)");
+    println!(
+        "  --rpc-timeout <secs>                  per-request RPC timeout (default: {}s); a",
+        DEFAULT_RPC_TIMEOUT.as_secs()
+    );
+    println!("                                        timeout exits 1 naming the RPC method");
     println!(
         "  Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr."
     );

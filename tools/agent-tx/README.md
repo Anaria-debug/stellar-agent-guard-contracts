@@ -30,6 +30,13 @@ agent-tx status --guard C... --network futurenet
   still signs the mainnet payload.
 - `--network-passphrase <phrase>` overrides the passphrase (a local
   `stellar standalone` network, a fork).
+- `--rpc-timeout <secs>` bounds every RPC request (connect, send, and reading the
+  response; default 30). A stalled endpoint ends the invocation with exit code 1
+  and a message naming the RPC method, instead of hanging. A timed-out
+  `getTransaction` poll counts as still pending; a timed-out `sendTransaction`
+  prints the locally computed tx hash so you can check it before resubmitting.
+  The tool does not retry on its own: retries belong to the caller (see the
+  Troubleshooting table).
 - Selecting mainnet prints a one-line reminder on stderr that this contract is
   unaudited and gates real funds; see the repository [SECURITY.md](../../SECURITY.md).
 
