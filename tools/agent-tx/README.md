@@ -133,6 +133,13 @@ estimated fee in stroops, and `broadcast: no`. The fee estimate is the RPC's
 `minResourceFee`, plus the inclusion fee and the guard-footprint fee allowance;
 actual inclusion costs can differ.
 
+The guard-footprint allowance (`GUARD_KEY_FEE_BUMP`, 100,000 stroops) is a
+refundable ceiling for the guard keys the simulation may not have priced. Its
+derivation from the network's fee schedule (currently about 22,300 stroops worst
+case on mainnet), why it does not grow with the policy's list sizes, and how to
+recognise it running short (`insufficient_refundable_fee`) are documented next
+to the constant in `src/main.rs`.
+
 Every preflight invocation begins with `send=no (preflight only)`, including
 blocked and inconclusive outcomes.
 

@@ -45,6 +45,90 @@ use strkey::KeyKind;
 
 const INCLUSION_FEE: u32 = 100;
 
+// ── Guard-footprint fee allowance (issue #382) ───────────────────────────
+//
+// `GUARD_KEY_FEE_BUMP` is added to both the declared `resource_fee` and the
+// total fee. It is a ceiling, not a price: core charges the non-refundable
+// part of `resource_fee` from the *declared resources*, the refundable part
+// (rent, events, return value) from actual use, and refunds the remainder.
+// Over-provisioning only reserves balance; under-provisioning fails the tx.
+//
+// What it pays for. `merge_guard_footprint` can add up to
+// `GUARD_FOOTPRINT_KEYS` read-write entries the simulation did not declare,
+// so did not price. Each one raises the non-refundable fee by a
+// `fee_write_ledger_entry` and grows the envelope (tx-size and historical
+// fees). Core takes that out of `resource_fee` before computing what is left
+// for refundable charges; unbudgeted, the remainder cannot cover rent and the
+// tx fails with `insufficient_refundable_fee`. On top of that, instruction
+// headroom for `__check_auth` work the simulation under-measures.
+//
+// Derivation, from the mainnet `ConfigSetting` entries read on 2026-10-18 at
+// ledger 65,008,194 (testnet charges half of each; re-read them with
+// `getLedgerEntries` on `ContractLedgerCostV0`/`ContractLedgerCostExtV0`/
+// `ContractBandwidthV0`/`ContractHistoricalDataV0`/`ContractComputeV0`):
+//
+//   write entries   5 keys × 2,500                         = 12,500
+//   envelope bytes  5 keys × ≤128 B × (406 + 4,059) / KiB  =  2,791 (rounded up)
+//   instructions    10,000,000 × 7 / 10,000                =  7,000
+//                                                            ------
+//   worst case at the current schedule                       22,291 stroops
+//
+// The constant stays at 100,000 (≈4.5× that) because the schedule is
+// validator-voted and has historically been several times higher, and unused
+// allowance is refunded. A compile-time assertion below keeps the derivation
+// under the constant if a key is added or an input is raised.
+//
+// It does *not* scale with the policy's list sizes. Longer allowlists make
+// the `Policy` and `Window` entries bigger and `__check_auth` slower, but the
+// signed simulation in `run` executes the real `__check_auth`, so those bytes
+// and instructions are already measured into `minResourceFee`. The merge only
+// changes the *number* of entries, which is fixed by `GuardKey` (four data
+// keys plus the instance), whatever the policy holds.
+//
+// How an operator recognises it is too low: the submission ends in
+// `RESULT: FAILED` with a `resultXdr` decoding to
+// `INVOKE_HOST_FUNCTION_INSUFFICIENT_REFUNDABLE_FEE` (or `sendTransaction`
+// refuses it as `txSOROBAN_INVALID` when even the non-refundable part is
+// short). Re-run with `AGENT_TX_DEBUG=1` to print `footprint merge added N
+// keys` and the `minResourceFee` / `resourceFee` / final-fee breakdown, then
+// update the inputs below from the live `ConfigSetting` entries.
+//
+// Interaction with #381 (declaring read-only guard keys read-only): once only
+// the keys `__check_auth` writes are read-write, the write-entry term covers
+// those keys alone and the read-only ones cost no write fee, so
+// `GUARD_FOOTPRINT_KEYS` in the first term should become the read-write count.
+
+/// Footprint entries `merge_guard_footprint` can add: every `GuardKey` the
+/// auth check reads, plus the guard's instance entry.
+const GUARD_FOOTPRINT_KEYS: i64 = GuardKey::CHECK_AUTH_READS.len() as i64 + 1;
+/// `ContractLedgerCostV0.fee_write_ledger_entry`, stroops per entry.
+const FEE_WRITE_LEDGER_ENTRY: i64 = 2_500;
+/// `ContractBandwidthV0.fee_tx_size1_kb`, stroops per KiB of envelope.
+const FEE_TX_SIZE_1KB: i64 = 406;
+/// `ContractHistoricalDataV0.fee_historical1_kb`, stroops per KiB of envelope.
+const FEE_HISTORICAL_1KB: i64 = 4_059;
+/// `ContractComputeV0.fee_rate_per_instructions_increment`, stroops per
+/// 10,000 instructions.
+const FEE_PER_10K_INSTRUCTIONS: i64 = 7;
+/// Upper bound on one guard `LedgerKey`'s XDR size (checked by a unit test).
+const GUARD_KEY_XDR_BYTES_MAX: i64 = 128;
+/// Instructions of headroom for `__check_auth`: 2.5% of the 400M per-tx limit.
+const CHECK_AUTH_INSTRUCTION_HEADROOM: i64 = 10_000_000;
+
+/// The worst-case cost the allowance must cover, per the derivation above.
+const fn guard_key_fee_floor() -> i64 {
+    let write_entries = GUARD_FOOTPRINT_KEYS * FEE_WRITE_LEDGER_ENTRY;
+    let key_bytes = GUARD_FOOTPRINT_KEYS * GUARD_KEY_XDR_BYTES_MAX;
+    let envelope = (key_bytes * (FEE_TX_SIZE_1KB + FEE_HISTORICAL_1KB) + 1023) / 1024;
+    let instructions = CHECK_AUTH_INSTRUCTION_HEADROOM * FEE_PER_10K_INSTRUCTIONS / 10_000;
+    write_entries + envelope + instructions
+}
+
+/// Stroops added to the declared resource fee and the total fee for the guard
+/// keys the simulation may not have priced. See the derivation above.
+const GUARD_KEY_FEE_BUMP: u32 = 100_000;
+const _: () = assert!(guard_key_fee_floor() <= GUARD_KEY_FEE_BUMP as i64);
+
 // ── strkey (base32 + CRC16-XModem) ───────────────────────────────────────
 
 const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -491,7 +575,7 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
         .expect("simulation minResourceFee")
         .parse()
         .expect("simulation fee");
-    const GUARD_KEY_FEE_BUMP: u32 = 100_000;
+    // Quote what `run` would pay, allowance included (see GUARD_KEY_FEE_BUMP).
     let fee = min_fee
         .saturating_add(INCLUSION_FEE)
         .saturating_add(GUARD_KEY_FEE_BUMP);
@@ -773,12 +857,13 @@ fn run(call: &Call, args: &Args) {
             data.resources.footprint.read_write.len()
         );
     }
-    // Cover the extra write entries (~few hundred stroops each) plus headroom
-    // for `__check_auth`'s extra instructions, which the recording-mode
-    // preflight also under-prices.
-    const GUARD_KEY_FEE_BUMP: i64 = 100_000;
+    // Cover the merged write entries plus `__check_auth` instruction headroom;
+    // the derivation and failure signature are documented at
+    // `GUARD_KEY_FEE_BUMP`.
     data.resources.footprint = merged;
-    data.resource_fee = data.resource_fee.saturating_add(GUARD_KEY_FEE_BUMP);
+    data.resource_fee = data
+        .resource_fee
+        .saturating_add(i64::from(GUARD_KEY_FEE_BUMP));
     let min_fee: u32 = sim["minResourceFee"]
         .as_str()
         .expect("minResourceFee")
@@ -786,7 +871,7 @@ fn run(call: &Call, args: &Args) {
         .expect("fee");
     let fee = min_fee
         .saturating_add(INCLUSION_FEE)
-        .saturating_add(GUARD_KEY_FEE_BUMP as u32);
+        .saturating_add(GUARD_KEY_FEE_BUMP);
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!(
             "minResourceFee: {min_fee}, resourceFee: {}, final fee: {fee}",
@@ -1350,6 +1435,25 @@ mod tests {
                 "agent-tx encodes DataKey::{} differently from the contract",
                 key.variant()
             );
+        }
+    }
+
+    // ── Guard-key fee allowance (issue #382) ─────────────────────────────
+
+    #[test]
+    fn guard_key_fee_allowance_covers_its_derivation() {
+        // The figure the documentation quotes.
+        assert_eq!(GUARD_FOOTPRINT_KEYS, 5);
+        assert_eq!(guard_key_fee_floor(), 22_291);
+        assert!(guard_key_fee_floor() <= i64::from(GUARD_KEY_FEE_BUMP));
+
+        // The per-key byte bound holds for the keys actually declared.
+        let guard: ScAddress = VALID_GUARD.parse().unwrap();
+        let keys = guard_keys(&guard);
+        assert_eq!(keys.len() as i64, GUARD_FOOTPRINT_KEYS);
+        for key in keys {
+            let len = key.to_xdr(Limits::none()).unwrap().len() as i64;
+            assert!(len <= GUARD_KEY_XDR_BYTES_MAX, "{key:?} is {len} bytes");
         }
     }
 
