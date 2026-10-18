@@ -694,9 +694,10 @@ mod tests {
     /// fixture is regenerated.
     fn data_key_storage(key: &DataKey) -> &'static str {
         match key {
-            DataKey::Initialized | DataKey::Admin | DataKey::PendingAdmin | DataKey::AgentPubkey => {
-                "instance"
-            }
+            DataKey::Initialized
+            | DataKey::Admin
+            | DataKey::PendingAdmin
+            | DataKey::AgentPubkey => "instance",
             DataKey::Policy
             | DataKey::Window
             | DataKey::LastHeartbeat
@@ -727,9 +728,9 @@ mod tests {
     /// changes both columns at once.
     fn render_agent_tx_storage_keys() -> std::string::String {
         use core::fmt::Write as _;
-        use std::string::String;
         use soroban_sdk::xdr::{Limits, ScVal, WriteXdr};
         use soroban_sdk::{IntoVal, TryFromVal, Val};
+        use std::string::String;
 
         let env = Env::default();
         let mut out = String::from(
