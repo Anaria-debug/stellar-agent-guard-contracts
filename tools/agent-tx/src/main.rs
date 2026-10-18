@@ -406,11 +406,13 @@ fn guard_keys(guard: &ScAddress) -> Vec<LedgerKey> {
 /// auth-less preflight never executes `__check_auth`, so those keys are
 /// missing from the simulated footprint; without them the enforced
 /// re-simulation cannot run. Merge them in (as read-write; the engine only
-/// writes what it must).
+/// writes what it must). A key the simulation already declared — in either
+/// list — is left where it is: core rejects a footprint that names the same
+/// key twice.
 fn merge_guard_footprint(mut fp: LedgerFootprint, guard: &ScAddress) -> LedgerFootprint {
     let mut rw: Vec<LedgerKey> = fp.read_write.iter().cloned().collect();
     for k in guard_keys(guard) {
-        if !rw.contains(&k) {
+        if !rw.contains(&k) && !fp.read_only.contains(&k) {
             rw.push(k);
         }
     }
@@ -1301,6 +1303,23 @@ mod tests {
         assert_eq!(fp.read_write.to_vec(), expected);
         // Merging into a footprint that already holds the keys adds nothing.
         assert_eq!(merge_guard_footprint(fp.clone(), &guard), fp);
+
+        // Keys the simulation declared read-only stay read-only, never
+        // duplicated into read-write.
+        let policy = guard_data_key(&guard, GuardKey::Policy);
+        let instance = guard_instance_key(&guard);
+        let sim = LedgerFootprint {
+            read_only: VecM::try_from(vec![policy.clone(), instance.clone()]).unwrap(),
+            read_write: VecM::default(),
+        };
+        let merged = merge_guard_footprint(sim, &guard);
+        assert_eq!(
+            merged.read_only.to_vec(),
+            [policy.clone(), instance.clone()]
+        );
+        assert!(!merged.read_write.contains(&policy));
+        assert!(!merged.read_write.contains(&instance));
+        assert_eq!(merged.read_write.len(), 3);
     }
 
     #[test]
