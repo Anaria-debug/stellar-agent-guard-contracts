@@ -5521,3 +5521,323 @@ fn unfreeze_does_not_clear_outside_active_window_until_set_policy() {
     h.heartbeat();
     h.transfer(&recv, 10);
 }
+
+// ── Issues #289/#290/#292: window-preserving `set_policy`, `reset_window`,
+//    dedicated `pause` / `resume`, and the reserved `Unauthorized` code ────
+
+/// Issue #289 (acceptance): spend half the window, then `set_policy` with a
+/// config that changes **only** `paused` — the rolling-window total must be
+/// preserved, not silently zeroed. The kill switch is no longer also a
+/// budget reset.
+#[test]
+fn set_policy_pause_only_edit_preserves_window_total() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_secs = 60;
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+    h.transfer(&recv, 50);
+    assert_eq!(h.stored_window().map(|w| w.total), Some(50));
+
+    // The operator pauses by rewriting the whole config with `paused: true`
+    // — the only pre-#290 way to flip the flag, and the exact footgun the
+    // issue describes.
+    let mut paused = p.clone();
+    paused.paused = true;
+    h.set_policy_enforcing(&paused);
+
+    let window = h
+        .stored_window()
+        .expect("the window entry must survive a pause-only edit");
+    assert_eq!(
+        window.total, 50,
+        "set_policy must preserve the rolling-window total (issue #289)"
+    );
+    assert_eq!(
+        window.entries.len(),
+        1,
+        "no spend entry may be dropped by the edit"
+    );
+    assert_eq!(h.status().window_remaining, Some(50));
+
+    // Behavioural proof, not just a storage assertion: after resuming via
+    // `set_policy`, the prior spend still counts — 50 + 60 exceeds the 100
+    // cap, so the account did not get its budget back.
+    let mut resumed = p;
+    resumed.paused = false;
+    h.set_policy_enforcing(&resumed);
+    assert!(!h.status().paused);
+    h.transfer_expect_blocked(&recv, 60);
+    // …and the window is genuinely live, not disabled: the remainder fits.
+    h.transfer(&recv, 50);
+    assert_eq!(h.status().window_remaining, Some(0));
+}
+
+/// Issue #289: a policy *edit* also leaves the dead-man-switch clock
+/// untouched. Before this change every `set_policy` re-stamped
+/// `LastHeartbeat = now`, so editing a policy silently re-armed a lapsed
+/// dead-man switch — a liveness attestation the agent never gave.
+#[test]
+fn set_policy_edit_does_not_rearm_expired_deadman_clock() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.dms_grace_secs = 100;
+    h.set_time(1_000);
+    h.install_policy(&p); // first install arms the clock: LastHeartbeat = 1_000
+
+    h.set_time(1_200); // 200s of silence > 100s grace
+    assert!(h.status().heartbeat_expired);
+
+    // A routine policy edit (raising the per-tx cap) must not re-arm the
+    // clock: the agent is still silent, so the account must stay expired.
+    let mut widened = p;
+    widened.per_tx_cap = 500;
+    h.set_policy_enforcing(&widened);
+    let st = h.status();
+    assert!(
+        st.heartbeat_expired,
+        "a policy edit must not re-arm a lapsed dead-man switch (issue #289)"
+    );
+    assert_eq!(st.last_heartbeat, 1_000);
+    h.transfer_expect_blocked(&recv, 10);
+
+    // The documented reversal path is still `unfreeze` (SPEC §5.1).
+    h.unfreeze();
+    assert!(!h.status().heartbeat_expired);
+    h.transfer(&recv, 10);
+}
+
+/// Issue #289 (acceptance): the explicit reset path still zeroes the window.
+/// `reset_window` is the admin-attested fresh budget `set_policy` no longer
+/// hands out implicitly; it touches nothing else (policy, revision, DMS
+/// clock) and records the action in the event log.
+#[test]
+fn reset_window_explicitly_zeroes_the_window() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_secs = 60;
+    p.window_cap = 100;
+    h.install_policy(&p);
+    h.set_time(1_000);
+    h.transfer(&recv, 80);
+    assert_eq!(h.stored_window().map(|w| w.total), Some(80));
+    h.transfer_expect_blocked(&recv, 40); // 80 + 40 > 100
+
+    // The explicit reset: an admin op, so re-enable blanket mocking first.
+    // (`env.events().all()` exposes one invocation's log, so the event is
+    // asserted immediately — before any later call replaces the log.)
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).reset_window();
+    assert!(
+        has_event_with_topics(&h.env, "event_window_reset", &["event_window_reset"]),
+        "reset_window must emit window_reset with the SPEC §9 single-topic layout"
+    );
+    assert!(
+        h.stored_window().is_none(),
+        "reset_window must remove the Window entry, not merely stop reading it"
+    );
+    assert_eq!(
+        h.status().window_remaining,
+        Some(100),
+        "headroom must be the full cap again after the explicit reset"
+    );
+    assert_eq!(
+        h.status().policy_revision,
+        1,
+        "reset_window must not advance the policy revision (issue #289)"
+    );
+
+    // Behavioural proof: the full cap is admissible again (a surviving 80
+    // would make 80 + 40 > 100 and block)…
+    h.transfer(&recv, 80);
+    // …and the fresh window is live again, not merely disabled.
+    h.transfer_expect_blocked(&recv, 40);
+}
+
+/// Issue #290 (acceptance): `pause` blocks a signed transfer, `resume`
+/// restores it, and neither call mutates the rolling window or the
+/// dead-man-switch clock — the policy-level kill switch hands out no fresh
+/// budget and no fresh grace.
+#[test]
+fn pause_blocks_signed_transfer_and_resume_restores_it() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.window_secs = 60;
+    p.window_cap = 100;
+    p.dms_grace_secs = 50;
+    h.set_time(1_000);
+    h.install_policy(&p);
+    h.set_time(1_005);
+    h.transfer(&recv, 50);
+    h.set_time(1_010);
+    h.heartbeat();
+    assert_eq!(h.stored_window().map(|w| w.total), Some(50));
+
+    // Pause is an admin op; re-enable blanket mocking after the signed ops.
+    // (`env.events().all()` exposes one invocation's log, so the event is
+    // asserted immediately — before any later call replaces the log.)
+    h.env.mock_all_auths();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    client.pause();
+    assert!(
+        has_event_with_topics(&h.env, "event_paused", &["event_paused"]),
+        "pause must emit paused with the SPEC §9 single-topic layout"
+    );
+    assert_eq!(
+        client.policy().map(|c| c.paused),
+        Some(true),
+        "pause must flip the stored policy's paused flag in place"
+    );
+    assert!(h.status().paused, "status must report the pause");
+
+    // A correctly-signed transfer is now blocked — the signature is valid,
+    // so gate #4 (`paused`) is the only possible explanation.
+    let reason = h.transfer_blocked_reason(&recv, 10);
+    assert!(
+        reason.contains("paused"),
+        "expected `paused`, got ({reason})"
+    );
+
+    // The pause touched neither the window nor the DMS clock: the spend is
+    // still on the ledger and LastHeartbeat is exactly where it was.
+    assert_eq!(
+        h.stored_window().map(|w| w.total),
+        Some(50),
+        "pause must not mutate the rolling window (issue #290)"
+    );
+    assert_eq!(
+        h.status().last_heartbeat,
+        1_010,
+        "pause must not touch the dead-man-switch clock"
+    );
+
+    // Resume restores admissibility — not budget: the transfer is admitted
+    // and counted against the same window (50 + 50 fills the cap exactly).
+    h.env.mock_all_auths();
+    client.resume();
+    assert!(
+        has_event_with_topics(&h.env, "event_resumed", &["event_resumed"]),
+        "resume must emit resumed with the SPEC §9 single-topic layout"
+    );
+    assert_eq!(client.policy().map(|c| c.paused), Some(false));
+    assert!(!h.status().paused);
+    assert_eq!(
+        h.status().last_heartbeat,
+        1_010,
+        "resume must not touch the dead-man-switch clock either"
+    );
+    h.transfer(&recv, 50);
+    assert_eq!(h.status().window_remaining, Some(0));
+    h.transfer_expect_blocked(&recv, 1);
+}
+
+/// Issue #290 (acceptance): `pause` / `resume` are idempotent-safe — calling
+/// twice is not an error — and `PolicyRevision` advances only when the flag
+/// actually flips, so a changing revision means exactly "the effective policy
+/// changed" (SPEC §9, issue #38). Without a policy there is nothing to
+/// pause: both calls fail closed with `NoPolicy`.
+#[test]
+fn pause_resume_are_idempotent_and_require_a_policy() {
+    let h = Harness::new();
+    let mut p = h.base_policy();
+    p.window_secs = 60;
+    p.window_cap = 100;
+    h.install_policy(&p);
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    let revision_after_install = h.status().policy_revision;
+    assert_eq!(revision_after_install, 1, "install is revision 1 (SPEC §3)");
+
+    // First pause: the flag flips, so the revision advances with the event.
+    client.pause();
+    assert_eq!(
+        last_event_revision(&h.env, "event_paused"),
+        revision_after_install + 1
+    );
+
+    // Second pause: not an error; the event still records the admin action,
+    // but the revision is unchanged because the effective policy did not.
+    client.pause();
+    assert_eq!(
+        last_event_revision(&h.env, "event_paused"),
+        revision_after_install + 1,
+        "a redundant pause must not advance the revision (issues #38/#290)"
+    );
+    assert_eq!(h.status().policy_revision, revision_after_install + 1);
+
+    // Same symmetry on the way back up.
+    client.resume();
+    assert_eq!(
+        last_event_revision(&h.env, "event_resumed"),
+        revision_after_install + 2
+    );
+    client.resume();
+    assert_eq!(
+        last_event_revision(&h.env, "event_resumed"),
+        revision_after_install + 2,
+        "a redundant resume must not advance the revision (issues #38/#290)"
+    );
+    assert!(!client.policy().expect("policy installed").paused);
+
+    // No policy → nothing to pause or resume: fail closed with `NoPolicy`.
+    h.revoke_policy();
+    let pause_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.pause();
+    }));
+    assert!(
+        pause_res.is_err(),
+        "pause with no policy installed must fail closed (NoPolicy)"
+    );
+    let resume_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.resume();
+    }));
+    assert!(
+        resume_res.is_err(),
+        "resume with no policy installed must fail closed (NoPolicy)"
+    );
+}
+
+/// Issue #292 (acceptance): `Error::Unauthorized` (code 1) is declared and
+/// published but never produced — a bad agent signature dies in the host's
+/// `ed25519_verify` trap. This pins the observable behaviour so a future
+/// contributor does not "fix" that trap into a contract error: the
+/// transaction fails with the host's ED25519 diagnostic, never with
+/// `Error(Contract, #1)` / `unauthorized`, and no `auth_checked` event is
+/// emitted for it.
+#[test]
+fn bad_agent_signature_traps_without_unauthorized_error() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    h.install_policy(&h.base_policy());
+    h.set_time(1_000);
+
+    // An entry signed by a key that is not the registered agent.
+    let wrong = SigningKey::from_bytes(&[42u8; 32]);
+    let root = h.transfer_invocation(&h.guard, &recv, 5);
+    let entry = h.guard_entry_with(&wrong, &root);
+    h.enforce(entry);
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        MockAssetClient::new(&h.env, &h.asset).transfer(&h.guard, &recv, &5);
+    }));
+    let msg = payload
+        .expect_err("a wrong-key signature must fail the transaction")
+        .downcast_ref::<std::string::String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        msg.contains("failed ED25519 verification"),
+        "the observable failure is the host crypto trap, got: {msg}"
+    );
+    assert!(
+        !msg.contains("unauthorized") && !msg.contains("Error(Contract"),
+        "code 1 is reserved: a bad signature must never surface as a contract \
+         error (issue #292), got: {msg}"
+    );
+
+    // The registered agent still authorizes afterwards.
+    h.transfer(&recv, 5);
+}

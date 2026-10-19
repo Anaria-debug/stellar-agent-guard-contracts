@@ -149,6 +149,35 @@ mod event_types {
         pub(super) revision: u64,
     }
 
+    /// Admin policy pause: data `by` (the admin address that acted) plus
+    /// `revision` — the `PolicyRevision` this call produced. The counter is
+    /// incremented only when the call actually flips `paused`, so `revision`
+    /// changes exactly when the effective policy changes (issues #290, #38).
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventPaused {
+        pub(super) by: Address,
+        pub(super) revision: u64,
+    }
+
+    /// Admin policy resume: data `by` (the admin address that acted) plus
+    /// `revision` — same counter semantics as [`EventPaused`] (issue #290).
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventResumed {
+        pub(super) by: Address,
+        pub(super) revision: u64,
+    }
+
+    /// Admin rolling-window reset: data `by` (the admin address that acted).
+    /// `set_policy` preserves the window across edits (issue #289); this event
+    /// is the audit trail of the *explicit* reset that zeroes it.
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventWindowReset {
+        pub(super) by: Address,
+    }
+
     /// Agent key rotation: data `by` (the admin that acted) plus truncated
     /// fingerprints of the outgoing and incoming agent keys, so an auditor can
     /// reconstruct the old→new linkage without carrying full pubkeys (SPEC §9).
@@ -629,6 +658,26 @@ fn key_fingerprint(env: &Env, pubkey: &BytesN<32>) -> BytesN<8> {
     BytesN::from_array(env, &fingerprint)
 }
 
+fn emit_paused(env: &Env, by: &Address) {
+    EventPaused {
+        by: by.clone(),
+        revision: current_revision(env),
+    }
+    .publish(env);
+}
+
+fn emit_resumed(env: &Env, by: &Address) {
+    EventResumed {
+        by: by.clone(),
+        revision: current_revision(env),
+    }
+    .publish(env);
+}
+
+fn emit_window_reset(env: &Env, by: &Address) {
+    EventWindowReset { by: by.clone() }.publish(env);
+}
+
 fn emit_agent_rotated(env: &Env, by: &Address, old: &BytesN<32>, new: &BytesN<32>) {
     EventAgentRotated {
         by: by.clone(),
@@ -712,17 +761,92 @@ mod policy_engine_type {
             }
         }
 
-        /// Installs a new policy. Resets the rolling window and starts the
-        /// dead-man-switch clock at install time (a fresh policy gets full grace).
+        /// Installs a new policy. A policy *edit* — any `set_policy` while a
+        /// policy is already installed — **preserves** the rolling window and
+        /// the dead-man-switch clock (issue #289): pausing, tightening, or
+        /// widening a policy no longer hands the agent a fresh budget or a
+        /// fresh grace period. Only a *first* install (no policy stored,
+        /// including an install after `revoke_policy`) seeds an empty window
+        /// and arms the DMS clock at install time (a fresh policy gets full
+        /// grace). Use [`PolicyEngine::reset_window`] to zero the window
+        /// explicitly.
         pub fn set_policy(env: Env, config: PolicyConfig) {
             let admin = Self::admin_or_panic(&env);
             validate_config(&env, &config).unwrap_or_else(|e| panic_with_error!(&env, e));
+            // Window/DMS semantics (issue #289): only a first install gets a
+            // fresh window and a fresh grace clock. An edit of an installed
+            // policy leaves both untouched — the accumulated spend stays
+            // counted and a DMS-expired account stays expired (the documented
+            // reversal path for expiry is `unfreeze`, not a policy edit).
+            let first_install = !env.storage().persistent().has(&DataKey::Policy);
             persist_set(&env, &DataKey::Policy, &config);
             increment_revision(&env);
-            save_ledger(&env, &Ledger::empty(&env));
-            let now = env.ledger().timestamp();
-            persist_set(&env, &DataKey::LastHeartbeat, &now);
+            if first_install {
+                save_ledger(&env, &Ledger::empty(&env));
+                let now = env.ledger().timestamp();
+                persist_set(&env, &DataKey::LastHeartbeat, &now);
+            }
             emit_policy_set(&env, &admin);
+        }
+
+        /// Explicitly zeroes the rolling spend window (issue #289). Admin-only.
+        ///
+        /// `set_policy` preserves the window across edits, so this is the one
+        /// entry point that hands the agent a fresh budget — reach for it only
+        /// when a reset is actually intended (e.g. after raising `window_cap`
+        /// mid-incident). Idempotent: resetting an already-empty (or absent)
+        /// window is a no-op that still records the admin action. Emits
+        /// `window_reset` carrying `by`. Does not touch the policy, the
+        /// revision counter, or the dead-man-switch clock.
+        pub fn reset_window(env: Env) {
+            let admin = Self::admin_or_panic(&env);
+            env.storage().persistent().remove(&DataKey::Window);
+            emit_window_reset(&env, &admin);
+        }
+
+        /// Policy-level kill switch (issue #290): flips the stored policy's
+        /// `paused` flag **in place** — the rolling window, the dead-man-switch
+        /// clock, and every other field are untouched. Admin-only, idempotent
+        /// (pausing an already-paused account is not an error; the event is
+        /// still emitted so the audit trail records the admin action), and
+        /// requires an installed policy (`NoPolicy` otherwise — with no policy
+        /// the account is default-deny and there is nothing to pause).
+        ///
+        /// Reach for `pause`/`resume` for routine halts and restarts; `freeze`
+        /// is the emergency lever that binds even a policyless account.
+        pub fn pause(env: Env) {
+            Self::set_paused(&env, true);
+        }
+
+        /// Lifts a [`PolicyEngine::pause`]: flips the stored policy's `paused`
+        /// flag back to `false` in place, again without touching the rolling
+        /// window — resuming does not restore a spent budget, it only restores
+        /// admissibility. Same admin/idempotency/`NoPolicy` rules as `pause`.
+        pub fn resume(env: Env) {
+            Self::set_paused(&env, false);
+        }
+
+        /// Shared implementation of [`PolicyEngine::pause`] /
+        /// [`PolicyEngine::resume`] (issues #289/#290): flip `paused` on the
+        /// stored config, nothing else. The revision counter advances only when
+        /// the flag actually changes, keeping the §9 join-key invariant —
+        /// same revision ⟺ same effective policy — while a redundant
+        /// double-pause still emits its event (idempotent-safe).
+        fn set_paused(env: &Env, paused: bool) {
+            let admin = Self::admin_or_panic(env);
+            let Some(mut cfg) = persist_get::<PolicyConfig>(env, &DataKey::Policy) else {
+                panic_with_error!(env, Error::NoPolicy);
+            };
+            if cfg.paused != paused {
+                cfg.paused = paused;
+                persist_set(env, &DataKey::Policy, &cfg);
+                increment_revision(env);
+            }
+            if paused {
+                emit_paused(env, &admin);
+            } else {
+                emit_resumed(env, &admin);
+            }
         }
 
         /// Removes the policy and window → immediate default-deny.
