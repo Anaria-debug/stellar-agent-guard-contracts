@@ -10,6 +10,12 @@ Nothing here is simulated.
 - RPC used for submissions: `https://soroban-testnet.stellar.org`
 - Horizon used for verification: `https://horizon-testnet.stellar.org`
 
+This file is the on-chain half of [SECURITY.md § Verified against](../../SECURITY.md#verified-against):
+that section names the protocol and `soroban-sdk` version, and this file records
+the transactions that prove the behaviour on them. `index.json` mirrors the
+network (including `network.protocol: 28`) so the claim is machine-checkable;
+when the protocol or SDK changes, both files move together.
+
 ## Deployed contracts
 
 | Component | Address |
@@ -68,6 +74,15 @@ what Phase 2's SDK must do:
 Each invocation uses a fresh tx sequence as the auth nonce (the SAC's replay
 protection records every consumed nonce on-chain; the guard's own `__check_auth`
 ignores nonces, per SPEC §6).
+
+## How to read the blocks
+
+Every scenario block below carries the account state that produced its result —
+inline on the command or on the line directly above it — and live runs also
+carry the transaction hash and ledger that prove them. This is the same convention as the README's
+["How to read the output blocks"](../../README.md#how-to-read-the-output-blocks-in-this-readme)
+(issue #418): a block with no state line should not be cited as evidence, and a
+blocked result is only meaningful relative to the state that produced it.
 
 ## The five scenarios — real results
 

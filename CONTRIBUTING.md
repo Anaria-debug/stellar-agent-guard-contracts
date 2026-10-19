@@ -46,6 +46,45 @@ would move and change the bytes without any change to the repository. Bumping
 `channel` in `rust-toolchain.toml` changes the released artifact hash, so do it
 in its own commit (issue #67).
 
+### Minimum supported Rust version (MSRV)
+
+`Cargo.toml` declares `rust-version = "1.91.0"`, and the `msrv` job in
+`.github/workflows/ci.yml` installs exactly that release — including the
+`wasm32v1-none` target — and runs clippy, `cargo test`, and the wasm build on
+it. The job reads the field from `Cargo.toml`, so changing that one value is
+what changes what CI proves; there is no second hardcoded version to forget.
+`cargo fmt` deliberately stays on the pinned channel in the `ci` job: rustfmt
+output is version-sensitive, and one formatter authority avoids two
+contradictory definitions of "formatted" (issue #410).
+
+The floor comes from the dependency graph, not from preference: `soroban-sdk`
+27.0.6 itself declares `rust-version = "1.91.0"`. If a dependency bump needs a
+newer compiler:
+
+1. Raise `rust-version` in the same PR as the bump — never as a drive-by — and
+   say why in the PR body.
+2. Update every version claim: the `README.md` badge, `docs/installation.md`,
+   and this section.
+3. Update [`SECURITY.md` § Verified against](SECURITY.md#verified-against),
+   because the security model is verified against a specific toolchain and
+   SDK, not against "Rust" in general.
+4. Let the `msrv` CI leg prove the new floor before merging.
+
+Do **not** declare a lower MSRV than the graph supports. Before issue #410 this
+repository declared 1.85 while `soroban-sdk` required 1.91, so a contributor's
+first `cargo build` failed on a version the README called supported.
+
+### Documentation site (GitBook)
+
+The published docs at
+<https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/> are
+synced from this repository by GitBook Git Sync — there is no build or deploy
+workflow in `.github/workflows/`. What gets synced, what triggers a sync, how
+to preview a change, who can publish, and which file wins between
+`gitbook-docs.yaml` and `docs/SUMMARY.md` are documented in
+[`docs/README.md`](docs/README.md). Read that before adding, moving, or renaming
+a page; after any such change, run `scripts/verify-docs-reachability.sh`.
+
 The `stellar` CLI cannot sign Soroban authorization entries whose address is a
 contract. Heartbeat testing uses the guard contract's own address, so the CLI
 cannot submit a heartbeat; use `agent-tx` for this path. See the
@@ -293,7 +332,12 @@ tasks for the Drips Stellar Wave contributor sprints.
 When bumping `soroban-sdk` version in `Cargo.toml`, you **must** re-verify
 SPEC §1.1 quotes against the new SDK source (`src/auth.rs`, `src/custom_account.rs`).
 Update the version comment in `Cargo.toml` and the SPEC §1.1 header accordingly.
-This is the mechanical ratchet preventing silent auth-semantics drift.
+Also update the SDK row in
+[`SECURITY.md` § Verified against](SECURITY.md#verified-against), which names
+the protocol and SDK the security model was actually verified against — a bump
+without that update leaves a security document claiming a version that is no
+longer the one in `Cargo.lock`. This is the mechanical ratchet preventing
+silent auth-semantics drift.
 
 Dependabot (`.github/dependabot.yml`, weekly, Cargo + GitHub Actions) files
 update PRs against `main` the same as any contributor PR: they must pass the

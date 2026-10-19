@@ -88,6 +88,67 @@ jobs:
       - name: Agent submission tool build (tools/agent-tx)
         run: cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 
+  # Issue #410: the `rust-version` in Cargo.toml is only a claim until CI
+  # builds on it. That field is the single source of truth — this job reads
+  # it rather than repeating a hardcoded number — and installs the wasm
+  # target for that release too, because the contract must *link* on the
+  # declared minimum, not merely type-check on the host.
+  #
+  # Separate from `ci` so a failure names the MSRV leg specifically instead
+  # of looking like a general regression, and so the required `ci` check is
+  # unaffected by toolchain-availability hiccups on the older release.
+  #
+  # `rustfmt` is deliberately NOT part of this leg: formatting is a property
+  # of the pinned compiler in `ci`, and rustfmt output is version-sensitive,
+  # so running it on two toolchains would give two contradictory definitions
+  # of "formatted". `RUSTUP_TOOLCHAIN` overrides the rust-toolchain.toml pin
+  # for every later step; without it `cargo` would silently keep using the
+  # pinned channel and this job would prove nothing.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install declared MSRV (Cargo.toml rust-version)
+        run: |
+          set -euo pipefail
+          msrv="$(sed -nE 's/^rust-version = "(.*)"$/\1/p' Cargo.toml)"
+          if [[ -z "$msrv" ]]; then
+            echo "Cargo.toml declares no [package] rust-version" >&2
+            exit 1
+          fi
+          echo "Declared MSRV: $msrv"
+          rustup toolchain install "$msrv" --profile minimal --no-self-update \
+            --target wasm32v1-none --component clippy
+          installed="$(rustup run "$msrv" rustc --version)"
+          echo "Installed: $installed"
+          [[ "$installed" == "rustc $msrv"* ]] || {
+            echo "rustup installed a different compiler than the declared MSRV" >&2
+            exit 1
+          }
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+
+      - name: Cache cargo (MSRV)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keyed by the MSRV: a target directory built by the pinned channel
+          # must not be restored into this leg (cargo would rebuild it, but a
+          # shared key would also evict the `ci` job's cache entry).
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
+
+      - name: Clippy on the MSRV (all + pedantic deny, all targets/features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit + integration tests on the MSRV
+        run: cargo test
+
+      - name: Contract build on the MSRV (wasm32v1-none)
+        run: cargo build --release --target wasm32v1-none
+
   # Issue #67: the released artifact ships with a SHA-256 that downstream
   # bytecode verification pins, so "two clean builds of this commit agree"
   # has to be a checked property, not an assumption. Separate job from `ci`
