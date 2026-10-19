@@ -119,10 +119,13 @@ fn strkey_encode(version: u8, payload: &[u8]) -> String {
 
 /// Decode a strkey secret (version 0x90 + 32-byte seed + checksum) to the seed.
 fn secret_to_seed(secret: &str) -> [u8; 32] {
-    let raw = base32_decode(secret).expect("invalid strkey secret");
-    assert_eq!(raw.len(), 35, "strkey secret must decode to 35 bytes");
-    assert_eq!(raw[0], 0x90, "not a strkey secret key");
-    raw[1..33].try_into().expect("seed length")
+    match strkey::decode_strkey(secret) {
+        Ok((ver, seed)) if ver == strkey::VER_SECRET => seed,
+        Ok(_) => exit_with("not an account secret seed (expected leading character 'S')".into()),
+        Err(err) => exit_with(format!(
+            "invalid secret seed: {err}; expected a 56-character StrKey secret seed (S...)"
+        )),
+    }
 }
 
 fn account_strkey(pubkey: &[u8; 32]) -> String {
@@ -879,7 +882,10 @@ impl Call {
 
 fn run(call: &Call, args: &Args) {
     let guard = &args.guard;
-    let seed = secret_to_seed(args.secret.as_deref().expect("--agent-secret required"));
+    let Some(secret) = args.secret.as_deref() else {
+        exit_with("missing --agent-secret: signing requires the registered agent's secret seed (expected secret seed 'S...'; or set AGENT_SECRET env var)".into());
+    };
+    let seed = secret_to_seed(secret);
     let agent = SigningKey::from_bytes(&seed);
     let source_pk = agent.verifying_key().to_bytes();
     let source_g = account_strkey(&source_pk);
@@ -1166,9 +1172,24 @@ fn verify_guard(rpc: &Rpc, guard_addr: &str, _passphrase: &str) -> Result<(), St
 }
 
 fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
-    let alias = cli.positional("an alias")?;
-    let address = cli.positional("a guard contract address (C...)")?;
-    let admin = cli.positional("an admin account address (G...)")?;
+    let alias = cli.positional_expected(
+        "alias",
+        "an alias string (see `agent-tx guards add --help`)",
+    )?;
+    if alias == "--help" || alias == "-h" {
+        print_guards_subcommand_help("add");
+        return Ok(());
+    }
+    let address = cli.positional_expected("address", "a guard contract address (C...)")?;
+    if address == "--help" || address == "-h" {
+        print_guards_subcommand_help("add");
+        return Ok(());
+    }
+    let admin = cli.positional_expected("admin", "an admin account address (G...)")?;
+    if admin == "--help" || admin == "-h" {
+        print_guards_subcommand_help("add");
+        return Ok(());
+    }
     // Validate the two addresses first: `verify_guard` below is the first
     // place `guards add` talks to the network (issue #52).
     strkey::validate_key("guards add address", KeyKind::Contract, &address)?;
@@ -1182,9 +1203,19 @@ fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
     let mut positionals: Vec<String> = Vec::new();
     while let Some(token) = cli.next() {
         match token.as_str() {
-            "--network" => network = Some(cli.value("--network")?),
-            "--rpc-url" => rpc_url = Some(cli.value("--rpc-url")?),
-            "--network-passphrase" => passphrase = Some(cli.value("--network-passphrase")?),
+            "--help" | "-h" => {
+                print_guards_subcommand_help("add");
+                return Ok(());
+            }
+            "--network" => {
+                network = Some(cli.value_expected("--network", "testnet | futurenet | mainnet")?)
+            }
+            "--rpc-url" => {
+                rpc_url = Some(cli.value_expected("--rpc-url", "endpoint URL e.g. https://...")?)
+            }
+            "--network-passphrase" => {
+                passphrase = Some(cli.value_expected("--network-passphrase", "passphrase string")?)
+            }
             other if other.starts_with("--") => return Err(cli.unknown(other)),
             other => positionals.push(other.to_string()),
         }
@@ -1262,7 +1293,12 @@ fn cmd_guards_list() {
 }
 
 fn cmd_guards_remove(cli: &mut Cli) -> Result<(), String> {
-    let alias = cli.positional("an alias")?;
+    let alias =
+        cli.positional_expected("alias", "an alias string (see `agent-tx guards --help`)")?;
+    if alias == "--help" || alias == "-h" {
+        print_guards_subcommand_help("remove");
+        return Ok(());
+    }
     let mut reg = load_registry();
     let idx = reg
         .guards
@@ -1279,7 +1315,12 @@ fn cmd_guards_remove(cli: &mut Cli) -> Result<(), String> {
 }
 
 fn cmd_guards_set_default(cli: &mut Cli) -> Result<(), String> {
-    let alias = cli.positional("an alias")?;
+    let alias =
+        cli.positional_expected("alias", "an alias string (see `agent-tx guards --help`)")?;
+    if alias == "--help" || alias == "-h" {
+        print_guards_subcommand_help("set-default");
+        return Ok(());
+    }
     let mut reg = load_registry();
     if !reg.guards.iter().any(|g| g.alias == alias) {
         return Err("alias not found".into());
@@ -1301,10 +1342,10 @@ fn resolve_guard(guard_arg: Option<&str>) -> Result<String, String> {
         }
     }
     if reg.guards.is_empty() {
-        return Err("no guard specified and no guards registered. Use `agent-tx guards add <alias> <address> <admin>` to register one, or pass --guard".into());
+        return Err("missing --guard (expected contract ID 'C...'): no guard specified and no guards registered. Use `agent-tx guards add <alias> <address> <admin>` to register one, or pass --guard <C...>".into());
     }
     Err(format!(
-        "no guard specified and no default set. Registered guards:\n{}",
+        "missing --guard (expected contract ID 'C...'): no guard specified and no default set. Use --guard <C...> or choose from registered guards:\n{}",
         reg.guards
             .iter()
             .map(|g| format!("  {} -> {}", g.alias, g.address))
@@ -2222,6 +2263,108 @@ mod tests {
             parse_request(cmd, &args).expect("read command without a secret");
         }
     }
+
+    #[test]
+    fn help_and_usage_cover_all_subcommands() {
+        let tool = tool_help();
+        assert!(tool.contains("Usage:"));
+        assert!(tool.contains("agent-tx preflight"));
+        assert!(tool.contains("agent-tx transfer"));
+        assert!(tool.contains("agent-tx guards"));
+
+        for sub in [
+            "preflight",
+            "transfer",
+            "transfer-from",
+            "heartbeat",
+            "status",
+            "policy",
+            "check",
+        ] {
+            let help = subcommand_help(sub);
+            assert!(
+                help.contains(&format!("Usage: agent-tx {sub}")),
+                "help for {sub} must contain usage"
+            );
+            assert!(
+                help.contains("-h, --help"),
+                "help for {sub} must document help option"
+            );
+        }
+
+        let guards = guards_help();
+        assert!(guards.contains("Usage: agent-tx guards"));
+        for sub in ["add", "list", "remove", "set-default"] {
+            let help = guards_subcommand_help(sub);
+            assert!(
+                help.contains(&format!("Usage: agent-tx guards {sub}")),
+                "help for guards {sub} must contain usage"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_arguments_name_the_argument_and_expected_form() {
+        // Missing --amount must name the flag and the expected integer i128 form
+        let args = argv(&[
+            "check",
+            "--guard",
+            VALID_GUARD,
+            "--asset",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("check", rest).expect_err("check accepted without amount");
+        assert!(err.contains("--amount"), "{err}");
+        assert!(err.contains("expected integer i128"), "{err}");
+
+        // Missing value for --amount must name the flag and expected form
+        let args = argv(&[
+            "check",
+            "--guard",
+            VALID_GUARD,
+            "--asset",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+            "--amount",
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("check", rest).expect_err("flag without value accepted");
+        assert!(err.contains("--amount"), "{err}");
+        assert!(err.contains("requires a value"), "{err}");
+        assert!(err.contains("expected integer i128"), "{err}");
+
+        // Missing value for --guard
+        let args = argv(&["status", "--guard"]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("status", rest).expect_err("guard without value accepted");
+        assert!(err.contains("--guard"), "{err}");
+        assert!(err.contains("requires a value"), "{err}");
+        assert!(err.contains("expected contract ID"), "{err}");
+
+        // Missing --from in transfer-from
+        let args = argv(&[
+            "transfer-from",
+            "--guard",
+            VALID_GUARD,
+            "--token",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+            "--amount",
+            "10",
+            "--agent-secret",
+            VALID_SECRET,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err =
+            parse_request("transfer-from", rest).expect_err("transfer-from accepted without from");
+        assert!(err.contains("--from"), "{err}");
+        assert!(err.contains("expected account ID"), "{err}");
+    }
 }
 
 fn map_submission_error(err_str: &str) -> String {
@@ -2261,21 +2404,21 @@ impl<'a> Cli<'a> {
         token
     }
 
-    /// The value belonging to the flag just consumed.
-    fn value(&mut self, flag: &str) -> Result<String, String> {
+    /// The value belonging to the flag just consumed, stating the expected form.
+    fn value_expected(&mut self, flag: &str, expected: &str) -> Result<String, String> {
         self.next()
-            .ok_or_else(|| format!("{flag} requires a value"))
+            .ok_or_else(|| format!("{flag} requires a value (expected {expected})"))
     }
 
-    fn positional(&mut self, name: &str) -> Result<String, String> {
+    fn positional_expected(&mut self, arg_name: &str, expected: &str) -> Result<String, String> {
         self.next()
-            .ok_or_else(|| format!("`{}` requires {name}", self.cmd))
+            .ok_or_else(|| format!("missing <{arg_name}>: `{}` requires {expected}", self.cmd))
     }
 
     fn unknown(&self, flag: &str) -> String {
         format!(
-            "unknown argument for `{}`: {flag} (see `agent-tx --help`)",
-            self.cmd
+            "unknown argument for `{}`: {flag} (see `agent-tx --help` or `agent-tx {} --help`)",
+            self.cmd, self.cmd
         )
     }
 }
@@ -2295,7 +2438,7 @@ fn validate_address(field: &str, kind: KeyKind, value: &str) -> Result<ScAddress
 
 fn parse_amount(raw: &str) -> Result<i128, String> {
     raw.parse::<i128>().map_err(|e| {
-        format!("invalid --amount '{raw}': {e}; expected a signed integer in whole units")
+        format!("invalid --amount '{raw}': {e}; expected an integer i128 in whole units")
     })
 }
 
@@ -2360,27 +2503,51 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
 
     while let Some(flag) = cli.next() {
         match flag.as_str() {
-            "--guard" => guard = Some(cli.value("--guard")?),
+            "-h" | "--help" => {
+                return Err(format!(
+                    "help requested for `{cmd}` (see `agent-tx {cmd} --help`)"
+                ));
+            }
+            "--guard" => guard = Some(cli.value_expected("--guard", "contract ID 'C...'")?),
             "--token" | "--asset" => {
                 token_field = flag.clone();
-                token = Some(cli.value(&flag)?);
+                token = Some(cli.value_expected(&flag, "contract ID 'C...'")?);
             }
-            "--from" => from = Some(cli.value("--from")?),
-            "--to" => to = Some(cli.value("--to")?),
-            "--amount" => amount = Some(parse_amount(&cli.value("--amount")?)?),
+            "--from" => {
+                from =
+                    Some(cli.value_expected("--from", "account ID 'G...' or contract ID 'C...'")?)
+            }
+            "--to" => {
+                to =
+                    Some(cli.value_expected(
+                        "--to",
+                        "recipient account ID 'G...' or contract ID 'C...'",
+                    )?)
+            }
+            "--amount" => {
+                amount = Some(parse_amount(
+                    &cli.value_expected("--amount", "integer i128")?,
+                )?)
+            }
             "--inclusion-fee" => {
-                let raw = cli.value("--inclusion-fee")?;
+                let raw = cli.value_expected("--inclusion-fee", "stroops as u32")?;
                 inclusion_fee_override = Some(raw.parse::<u32>().map_err(|error| {
                     format!("invalid --inclusion-fee '{raw}': {error}; expected stroops as u32")
                 })?);
             }
             "--agent-secret" | "--secret" => {
                 secret_field = flag.clone();
-                secret = Some(cli.value(&flag)?);
+                secret = Some(cli.value_expected(&flag, "secret seed 'S...'")?);
             }
-            "--network" => network = Some(cli.value("--network")?),
-            "--rpc-url" => rpc_url = Some(cli.value("--rpc-url")?),
-            "--network-passphrase" => passphrase = Some(cli.value("--network-passphrase")?),
+            "--network" => {
+                network = Some(cli.value_expected("--network", "testnet | futurenet | mainnet")?)
+            }
+            "--rpc-url" => {
+                rpc_url = Some(cli.value_expected("--rpc-url", "endpoint URL e.g. https://...")?)
+            }
+            "--network-passphrase" => {
+                passphrase = Some(cli.value_expected("--network-passphrase", "passphrase string")?)
+            }
             "--expect-blocked" => expect_blocked = true,
             other => return Err(cli.unknown(other)),
         }
@@ -2410,7 +2577,7 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     }
     if matches!(cmd, "transfer" | "transfer-from" | "heartbeat") && secret.is_none() {
         return Err(format!(
-            "missing --agent-secret (or AGENT_SECRET): `{cmd}` signs and submits, so it requires \
+            "missing --agent-secret (or AGENT_SECRET; expected secret seed 'S...'): `{cmd}` signs and submits, so it requires \
              the registered agent's secret seed"
         ));
     }
@@ -2433,24 +2600,26 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
         } else {
             token_field
         };
-        let raw = token
-            .as_deref()
-            .ok_or_else(|| format!("missing {token_field}: `{cmd}` requires it"))?;
+        let raw = token.as_deref().ok_or_else(|| {
+            format!("missing {token_field} (expected contract ID 'C...'): `{cmd}` requires it")
+        })?;
         parsed_token = Some(validate_address(&token_field, KeyKind::Contract, raw)?);
         if cmd == "transfer-from" {
             let raw = from
                 .as_deref()
-                .ok_or_else(|| "missing --from: `transfer-from` requires it".to_string())?;
+                .ok_or_else(|| "missing --from (expected account ID 'G...' or contract ID 'C...'): `transfer-from` requires it".to_string())?;
             parsed_from = Some(validate_address("--from", KeyKind::Recipient, raw)?);
         } else if from.is_some() {
             return Err("--from is only valid for `transfer-from`".to_string());
         }
         let raw = to
             .as_deref()
-            .ok_or_else(|| format!("missing --to: `{cmd}` requires it"))?;
+            .ok_or_else(|| format!("missing --to (expected recipient account ID 'G...' or contract ID 'C...'): `{cmd}` requires it"))?;
         parsed_to = Some(validate_address("--to", KeyKind::Recipient, raw)?);
         if amount.is_none() {
-            return Err(format!("missing --amount: `{cmd}` requires it"));
+            return Err(format!(
+                "missing --amount (expected integer i128): `{cmd}` requires it"
+            ));
         }
     }
 
@@ -2467,55 +2636,251 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     })
 }
 
-fn print_help() {
-    println!("agent-tx — simulate or submit Soroban transactions for Stellar Agent Guard");
-    println!("Usage:");
-    println!("  agent-tx preflight --guard <C...> --asset <C...> --to <G...> --amount <N> [--secret <S...>]");
-    println!("  agent-tx transfer --guard <C...> --token <C...> --to <G...> --amount <N> --agent-secret <S...>");
-    println!("  agent-tx transfer-from --guard <C...> --token <C...> --from <G|C...> --to <G|C...> --amount <N> --agent-secret <S...>");
-    println!("  agent-tx heartbeat --guard <C...> --agent-secret <S...>");
-    println!("  agent-tx status --guard <C...> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx policy --guard <C...> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx check --guard <C...> --asset <C...> --to <G...> --amount <N> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx guards <add|list|remove|set-default> ...");
-    println!();
-    println!("Network selection:");
-    println!("  --network testnet|futurenet|mainnet   named preset endpoint + passphrase (default: testnet)");
-    println!(
-        "                                        mainnet: {}",
-        Network::Mainnet.rpc_url()
-    );
-    println!(
-        "                                        futurenet: {}",
+fn tool_help() -> String {
+    format!(
+        "agent-tx — simulate or submit Soroban transactions for Stellar Agent Guard\n\
+         \n\
+         Usage:\n\
+         \x20 agent-tx preflight --guard <C...> --asset <C...> --to <G...> --amount <N> [--secret <S...>]\n\
+         \x20 agent-tx transfer --guard <C...> --token <C...> --to <G...> --amount <N> --agent-secret <S...>\n\
+         \x20 agent-tx transfer-from --guard <C...> --token <C...> --from <G|C...> --to <G|C...> --amount <N> --agent-secret <S...>\n\
+         \x20 agent-tx heartbeat --guard <C...> --agent-secret <S...>\n\
+         \x20 agent-tx status --guard <C...> [--network testnet|futurenet|mainnet]\n\
+         \x20 agent-tx policy --guard <C...> [--network testnet|futurenet|mainnet]\n\
+         \x20 agent-tx check --guard <C...> --asset <C...> --to <G...> --amount <N> [--network testnet|futurenet|mainnet]\n\
+         \x20 agent-tx guards <add|list|remove|set-default> ...\n\
+         \n\
+         Run `agent-tx <subcommand> --help` for detailed help on any subcommand.\n\
+         \n\
+         Network selection:\n\
+         \x20 --network testnet|futurenet|mainnet   named preset endpoint + passphrase (default: testnet)\n\
+         \x20                                       mainnet: {}\n\
+         \x20                                       futurenet: {}\n\
+         \x20 --rpc-url <url>                       any endpoint; overrides the default, and is\n\
+         \x20                                       refused together with an explicit --network\n\
+         \x20 --network-passphrase <passphrase>     override the preset's passphrase (advanced:\n\
+         \x20                                       private or non-standard networks)\n\
+         \x20 --inclusion-fee <stroops>             override the RPC-reported inclusion fee\n\
+         \x20 Custom --rpc-url values require --network-passphrase unless the URL is a known preset.\n\
+         \x20 Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr.\n\
+         \x20 A StrKey's leading character encodes the key type, not the network, so address\n\
+         \x20 validation cannot catch a wrong-network address; the preset plus passphrase decide\n\
+         \x20 which network a call reaches.\n\
+         \n\
+         Inputs: --guard/--asset/--token must be a contract ID (C...), --to an account (G...) or\n\
+         contract (C...) ID, --agent-secret a secret seed (S...). All are checked for the\n\
+         correct prefix, length and CRC16 checksum before any RPC request is made.\n\
+         Preflight exit codes: 0=admitted, 1=blocked (signed simulation), 2=unsigned/inconclusive.\n\
+         Troubleshooting: See README.md 'Troubleshooting — Submission Errors' table for error mapping and concrete fix flags (--fee-multiplier, etc.).\n\
+         The stellar CLI cannot sign auth entries for contract addresses; use agent-tx for heartbeat calls (see tools/agent-tx/README.md).",
+        Network::Mainnet.rpc_url(),
         Network::Futurenet.rpc_url()
-    );
-    println!("  --rpc-url <url>                       any endpoint; overrides the default, and is");
-    println!("                                        refused together with an explicit --network");
-    println!("  --network-passphrase <passphrase>     override the preset's passphrase (advanced:");
-    println!("                                        private or non-standard networks)");
-    println!("  --inclusion-fee <stroops>              override the RPC-reported inclusion fee");
-    println!(
-        "  Custom --rpc-url values require --network-passphrase unless the URL is a known preset."
-    );
-    println!(
-        "  Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr."
-    );
-    println!("  A StrKey's leading character encodes the key type, not the network, so address");
-    println!(
-        "  validation cannot catch a wrong-network address; the preset plus passphrase decide"
-    );
-    println!("  which network a call reaches.");
-    println!();
-    println!(
-        "Inputs: --guard/--asset/--token must be a contract ID (C...), --to an account (G...) or"
-    );
-    println!("contract (C...) ID, --agent-secret a secret seed (S...). All are checked for the");
-    println!("correct prefix, length and CRC16 checksum before any RPC request is made.");
-    println!(
-        "Preflight exit codes: 0=admitted, 1=blocked (signed simulation), 2=unsigned/inconclusive."
-    );
-    println!("Troubleshooting: See README.md 'Troubleshooting — Submission Errors' table for error mapping and concrete fix flags (--fee-multiplier, etc.).");
-    println!("The stellar CLI cannot sign auth entries for contract addresses; use agent-tx for heartbeat calls (see tools/agent-tx/README.md).");
+    )
+}
+
+fn print_help() {
+    println!("{}", tool_help());
+}
+
+fn subcommand_help(cmd: &str) -> String {
+    match cmd {
+        "preflight" => {
+            "Usage: agent-tx preflight --guard <C...> --asset <C...> --to <G|C...> --amount <N> [options]\n\
+             \n\
+             Simulate a prospective transfer without submitting to the network.\n\
+             Exit codes: 0 = admitted by policy, 1 = blocked by guard policy, 2 = unsigned/inconclusive.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --asset <C...>              Token contract address (C...); synonym: --token\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \n\
+             Options:\n\
+             \x20 --secret <S...>             Agent secret seed (S...) for signed simulation auth\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 --expect-blocked            Invert exit code: exit 0 if simulation blocked, 1 if admitted\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "transfer" => {
+            "Usage: agent-tx transfer --guard <C...> --token <C...> --to <G|C...> --amount <N> --agent-secret <S...> [options]\n\
+             \n\
+             Sign and submit a transfer from the guard contract to the recipient.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --token <C...>              Token contract address (C...); synonym: --asset\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \x20 --agent-secret <S...>       Registered agent's secret seed (S...); or set AGENT_SECRET env var\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 --expect-blocked            Expect the transaction to be rejected by policy\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "transfer-from" => {
+            "Usage: agent-tx transfer-from --guard <C...> --token <C...> --from <G|C...> --to <G|C...> --amount <N> --agent-secret <S...> [options]\n\
+             \n\
+             Sign and submit a transfer_from authorized by the guard account.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --token <C...>              Token contract address (C...)\n\
+             \x20 --from <G|C...>             Source account (G...) or contract (C...) debited by allowance\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \x20 --agent-secret <S...>       Registered agent's secret seed (S...); or set AGENT_SECRET env var\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 --expect-blocked            Expect the transaction to be rejected by policy\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "heartbeat" => {
+            "Usage: agent-tx heartbeat --guard <C...> --agent-secret <S...> [options]\n\
+             \n\
+             Send a heartbeat transaction to keep the guard's dead man's switch (DMS) from expiring.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --agent-secret <S...>       Registered agent's secret seed (S...); or set AGENT_SECRET env var\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "status" => {
+            "Usage: agent-tx status --guard <C...> [options]\n\
+             \n\
+             Inspect the guard's on-chain status (frozen state, heartbeat expiration, policy revision).\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "policy" => {
+            "Usage: agent-tx policy --guard <C...> [options]\n\
+             \n\
+             Fetch and display active spending limits and policy configuration for the guard.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "check" => {
+            "Usage: agent-tx check --guard <C...> --asset <C...> --to <G|C...> --amount <N> [options]\n\
+             \n\
+             Simulate an unsigned transfer against guard policy and display the verdict.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --asset <C...>              Token contract address (C...); synonym: --token\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "guards" => guards_help(),
+        _ => tool_help(),
+    }
+}
+
+fn print_subcommand_help(cmd: &str) {
+    println!("{}", subcommand_help(cmd));
+}
+
+fn guards_help() -> String {
+    "Usage: agent-tx guards <subcommand> [args...]\n\
+     \n\
+     Manage the local registry of guard contracts and aliases.\n\
+     \n\
+     Subcommands:\n\
+     \x20 add <alias> <address> <admin> [--network <name> | --rpc-url <url>] [--network-passphrase <pass>]\n\
+     \x20     Register a guard contract address and admin under an alias\n\
+     \x20 list\n\
+     \x20     List all registered guard aliases and current default\n\
+     \x20 remove <alias>\n\
+     \x20     Remove an alias from the local registry\n\
+     \x20 set-default <alias>\n\
+     \x20     Set the default guard alias used when --guard is omitted\n\
+     \n\
+     Run `agent-tx guards <subcommand> --help` for help on a guards subcommand.\n\
+     Options:\n\
+     \x20 -h, --help   Print this help message\n".to_string()
+}
+
+fn print_guards_help() {
+    println!("{}", guards_help());
+}
+
+fn guards_subcommand_help(sub: &str) -> String {
+    match sub {
+        "add" => "Usage: agent-tx guards add <alias> <address> <admin> [options]\n\
+             \n\
+             Register a guard contract address and admin under a local alias.\n\
+             \n\
+             Positional arguments:\n\
+             \x20 <alias>       Unique alias name for the guard\n\
+             \x20 <address>     Guard contract address (C...)\n\
+             \x20 <admin>       Admin account address (G...)\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 -h, --help                  Print this help message\n"
+            .to_string(),
+        "list" => "Usage: agent-tx guards list\n\
+             \n\
+             List all registered guard aliases and indicate the default guard.\n"
+            .to_string(),
+        "remove" => "Usage: agent-tx guards remove <alias>\n\
+             \n\
+             Remove a guard alias from the local registry.\n\
+             \n\
+             Positional arguments:\n\
+             \x20 <alias>   The alias to remove\n"
+            .to_string(),
+        "set-default" => "Usage: agent-tx guards set-default <alias>\n\
+             \n\
+             Set the default guard alias used when --guard is omitted.\n\
+             \n\
+             Positional arguments:\n\
+             \x20 <alias>   The registered alias to set as default\n"
+            .to_string(),
+        _ => guards_help(),
+    }
+}
+
+fn print_guards_subcommand_help(sub: &str) {
+    println!("{}", guards_subcommand_help(sub));
 }
 
 // ── Read-only diagnostics (status, policy, check) ───────────────────────
@@ -2747,8 +3112,20 @@ fn exit_with(message: String) -> ! {
 }
 
 fn run_guards(argv: &[String]) {
+    if argv.is_empty() || argv[0] == "--help" || argv[0] == "-h" || argv[0] == "help" {
+        print_guards_help();
+        return;
+    }
+    let sub = &argv[0];
+    if argv.len() > 1 && (argv[1] == "--help" || argv[1] == "-h" || argv[1] == "help") {
+        print_guards_subcommand_help(sub);
+        return;
+    }
     let mut cli = Cli::new("guards", argv);
-    let subcommand = match cli.positional("a subcommand: add | list | remove | set-default") {
+    let subcommand = match cli.positional_expected(
+        "subcommand",
+        "a subcommand: add | list | remove | set-default (see `agent-tx guards --help`)",
+    ) {
         Ok(subcommand) => subcommand,
         Err(message) => exit_with(message),
     };
@@ -2761,7 +3138,7 @@ fn run_guards(argv: &[String]) {
         "remove" => cmd_guards_remove(&mut cli),
         "set-default" => cmd_guards_set_default(&mut cli),
         other => Err(format!(
-            "unknown guards subcommand: {other} (expected add, list, remove or set-default)"
+            "unknown guards subcommand: {other} (expected add, list, remove or set-default; see `agent-tx guards --help`)"
         )),
     };
     if let Err(message) = result {
@@ -2775,8 +3152,39 @@ fn main() {
         print_help();
         std::process::exit(1);
     };
-    if cmd == "--help" || cmd == "-h" {
-        print_help();
+    if cmd == "--help" || cmd == "-h" || cmd == "help" {
+        if let Some(sub) = rest.first() {
+            if sub == "guards" {
+                if let Some(sub_sub) = rest.get(1) {
+                    print_guards_subcommand_help(sub_sub);
+                } else {
+                    print_guards_help();
+                }
+            } else {
+                print_subcommand_help(sub);
+            }
+        } else {
+            print_help();
+        }
+        return;
+    }
+    if rest
+        .iter()
+        .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
+    {
+        if cmd == "guards" {
+            if let Some(sub_sub) = rest.first() {
+                if matches!(sub_sub.as_str(), "add" | "list" | "remove" | "set-default") {
+                    print_guards_subcommand_help(sub_sub);
+                } else {
+                    print_guards_help();
+                }
+            } else {
+                print_guards_help();
+            }
+        } else {
+            print_subcommand_help(cmd);
+        }
         return;
     }
     if cmd == "guards" {
@@ -2819,41 +3227,71 @@ fn main() {
             }
         }
         "check" => {
-            let asset = request.token.clone().expect("validated --asset");
-            let to = request.to.clone().expect("validated --to");
-            let amount = request.amount.expect("validated --amount");
+            let (asset, to, amount) =
+                match (request.token.clone(), request.to.clone(), request.amount) {
+                    (Some(asset), Some(to), Some(amount)) => (asset, to, amount),
+                    _ => exit_with(
+                        "missing required argument for `check` (see `agent-tx check --help`)"
+                            .into(),
+                    ),
+                };
             if let Err(e) = cmd_check(&rpc, &request.guard, &asset, &to, amount, &passphrase) {
                 exit_with(e);
             }
         }
         "preflight" => {
-            let call = Call::Transfer {
-                token: request.token.clone().expect("validated --asset"),
-                to: request.to.clone().expect("validated --to"),
-                amount: request.amount.expect("validated --amount"),
+            let (token, to, amount) = match (
+                request.token.clone(),
+                request.to.clone(),
+                request.amount,
+            ) {
+                (Some(token), Some(to), Some(amount)) => (token, to, amount),
+                _ => exit_with(
+                    "missing required argument for `preflight` (see `agent-tx preflight --help`)"
+                        .into(),
+                ),
             };
+            let call = Call::Transfer { token, to, amount };
             let args = request.args();
             let result = preflight(&call, &args, &args.rpc);
             std::process::exit(result.err().unwrap_or(0));
         }
         "transfer" => {
-            let call = Call::Transfer {
-                token: request.token.clone().expect("validated --token"),
-                to: request.to.clone().expect("validated --to"),
-                amount: request.amount.expect("validated --amount"),
-            };
+            let (token, to, amount) =
+                match (request.token.clone(), request.to.clone(), request.amount) {
+                    (Some(token), Some(to), Some(amount)) => (token, to, amount),
+                    _ => exit_with(
+                        "missing required argument for `transfer` (see `agent-tx transfer --help`)"
+                            .into(),
+                    ),
+                };
+            let call = Call::Transfer { token, to, amount };
             run(&call, &request.args());
         }
         "transfer-from" => {
+            let (token, from, to, amount) = match (
+                request.token.clone(),
+                request.from.clone(),
+                request.to.clone(),
+                request.amount,
+            ) {
+                (Some(token), Some(from), Some(to), Some(amount)) => (token, from, to, amount),
+                _ => exit_with(
+                    "missing required argument for `transfer-from` (see `agent-tx transfer-from --help`)"
+                        .into(),
+                ),
+            };
             let call = Call::TransferFrom {
-                token: request.token.clone().expect("validated --token"),
-                from: request.from.clone().expect("validated --from"),
-                to: request.to.clone().expect("validated --to"),
-                amount: request.amount.expect("validated --amount"),
+                token,
+                from,
+                to,
+                amount,
             };
             run(&call, &request.args());
         }
         "heartbeat" => run(&Call::Heartbeat, &request.args()),
-        _ => unreachable!(),
+        _ => exit_with(format!(
+            "unknown subcommand '{cmd}' (see `agent-tx --help`)"
+        )),
     }
 }
