@@ -3146,6 +3146,8 @@ fn self_address_rejected_in_every_list() {
     let rule = ProtocolRule {
         contract: h.guard.clone(),
         fns: None,
+
+        paused: false,
     };
     p.protocols = soroban_sdk::vec![&h.env, rule];
     expect_invalid(&p, "protocols");
@@ -3558,10 +3560,14 @@ fn policy_config_debug_snapshot() {
             ProtocolRule {
                 contract: proto_a,
                 fns: Some(vec![&env, Symbol::new(&env, "swap")]),
+
+                paused: false,
             },
             ProtocolRule {
                 contract: proto_b,
                 fns: None,
+
+                paused: false,
             },
         ],
         recipients: vec![&env, recip_a.clone(), recip_b],
@@ -3577,6 +3583,8 @@ fn policy_config_debug_snapshot() {
             AssetCap {
                 asset: asset_a.clone(),
                 per_tx_cap: 500,
+
+                paused: false,
             },
         ],
         blocked_recipients: vec![&env],
@@ -3609,8 +3617,12 @@ fn policy_config_debug_snapshot() {
 
     let mut last_pos = 0;
     for field in fields {
+        if field == "paused" {
+            continue;
+        }
+        let needle = format!("{field}:");
         let pos = debug_output
-            .find(field)
+            .find(&needle)
             .unwrap_or_else(|| panic!("field {field} not found in debug output"));
         assert!(
             pos >= last_pos,
@@ -3618,6 +3630,20 @@ fn policy_config_debug_snapshot() {
         );
         last_pos = pos;
     }
+
+    let paused_pos = debug_output
+        .rfind("paused:")
+        .unwrap_or_else(|| panic!("field paused not found in debug output"));
+    let active_until_pos = debug_output
+        .find("active_until:")
+        .unwrap_or_else(|| panic!("field active_until not found in debug output"));
+    let dms_pos = debug_output
+        .find("dms_grace_secs:")
+        .unwrap_or_else(|| panic!("field dms_grace_secs not found in debug output"));
+    assert!(
+        paused_pos > active_until_pos && paused_pos < dms_pos,
+        "top-level paused field must sit between active_until and dms_grace_secs"
+    );
 }
 
 #[test]
@@ -3820,6 +3846,17 @@ fn failed_multi_context_batch_never_commits_staged_window_admissions() {
         })
     };
 
+    // All 65 transfers fit the configured 100-unit window, but the whole
+    // authorization must be rejected before any of them can be persisted.
+    let mut oversized = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..=crate::types::MAX_AUTH_CONTEXTS {
+        oversized.push_back(transfer_ctx(&to, 1));
+    }
+    let oversized_result = check_batch(oversized, 2);
+    assert_eq!(oversized_result, Err(GuardError::TooManyAuthContexts));
+    assert_eq!(read_window_total(), 0i128);
+    assert_eq!(h.status().window_remaining, Some(100));
+
     // Two-context auth batch: ctx1 (40, valid), ctx2 (90, exceeds per_tx_cap 80).
     let contexts = soroban_sdk::vec![&h.env, transfer_ctx(&to, 40), transfer_ctx(&to, 90)];
     let res = check_batch(contexts, 0);
@@ -4015,6 +4052,8 @@ fn per_asset_cap_override_wins_over_global() {
         AssetCap {
             asset: h.asset.clone(),
             per_tx_cap: 10,
+
+            paused: false,
         },
     ];
     h.install_policy(&p);
@@ -4052,6 +4091,8 @@ fn per_asset_cap_zero_override_disables_cap_for_that_asset() {
         AssetCap {
             asset: h.asset.clone(),
             per_tx_cap: 0,
+
+            paused: false,
         },
     ];
     h.install_policy(&p);
@@ -4075,6 +4116,8 @@ fn per_asset_cap_window_still_uses_global_window() {
         AssetCap {
             asset: h.asset.clone(),
             per_tx_cap: 50,
+
+            paused: false,
         },
     ];
     h.install_policy(&p);
@@ -4095,6 +4138,8 @@ fn invalid_negative_per_asset_cap_rejected() {
         AssetCap {
             asset: h.asset.clone(),
             per_tx_cap: -1,
+
+            paused: false,
         },
     ];
     h.env.mock_all_auths();
@@ -4115,6 +4160,8 @@ fn invalid_unknown_asset_override_rejected() {
         AssetCap {
             asset: h.other.clone(),
             per_tx_cap: 10,
+
+            paused: false,
         },
     ];
     h.env.mock_all_auths();
@@ -4136,10 +4183,14 @@ fn invalid_duplicate_per_asset_cap_rejected() {
         AssetCap {
             asset: h.asset.clone(),
             per_tx_cap: 10,
+
+            paused: false,
         },
         AssetCap {
             asset: h.asset.clone(),
             per_tx_cap: 20,
+
+            paused: false,
         },
     ];
     h.env.mock_all_auths();
@@ -4160,6 +4211,8 @@ fn detailed_check_reports_effective_per_asset_cap() {
         AssetCap {
             asset: h.asset.clone(),
             per_tx_cap: 25,
+
+            paused: false,
         },
     ];
     h.install_policy(&p);
@@ -4710,6 +4763,8 @@ fn validate_policy_reports_self_address_in_list() {
         ProtocolRule {
             contract: h.guard.clone(),
             fns: None,
+
+            paused: false,
         },
     ];
     assert_eq!(
@@ -4834,6 +4889,8 @@ fn policy_asset_protocol_and_recipient_limits_are_inclusive_and_fail_closed() {
         protocols.push_back(ProtocolRule {
             contract: Address::generate(&h.env),
             fns: None,
+
+            paused: false,
         });
     }
     let mut at_limit = baseline.clone();
@@ -4844,6 +4901,8 @@ fn policy_asset_protocol_and_recipient_limits_are_inclusive_and_fail_closed() {
     protocols.push_back(ProtocolRule {
         contract: Address::generate(&h.env),
         fns: None,
+
+        paused: false,
     });
     let mut over_limit = at_limit.clone();
     over_limit.protocols = protocols;
@@ -4927,6 +4986,8 @@ fn validate_policy_reports_protocol_contract_duplicate() {
     let rule = ProtocolRule {
         contract: h.asset.clone(),
         fns: None,
+
+        paused: false,
     };
     p.protocols = soroban_sdk::vec![&h.env, rule.clone(), rule];
     assert_rejects_with(&h, &p, &PolicyRuleId::ProtocolContractDuplicate);
@@ -4943,6 +5004,8 @@ fn validate_policy_reports_protocol_fn_list_invalid() {
         ProtocolRule {
             contract: h.asset.clone(),
             fns: Some(soroban_sdk::Vec::new(&h.env)),
+
+            paused: false,
         },
     ];
     assert_rejects_with(&h, &p, &PolicyRuleId::ProtocolFnListInvalid);
@@ -4959,6 +5022,8 @@ fn validate_policy_reports_protocol_fn_list_invalid() {
         ProtocolRule {
             contract: h.asset.clone(),
             fns: Some(fns),
+
+            paused: false,
         },
     ];
     assert_rejects_with(&h, &p, &PolicyRuleId::ProtocolFnListInvalid);

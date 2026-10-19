@@ -23,6 +23,10 @@ pub enum DmsHealthStatus {
 /// oldest entries forward (conservative over-count) — see SPEC §3.1.
 pub const MAX_WINDOW_ENTRIES: usize = 8192;
 
+/// Hard bound on auth contexts evaluated in one authorization (SPEC §4/§6).
+/// Sixty-four admits large DEX batches while bounding worst-case decision work.
+pub const MAX_AUTH_CONTEXTS: usize = 64;
+
 /// Maximum number of asset contracts in a policy (SPEC §8).
 pub const MAX_POLICY_ASSETS: usize = 256;
 
@@ -173,6 +177,8 @@ pub struct AssetCap {
     pub asset: Address,
     /// Per-tx cap for this asset; 0 = disabled / fall back to global.
     pub per_tx_cap: i128,
+    /// If true, the asset is blocked even when it is otherwise allowlisted.
+    pub paused: bool,
 }
 
 /// The policy an admin installs on the account. See SPEC §3/§4.
@@ -254,6 +260,8 @@ pub struct ProtocolRule {
     pub contract: Address,
     /// `None` = any function; `Some` = per-function allowlist.
     pub fns: Option<Vec<Symbol>>,
+    /// If true, the contract is blocked even when it is otherwise allowlisted.
+    pub paused: bool,
 }
 
 /// A single call the account must authorize, parsed into a form the pure
@@ -396,6 +404,7 @@ impl Error {
             Self::CreateContractNotAllowed,
             Self::ProtocolCallRateExceeded,
             Self::DecisionInvariantViolation,
+            Self::TooManyAuthContexts,
         ];
         all_errors
             .into_iter()
@@ -455,6 +464,22 @@ pub enum DataKey {
 }
 
 /// Stable contract errors and decision reasons exposed by the ABI.
+///
+/// # Discriminant Stability & Frozen Codes
+///
+/// Error discriminants are permanently frozen across mainnet/testnet releases because
+/// off-chain SDKs, indexers, and telemetry decode errors using these exact numeric codes
+/// (`Error(Contract, #N)`).
+///
+/// Variants are partitioned into three numeric groups:
+/// - Generic / lifecycle (`1..=9`, next free: `7`)
+/// - Account-level gates (`10..=19`, next free: `15`)
+/// - Per-call decisions (`20..=39`, next free: `34`)
+///
+/// Always follow the 'append, never insert' convention when adding variants. For the
+/// full end-to-end contributor workflow (touching the enum, reason mappings, decision table,
+/// SPEC §4/§6/§7, event vocabulary, and tests), see the checklist in `docs/contributing.md`
+/// (`#how-to-add-a-new-error-variant-end-to-end`) and `CONTRIBUTING.md`.
 #[allow(missing_docs)] // individual ABI variants are described below
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -511,6 +536,8 @@ pub enum Error {
     ProtocolCallRateExceeded = 30,
     /// An internal decision-engine invariant failed.
     DecisionInvariantViolation = 31,
+    /// One authorization contains more contexts than the engine evaluates.
+    TooManyAuthContexts = 33,
 }
 
 impl Error {
@@ -542,6 +569,7 @@ impl Error {
             Self::CreateContractNotAllowed => "create_contract_not_allowed",
             Self::ProtocolCallRateExceeded => "protocol_call_rate_exceeded",
             Self::DecisionInvariantViolation => "decision_invariant_violation",
+            Self::TooManyAuthContexts => "too_many_auth_contexts",
         }
     }
 }
@@ -566,6 +594,9 @@ mod tests {
     /// 2. Update the SDK's `reasons.ts` (`REASON_CODES` / `REASON_BY_CODE` mapping).
     /// 3. Update `tests/fixtures/auth-checked-vocabulary.json`.
     /// 4. Update this test to assert the new or modified discriminant.
+    ///
+    /// For the complete contributor checklist and verification commands, see
+    /// `docs/contributing.md#how-to-add-a-new-error-variant-end-to-end` and `CONTRIBUTING.md`.
     #[test]
     fn error_code_discriminant_stability_spec_7() {
         let all_errors = [
@@ -593,6 +624,7 @@ mod tests {
             Error::RecipientBlocked,
             Error::ProtocolCallRateExceeded,
             Error::DecisionInvariantViolation,
+            Error::TooManyAuthContexts,
         ];
 
         // An exhaustive match asserting each variant's exact discriminant against SPEC §7.
@@ -624,6 +656,7 @@ mod tests {
                 Error::ProtocolCallRateExceeded => (30, "protocol_call_rate_exceeded"),
                 Error::DecisionInvariantViolation => (31, "decision_invariant_violation"),
                 Error::AssetFnNotAllowed => (32, "asset_fn_not_allowed"),
+                Error::TooManyAuthContexts => (33, "too_many_auth_contexts"),
             };
 
             assert_eq!(
@@ -672,6 +705,7 @@ mod tests {
             Error::RecipientBlocked,
             Error::ProtocolCallRateExceeded,
             Error::DecisionInvariantViolation,
+            Error::TooManyAuthContexts,
         ] {
             let code = err as u32;
             assert!(
