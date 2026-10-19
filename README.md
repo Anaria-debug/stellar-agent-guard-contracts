@@ -98,7 +98,10 @@ cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
 cargo test                                      # 217 tests, isolated (no network)
 
-# Read live state from the Phase-1 testnet deployment (no auth, simulation only)
+# Read live state from the Phase-1 testnet deployment (no auth, simulation only).
+# Live, testnet protocol 28, 2026-09-08: the fixture account was DMS-frozen
+# (heartbeat_expired: true) — the designed end state after the 60s grace lapsed.
+# The read still succeeds because reads are permissionless.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- status
 # → {"admin_frozen":false,"has_policy":true,"heartbeat_expired":true,"last_heartbeat":1788855212,"now":1788863857}
@@ -123,6 +126,9 @@ authorization is rejected with `not_initialized`/`no_policy`.
 
 Called twice, it fails with `AlreadyInitialized` — verified live:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the fixture account was already
+# initialized, so this second call is rejected — demonstrates the retry hazard
+# below, not a failed deployment.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- \
   initialize --admin GD5S5O2MZ6FSMFH6QILG37KSQNRVR3RPSWBTTV4JOUJ7J6TWLLL5LAVS \
@@ -173,6 +179,10 @@ Config is validated **before** anything is written; invalid config fails with
 fixture policy installs cleanly (emits `EventPolicySet`), and an invalid active window
 (`active_until <= active_from`) is rejected with `Error(Contract, #4)`:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: simulated against the deployed account
+# while it was DMS-frozen. The admin write is still admitted — the dead-man gate
+# guards agent authorizations, not admin policy writes — and emits EventPolicySet.
+# Simulation does not persist this call.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- set_policy --config '{
     "active_from": 0, "active_until": 0, "allow_any_recipient": false,
@@ -331,6 +341,9 @@ For gate ordering and full incident guidance, see [SPEC §4.2](SPEC.md#42-admin-
 The real Phase-1 unfreeze — the DMS-reversal transaction verified on-chain (tx
 `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5`):
 ```bash
+# Live, testnet protocol 28, 2026-09-08 (on-chain): the account had self-frozen
+# when the 60s grace lapsed; this admin unfreeze is the only path back (the
+# agent's own heartbeat is rejected while expired). Submitted and confirmed.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source guard_admin --send=yes -- unfreeze
 # → ✅ Transaction submitted successfully!  tx=dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5
@@ -345,6 +358,9 @@ read may extend the policy TTL and incur rent if it is below the threshold in [S
 simulation does not persist the extension. Verified live against the deployed contract — this is
 the real installed fixture policy:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the account is DMS-frozen but the
+# policy still reads — permissionless reads are not gated by the dead-man switch.
+# This is the policy currently installed on the fixture account (DMS grace 60s).
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- policy
 # → {"active_from":0,"active_until":0,"allow_any_recipient":false,
@@ -384,6 +400,9 @@ account. When submitted on-ledger, this read may extend persistent-entry TTLs an
 simulation does not persist those extensions (SPEC §9.5).
 Verified live:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the fixture account's 60s DMS grace
+# lapsed after the Phase-1 runs, so it reports heartbeat_expired: true. That is
+# the self-freeze working as designed, not a broken read.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- status
 # → {"admin_frozen":false,"has_policy":true,"heartbeat_expired":true,"last_heartbeat":1788855212,"now":1788863857}
@@ -407,6 +426,10 @@ telemetry sees one vocabulary. Submitting it on-ledger may extend persistent-ent
 incur rent (SPEC §9.5); simulation does not persist those extensions. Verified live (this account is
 DMS-frozen, so the honest answer today is blocked):
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the account was DMS-frozen, so this
+# simulated 50-unit transfer is blocked at the dead-man gate (heartbeat_expired)
+# before caps or allowlists are consulted. That is a correct answer to "can this
+# transfer go through right now?", not a failure of the contract.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- \
   check --asset CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7 \
@@ -432,6 +455,9 @@ pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> Ch
 ```
 Example CLI read for a policy with a 150-unit rolling cap and 40 units already spent:
 ```bash
+# Illustrative shape, not a live capture: a 150-unit window with 40 already
+# spent, 25 more requested → Allowed, 110 remaining. Replace the placeholders
+# with real IDs; this block documents the fields, not a verified run.
 stellar contract invoke --id GUARD_CONTRACT_ID --network testnet --source-account operator --send=no -- \
   check_detailed --asset ASSET_CONTRACT_ID --to RECIPIENT_ADDRESS --amount 25
 # → {"result":"Allowed","remaining_window":"110","per_tx_cap":"1000",\
@@ -778,8 +804,26 @@ Stellar Agent Guard operates across three dedicated repositories:
 
 ## ✅ Verified against live testnet
 
+### How to read the output blocks in this README
+
+One convention applies to every fenced block, so a copied snippet keeps its caveat
+(issue #418):
+
+- **`# Live, <network> protocol <n>, <date>: <account state>. <what the result
+  demonstrates>.`** The first line inside a live block names the state the account
+  was in and what the output is evidence for. Live values are historical: they
+  describe the account at capture time, not today.
+- A block **without** a `# Live` line is not evidence of on-chain behaviour: it is
+  a command (no output shown), local build/tool output (`# → target/...`), or an
+  illustrative shape with placeholders such as `GUARD_CONTRACT_ID`.
+- [`tests/fixtures/README.md`](tests/fixtures/README.md) uses the same convention,
+  and each of its scenario blocks also carries the transaction hash and ledger that
+  prove it.
+
 Phase 1 was proven end-to-end against a **real deployed contract** on Stellar testnet
-(protocol 28, `Test SDF Network ; September 2015`), cross-checked on-chain:
+(protocol 28, `Test SDF Network ; September 2015`), cross-checked on-chain. The values
+below are the Phase-1 record from 2026-09-08 — history, not a claim about the account's
+current state (the `status` block in the function reference above shows that):
 
 - **Guard (custom account) contract ID**:
   `CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7`
