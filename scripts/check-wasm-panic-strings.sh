@@ -18,7 +18,7 @@ if ! command -v strings >/dev/null 2>&1; then
 fi
 
 pattern='panicked at|panic in a function that cannot unwind|assertion failed|assertion `.*` failed|called `Result::unwrap\(\)` on an `Err` value|called `Option::unwrap\(\)` on a `None` value|index out of bounds:|slice index starts at|attempt to (add|subtract|multiply|divide) with overflow|unsafe precondition(s) violated'
-matches="$(strings -a -- "$artifact" | grep -E "$pattern" || true)"
+matches="$(strings -a -- "$artifact" | grep -oE "$pattern" | sort -u || true)"
 if [[ -z "$matches" ]]; then
   echo "No panic/unwrap diagnostic strings found in $artifact"
   exit 0

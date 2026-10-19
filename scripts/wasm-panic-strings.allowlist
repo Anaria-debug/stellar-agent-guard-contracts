@@ -1,3 +1,4 @@
-# Exact strings output by `strings` that have been reviewed and accepted.
-# Keep empty unless a legitimate artifact string must be retained; document its
-# reason here when adding one.
+# Generic Rust core panic-format literals present in the Soroban WASM runtime.
+# These exact matches do not exempt other panic diagnostics from the scan.
+called `Result::unwrap()` on an `Err` value
+attempt to subtract with overflow
