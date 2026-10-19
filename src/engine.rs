@@ -631,7 +631,7 @@ mod tests {
         ];
 
         let mut all_args = alloc::vec::Vec::new();
-        
+
         // 0 args
         all_args.push(Vec::new(&env));
 
@@ -694,14 +694,19 @@ mod tests {
                 // It either yields a stable classified denial, or an Allowed (if it randomly made a valid transfer).
                 let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, vec![&env, ctx]);
                 assert!(!d.is_empty());
-                
+
                 // Extra check: parse_call doesn't trap
-                let parsed = parse_call(&env, &sa, &Context::Contract(ContractContext {
-                    contract: asset.clone(),
-                    fn_name: fn_sym.clone(),
-                    args: args.clone(),
-                }), &p);
-                
+                let parsed = parse_call(
+                    &env,
+                    &sa,
+                    &Context::Contract(ContractContext {
+                        contract: asset.clone(),
+                        fn_name: fn_sym.clone(),
+                        args: args.clone(),
+                    }),
+                    &p,
+                );
+
                 match parsed {
                     ParsedCall::AssetTransfer { .. } | ParsedCall::Unknown { .. } => {}
                     _ => panic!("Expected AssetTransfer or Unknown"),
