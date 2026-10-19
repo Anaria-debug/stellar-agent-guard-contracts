@@ -233,7 +233,10 @@ mod tests {
         assert_eq!(overridden.rpc_url, custom);
         assert_eq!(overridden.network, None, "a private node is not a preset");
         assert_eq!(overridden.passphrase, "Local Network ; 2026");
-        assert_eq!(overridden.passphrase_source, "explicit --network-passphrase");
+        assert_eq!(
+            overridden.passphrase_source,
+            "explicit --network-passphrase"
+        );
 
         // A preset endpoint passed as a URL is still that network: signing the
         // wrong payload because the passphrase came from the default would be

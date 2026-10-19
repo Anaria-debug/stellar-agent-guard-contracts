@@ -207,11 +207,7 @@ trait PreflightRpc {
 }
 
 impl Rpc {
-    fn post(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcError> {
+    fn post(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -242,15 +238,14 @@ impl Rpc {
             json_rpc_code: None,
             message: error.to_string(),
         })?;
-        let json: serde_json::Value = serde_json::from_str(&response_body).map_err(|error| {
-            RpcError {
+        let json: serde_json::Value =
+            serde_json::from_str(&response_body).map_err(|error| RpcError {
                 method: method.to_string(),
                 kind: RpcFailureKind::InvalidResponse,
                 http_status: Some(status),
                 json_rpc_code: None,
                 message: format!("response is not valid JSON: {error}"),
-            }
-        })?;
+            })?;
         if let Some(err) = json.get("error") {
             return Err(RpcError {
                 method: method.to_string(),
@@ -380,15 +375,13 @@ impl PreflightRpc for Rpc {
 }
 
 fn parse_inclusion_fee(stats: &serde_json::Value) -> Option<u32> {
-    ["mode", "p50", "min"]
-        .iter()
-        .find_map(|field| {
-            let value = &stats["inclusionFee"][field];
-            value
-                .as_str()
-                .and_then(|fee| fee.parse::<u32>().ok())
-                .or_else(|| value.as_u64().and_then(|fee| u32::try_from(fee).ok()))
-        })
+    ["mode", "p50", "min"].iter().find_map(|field| {
+        let value = &stats["inclusionFee"][field];
+        value
+            .as_str()
+            .and_then(|fee| fee.parse::<u32>().ok())
+            .or_else(|| value.as_u64().and_then(|fee| u32::try_from(fee).ok()))
+    })
 }
 
 fn calculate_fee(min_resource_fee: u32, inclusion_fee: u32) -> u32 {
@@ -410,13 +403,19 @@ fn resolve_inclusion_fee<R: PreflightRpc>(
             eprintln!(
                 "warning: RPC fee statistics did not include an inclusion fee; using fallback {INCLUSION_FEE} stroops"
             );
-            (INCLUSION_FEE, "fallback constant (fee statistics unavailable)")
+            (
+                INCLUSION_FEE,
+                "fallback constant (fee statistics unavailable)",
+            )
         }
         Err(error) => {
             eprintln!(
                 "warning: could not read the network inclusion fee ({error}); using fallback {INCLUSION_FEE} stroops"
             );
-            (INCLUSION_FEE, "fallback constant (fee statistics unavailable)")
+            (
+                INCLUSION_FEE,
+                "fallback constant (fee statistics unavailable)",
+            )
         }
     }
 }
@@ -950,7 +949,11 @@ fn run(call: &Call, args: &Args) {
             print_events(&serde_json::Value::Array(events.clone()));
         }
         println!("  broadcast: no");
-        std::process::exit(if policy_block && args.expect_blocked { 0 } else { 1 });
+        std::process::exit(if policy_block && args.expect_blocked {
+            0
+        } else {
+            1
+        });
     }
     if args.expect_blocked {
         println!("expected a block, but the enforced simulation succeeded");
@@ -2491,7 +2494,9 @@ fn print_help() {
     println!("  --network-passphrase <passphrase>     override the preset's passphrase (advanced:");
     println!("                                        private or non-standard networks)");
     println!("  --inclusion-fee <stroops>              override the RPC-reported inclusion fee");
-    println!("  Custom --rpc-url values require --network-passphrase unless the URL is a known preset.");
+    println!(
+        "  Custom --rpc-url values require --network-passphrase unless the URL is a known preset."
+    );
     println!(
         "  Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr."
     );
@@ -2553,10 +2558,7 @@ fn cmd_status(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), Str
     let keys = [instance_key, policy_key, heartbeat_key, frozen_key];
     let keys_xdr: Vec<String> = keys.iter().map(b64_encode_xdr).collect();
 
-    let res = rpc_or_exit(rpc.post(
-        "getLedgerEntries",
-        serde_json::json!({ "keys": keys_xdr }),
-    ));
+    let res = rpc_or_exit(rpc.post("getLedgerEntries", serde_json::json!({ "keys": keys_xdr })));
 
     let entries = res["entries"].as_array().ok_or("no entries in response")?;
 
