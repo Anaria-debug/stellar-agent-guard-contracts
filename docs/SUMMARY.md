@@ -1,5 +1,6 @@
 # Summary
 
+* [About the documentation site](README.md)
 * [Introduction](introduction.md)
 * [Installation](installation.md)
 * [Concepts](concepts/)

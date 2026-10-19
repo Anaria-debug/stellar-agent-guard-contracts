@@ -74,6 +74,17 @@ Do **not** declare a lower MSRV than the graph supports. Before issue #410 this
 repository declared 1.85 while `soroban-sdk` required 1.91, so a contributor's
 first `cargo build` failed on a version the README called supported.
 
+### Documentation site (GitBook)
+
+The published docs at
+<https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/> are
+synced from this repository by GitBook Git Sync — there is no build or deploy
+workflow in `.github/workflows/`. What gets synced, what triggers a sync, how
+to preview a change, who can publish, and which file wins between
+`gitbook-docs.yaml` and `docs/SUMMARY.md` are documented in
+[`docs/README.md`](docs/README.md). Read that before adding, moving, or renaming
+a page; after any such change, run `scripts/verify-docs-reachability.sh`.
+
 The `stellar` CLI cannot sign Soroban authorization entries whose address is a
 contract. Heartbeat testing uses the guard contract's own address, so the CLI
 cannot submit a heartbeat; use `agent-tx` for this path. See the
