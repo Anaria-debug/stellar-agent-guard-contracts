@@ -21,7 +21,7 @@
 
 # Stellar Agent Guard — Contracts
 
-📚 **[Documentation](https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/)**
+📚 **[Documentation](https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/)** • **[SPEC ↔ GitBook Cross-Reference](docs/README.md#spec--gitbook-cross-reference-map)**
 
 **Non-custodial, account-level spending firewall for autonomous AI agents on Stellar.**
 
@@ -96,7 +96,7 @@ Full recipient/amount enforcement — spend caps, allowlists, per-transaction li
 git clone https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 217 tests, isolated (no network)
+cargo test                                      # 224 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only).
 # Live, testnet protocol 28, 2026-09-08: the fixture account was DMS-frozen
@@ -269,9 +269,10 @@ The `stellar` CLI cannot invoke it, because it cannot sign Soroban auth entries 
 address is a contract. Use the repo's submission helper instead:
 ```bash
 cd tools/agent-tx && cargo build --release
+# Read without echo so the secret is not saved in shell history.
+read -rsp "Agent secret: " AGENT_SECRET; echo; export AGENT_SECRET
 ./target/release/agent-tx heartbeat \
-  --guard CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
-  --agent-secret S...   # the registered agent's Ed25519 secret (AGENT_SECRET env also works)
+  --guard CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7
 ```
 
 For the full steady-state loop an agent must run (heartbeat cadence, per-transfer
@@ -291,11 +292,13 @@ guarantee of the eventual inclusion fee.
 
 ```bash
 cd tools/agent-tx && cargo build --release
+# Read without echo so the secret is not saved in shell history.
+read -rsp "Agent secret: " AGENT_SECRET; echo; export AGENT_SECRET
 ./target/release/agent-tx preflight \
   --guard CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --asset CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7 \
   --to GDUYLFVFLVISVOM5FK5KTBA446VQQ7NBRRFMLNLKLISKL26LJGKUVRRX \
-  --amount 1100 --secret "$AGENT_SECRET"
+  --amount 1100
 # BLOCKED (pre-broadcast, enforced simulation)
 # diagnostic event: auth_checked, blocked, per_tx_cap_exceeded
 # broadcast: no
@@ -303,11 +306,12 @@ cd tools/agent-tx && cargo build --release
 
 The example exceeds the fixture policy's `per_tx_cap: 1000`. Exit codes:
 `0` means signed simulation admitted the call, `1` means signed simulation
-blocked it, and `2` means the unsigned simulation was inconclusive. `--secret`
-is optional (or supplied via `AGENT_SECRET`): without it the tool retrieves the
+blocked it, and `2` means the unsigned simulation was inconclusive. The secret
+is optional: without `AGENT_SECRET` the tool retrieves the
 registered public key and estimates a fee, but cannot sign the custom-account
 authorization, so it cannot establish whether `__check_auth` will admit the
-transfer. See [`tools/agent-tx/README.md`](tools/agent-tx/README.md) for details.
+transfer. The command above prompts without echo so the secret is not saved in
+shell history. See [`tools/agent-tx/README.md`](tools/agent-tx/README.md) for details.
 
 ### `freeze` / `unfreeze`
 ```rust
@@ -647,37 +651,59 @@ its own commit so the hash change is reviewable on its own.
 ## How it works
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
-│ Transaction requires │─────▶│ __check_auth         │─────▶│ Verify agent Ed25519 │
-│ the account's auth   │      │ (host-invoked)       │      │ signature over auth  │
-└──────────────────────┘      └──────────────────────┘      │ payload (bad sig ⇒  │
-                                                             │ host trap)          │
-                                                             └──────────┬───────────┘
-                                                                        ▼
-┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
-│ Load PolicyConfig,   │◀─────│ Contexts >64 block   │◀─────│ Load instance +      │
-│ AdminFrozen,         │      │ before gates; else   │      │ persistent state     │
-│ LastHeartbeat, now   │      │ admin → DMS → pause  │      │ (agent key, policy,  │
-└──────────┬───────────┘      │ → active window      │      │ window, heartbeat)   │
-           │                  └──────────────────────┘      └──────────────────────┘
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ Transaction requires │───▶│ __check_auth         │───▶│ Verify agent Ed25519 │
+│ the account's auth   │    │ (host-invoked)       │    │ signature over auth  │
+│                      │    │                      │    │ payload              │
+│ [HOLDS FUNDS]        │    │ [HOST-ENFORCED]      │    │                      │
+│ Contract is account; │    │ Single enforcement   │    │ [HOST-ENFORCED]      │
+│ funds live in agent's│    │ vector (SPEC §1)     │    │ Host ed25519_verify; │
+│ own smart account    │    │                      │    │ bad sig traps frame  │
+│ with balances held   │    │ [NO FUNDS]           │    │ before policy eval   │
+│ at contract address  │    │ No third-party vault,│    │ (SPEC §1.1, §4.1)    │
+│ by SAC (SPEC §1)     │    │ no top_up, no deposit│    │                      │
+│                      │    │ step (SPEC §1)       │    │                      │
+└──────────────────────┘    └──────────────────────┘    └──────────┬───────────┘
+                                                [POLICY-BOUND]     │
+                                                From here, auth is │
+                                                policy-bound       ▼
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ Load PolicyConfig,   │◀───│ Contexts >64 block   │◀───│ Load instance +      │
+│ AdminFrozen,         │    │ before gates; else   │    │ persistent state     │
+│ LastHeartbeat, now   │    │ admin → DMS → pause  │    │ (agent key, policy,  │
+└──────────┬───────────┘    │ → active window      │    │ window, heartbeat)   │
+           │                └──────────────────────┘    └──────────────────────┘
            ▼
-┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
-│ Per-context decision │─────▶│ parse_call: classify │─────▶│ Enforce per kind:    │
-│ loop — every context │      │ each auth context    │      │ • AssetTransfer →    │
-│ must pass            │      │ (SelfCall /          │      │   recipient allowlist│
-└──────────────────────┘      │  CreateContract /    │      │   + per-tx cap +     │
-                              │  Unknown / AssetOther│      │   rolling window     │
-                              │  / AssetTransfer /   │      │ • Protocol → contract│
-                              │  Protocol)           │      │   + fn allowlist     │
-                              └──────────────────────┘      │ • anything else →    │
-                                                             │   default-deny       │
-                                                             └──────────┬───────────┘
-                                                                        ▼
-                              ┌────────────────────────────────────────────────────┐
-                              │ All contexts admissible?  Yes → commit staged      │
-                              │ window admissions → Ok(()).  No → Err(reason) —     │
-                              │ the whole transaction is rejected pre-broadcast.   │
-                              └────────────────────────────────────────────────────┘
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ Per-context decision │───▶│ parse_call: classify │───▶│ Enforce per kind:    │
+│ loop — every context │    │ each auth context    │    │ • AssetTransfer →    │
+│ must pass            │    │ (SelfCall /          │    │   recipient allowlist│
+└──────────────────────┘    │  CreateContract /    │    │   + per-tx cap +     │
+                            │  Unknown / AssetOther│    │   rolling window     │
+                            │  / AssetTransfer /   │    │ • Protocol → contract│
+                            │  Protocol)           │    │   + fn allowlist     │
+                            └──────────────────────┘    │ • anything else →    │
+                                                        │   default-deny       │
+                                                        └──────────┬───────────┘
+                                                                   ▼
+                          ┌────────────────────────────────────────────────────┐
+                          │ All contexts admissible?  Yes → commit staged      │
+                          │ window admissions → Ok(()).  No → Err(reason) —    │
+                          │ the whole transaction is rejected pre-broadcast.   │
+                          └────────────────────────────────────────────────────┘
+
+Trust boundaries & custody legend (SPEC §1):
+  [HOST-ENFORCED] Host-enforced step: Soroban host routes require_auth through
+                  __check_auth (SPEC §1); host crypto verification traps
+                  on bad signature (SPEC §1.1, §4.1).
+  [HOLDS FUNDS]   Contract is account (SPEC §1); funds live in agent's own
+                  smart account with balances held at contract address by
+                  Stellar Asset Contracts (SPEC §1).
+  [NO FUNDS]      Check logic takes no custody: there is no third-party vault,
+                  no top_up, no deposit step (SPEC §1).
+  [POLICY-BOUND]  From here, agent authorization is policy-bound: policy admin
+                  holds no fund-moving authority of any kind (admin functions
+                  change policy and freeze state only) (SPEC §1).
 ```
 
 Walkthrough, matching the real code path in `src/lib.rs` / `src/engine.rs`:
@@ -708,7 +734,8 @@ Walkthrough, matching the real code path in `src/lib.rs` / `src/engine.rs`:
 7. **All-or-nothing commit.** Window admissions are staged and only committed to storage
    if *every* context passes — a partially-validating batch can never spend. `Ok(())`
    approves; `Err(reason)` rejects the entire transaction, and the `auth_checked` event
-  records the outcome either way — with the same observability caveat as step 6 above:
+  records the outcome either way. Its data includes the authorized contract and function, so
+  a blocked decision identifies the denied call. The event has the same observability caveat as step 6 above:
    an allowed decision's event is committed, a blocked one exists only in diagnostics
    (the transaction it rolled back with carried it away). See [SPEC §9](SPEC.md#9-events-and-telemetry).
 
@@ -800,7 +827,8 @@ Stellar Agent Guard operates across three dedicated repositories:
   build if that file, the SPEC §4 table, the “How it works” walkthrough above, the
   `Error` enum, and `src/engine.rs` disagree — so the three artifacts cannot drift
   apart silently.
-- `SPEC.md` — the full architecture specification.
+- `docs/README.md` — documentation contributor guide and the [SPEC ↔ GitBook cross-reference map](docs/README.md#spec--gitbook-cross-reference-map).
+- `SPEC.md` — the full architecture specification (normative source of truth).
 
 ## ✅ Verified against live testnet
 
@@ -879,11 +907,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-217 tests (unit + integration) cover the policy decision engine — including the regression
+224 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `217 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `224 passed; 0 failed`.
 
 ```bash
 cargo test
