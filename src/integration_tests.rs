@@ -102,11 +102,12 @@ impl Harness {
         let other = Address::generate(&env);
 
         // soroban-sdk 27 test env defaults to *enforcing* auth: `require_auth`
-        // only passes with explicit entries. Admin setup ops (initialize,
-        // set_policy, ...) run under blanket mocking; `enforce()` flips the env
-        // back into enforcing mode with a hand-signed entry for the guarded
-        // flow. `mock_all_auths` is the documented default intent of the
-        // harness (see header comment).
+        // only passes with explicit entries. The default harness intentionally
+        // uses blanket mocking for the rest of the suite because the majority of
+        // tests care about policy behavior, not the auth bootstrap path; this is
+        // the documented exception for the suite, not an accidental omission.
+        // A dedicated test can choose explicit `set_auths` entries to verify the
+        // real `require_auth` flow when admin/agent semantics matter.
         env.mock_all_auths();
         let client = PolicyEngineClient::new(&env, &guard);
         let pk = agent.verifying_key().to_bytes();
@@ -123,6 +124,50 @@ impl Harness {
             guard_nonce: 1,
             admin_nonce: 1,
         }
+    }
+
+    /// Fresh registration under real host auth: initialize and the first policy
+    /// set both require explicit admin entries, with no blanket `mock_all_auths`
+    /// call in this harness.
+    fn new_enforced_auth() -> Self {
+        let env = Env::default();
+        let agent = SigningKey::from_bytes(&[7u8; 32]);
+        let admin = env.register(MockAdmin, ());
+        let asset = env.register(MockAsset, ());
+        let guard = env.register(PolicyEngine, ());
+        let recv = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        let mut h = Harness {
+            env,
+            guard,
+            admin,
+            asset,
+            agent,
+            recv,
+            other,
+            guard_nonce: 1,
+            admin_nonce: 1,
+        };
+
+        let pk = h.agent.verifying_key().to_bytes();
+        let init_root = h.invocation(
+            &h.guard,
+            "initialize",
+            std::vec![
+                h.admin.clone().into_val(&h.env),
+                BytesN::from_array(&h.env, &pk).into_val(&h.env),
+            ],
+        );
+        let init_entry = {
+            let h = &mut h;
+            h.admin_entry(&init_root)
+        };
+        h.env.set_auths(&[init_entry]);
+        PolicyEngineClient::new(&h.env, &h.guard)
+            .initialize(&h.admin, &BytesN::from_array(&h.env, &pk));
+
+        h
     }
 
     /// Base policy: asset = `MockAsset`, one allowed recipient, no caps.
@@ -148,6 +193,17 @@ impl Harness {
 
     // ── Admin ops (mock mode: before any `set_auths`) ────────────────────
     fn install_policy(&self, cfg: &PolicyConfig) {
+        PolicyEngineClient::new(&self.env, &self.guard).set_policy(&cfg.clone());
+    }
+
+    fn install_policy_enforced(&mut self, cfg: &PolicyConfig) {
+        let root = self.invocation(
+            &self.guard,
+            "set_policy",
+            std::vec![cfg.clone().into_val(&self.env)],
+        );
+        let entry = self.admin_entry(&root);
+        self.enforce(entry);
         PolicyEngineClient::new(&self.env, &self.guard).set_policy(&cfg.clone());
     }
 
@@ -773,4 +829,21 @@ fn batch_events_emit_in_order_with_context_index() {
     // ctx3: allowed (even though the batch fails, decide evaluates all contexts and emits for all)
     assert_eq!(auth_events[2].0.get(1).unwrap(), &want_allowed);
     assert_eq!(auth_events[2].1, build_map(2));
+}
+
+#[test]
+fn full_lifecycle_from_fresh_registration_uses_real_admin_and_agent_auth() {
+    let mut h = Harness::new_enforced_auth();
+    let recv = h.recv.clone();
+    let policy = h.base_policy();
+
+    h.set_time(1_000);
+    h.install_policy_enforced(&policy);
+    h.transfer(&recv, 50);
+
+    assert!(h.emitted_allowed_auth());
+    let st = h.status();
+    assert!(st.has_policy);
+    assert_eq!(st.policy_revision, 1);
+    assert!(!st.heartbeat_expired);
 }
