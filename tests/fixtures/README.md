@@ -10,6 +10,12 @@ Nothing here is simulated.
 - RPC used for submissions: `https://soroban-testnet.stellar.org`
 - Horizon used for verification: `https://horizon-testnet.stellar.org`
 
+This file is the on-chain half of [SECURITY.md § Verified against](../../SECURITY.md#verified-against):
+that section names the protocol and `soroban-sdk` version, and this file records
+the transactions that prove the behaviour on them. `index.json` mirrors the
+network (including `network.protocol: 28`) so the claim is machine-checkable;
+when the protocol or SDK changes, both files move together.
+
 ## Deployed contracts
 
 | Component | Address |

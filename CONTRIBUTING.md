@@ -332,7 +332,12 @@ tasks for the Drips Stellar Wave contributor sprints.
 When bumping `soroban-sdk` version in `Cargo.toml`, you **must** re-verify
 SPEC §1.1 quotes against the new SDK source (`src/auth.rs`, `src/custom_account.rs`).
 Update the version comment in `Cargo.toml` and the SPEC §1.1 header accordingly.
-This is the mechanical ratchet preventing silent auth-semantics drift.
+Also update the SDK row in
+[`SECURITY.md` § Verified against](SECURITY.md#verified-against), which names
+the protocol and SDK the security model was actually verified against — a bump
+without that update leaves a security document claiming a version that is no
+longer the one in `Cargo.lock`. This is the mechanical ratchet preventing
+silent auth-semantics drift.
 
 Dependabot (`.github/dependabot.yml`, weekly, Cargo + GitHub Actions) files
 update PRs against `main` the same as any contributor PR: they must pass the
