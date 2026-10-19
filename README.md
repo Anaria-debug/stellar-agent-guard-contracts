@@ -12,7 +12,7 @@
 <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0"/>
 </a>
 <a href="https://www.rust-lang.org/">
-<img src="https://img.shields.io/badge/rust-1.85%2B-blue" alt="Rust 1.85+"/>
+<img src="https://img.shields.io/badge/rust-1.91%2B-blue" alt="Rust 1.91+"/>
 </a>
 <a href="https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/">....
 <img src="https://img.shields.io/badge/docs-GitBook-blue" alt="Documentation"/>
@@ -849,10 +849,14 @@ cargo fmt --check
 
 Every push runs these gates on GitHub Actions (`.github/workflows/ci.yml`, job `ci`):
 format → clippy (`-D warnings`) → unit + integration tests → contract wasm build →
-`agent-tx` build. A second job, `wasm-reproducible`, builds the contract twice in clean
-target directories and fails unless both builds hash identically (see
-[Reproducible builds](#reproducible-builds)). `main` is protected by a branch ruleset —
-the `ci` check must be green and a review approved for changes to merge.
+`agent-tx` build. A second job, `msrv`, reads `rust-version` from `Cargo.toml`
+(currently `1.91.0`), installs that release with the `wasm32v1-none` target, and runs
+clippy, the test suite, and the contract build on it — so the declared minimum is a
+tested fact rather than an aspiration. Formatting stays on the pinned channel in that
+job because rustfmt output is version-sensitive. A third job, `wasm-reproducible`,
+builds the contract twice in clean target directories and fails unless both builds hash
+identically (see [Reproducible builds](#reproducible-builds)). `main` is protected by a
+branch ruleset — the `ci` check must be green and a review approved for changes to merge.
 
 ## Topics
 

@@ -46,6 +46,34 @@ would move and change the bytes without any change to the repository. Bumping
 `channel` in `rust-toolchain.toml` changes the released artifact hash, so do it
 in its own commit (issue #67).
 
+### Minimum supported Rust version (MSRV)
+
+`Cargo.toml` declares `rust-version = "1.91.0"`, and the `msrv` job in
+`.github/workflows/ci.yml` installs exactly that release — including the
+`wasm32v1-none` target — and runs clippy, `cargo test`, and the wasm build on
+it. The job reads the field from `Cargo.toml`, so changing that one value is
+what changes what CI proves; there is no second hardcoded version to forget.
+`cargo fmt` deliberately stays on the pinned channel in the `ci` job: rustfmt
+output is version-sensitive, and one formatter authority avoids two
+contradictory definitions of "formatted" (issue #410).
+
+The floor comes from the dependency graph, not from preference: `soroban-sdk`
+27.0.6 itself declares `rust-version = "1.91.0"`. If a dependency bump needs a
+newer compiler:
+
+1. Raise `rust-version` in the same PR as the bump — never as a drive-by — and
+   say why in the PR body.
+2. Update every version claim: the `README.md` badge, `docs/installation.md`,
+   and this section.
+3. Update [`SECURITY.md` § Verified against](SECURITY.md#verified-against),
+   because the security model is verified against a specific toolchain and
+   SDK, not against "Rust" in general.
+4. Let the `msrv` CI leg prove the new floor before merging.
+
+Do **not** declare a lower MSRV than the graph supports. Before issue #410 this
+repository declared 1.85 while `soroban-sdk` required 1.91, so a contributor's
+first `cargo build` failed on a version the README called supported.
+
 The `stellar` CLI cannot sign Soroban authorization entries whose address is a
 contract. Heartbeat testing uses the guard contract's own address, so the CLI
 cannot submit a heartbeat; use `agent-tx` for this path. See the
