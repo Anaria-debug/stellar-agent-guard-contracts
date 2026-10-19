@@ -570,10 +570,41 @@ fn run(call: &Call, args: &Args) {
         std::process::exit(1);
     }
 
-    // Assemble the final envelope from the simulation's resources and submit.
-    let mut data: SorobanTransactionData = xdr(sim["transactionData"]
+    // Capture and surface the simulation's cost estimate before we mutate
+    // the declared resources (we add a visible bump for the guard keys).
+    let sim_txdata_b64 = sim["transactionData"]
         .as_str()
-        .expect("simulation transactionData"));
+        .expect("simulation transactionData");
+    let mut data: SorobanTransactionData = xdr(sim_txdata_b64);
+    let sim_min_fee: u32 = sim["minResourceFee"]
+        .as_str()
+        .expect("minResourceFee")
+        .parse()
+        .expect("fee");
+    let sim_instructions = data.resources.instructions;
+    let sim_disk_read_bytes = data.resources.disk_read_bytes;
+    let sim_write_bytes = data.resources.write_bytes;
+    let sim_resource_fee = data.resource_fee;
+
+    println!("SIMULATION ESTIMATE (pre-submit, simulated values):");
+    println!("  min_resource_fee: {sim_min_fee}");
+    println!("  simulated_resource_fee: {sim_resource_fee}");
+    println!("  instructions: {sim_instructions}");
+    println!("  disk_read_bytes: {sim_disk_read_bytes}");
+    println!("  write_bytes: {sim_write_bytes}");
+    println!("  note: these are simulated estimates, not on-chain actuals");
+
+    // Machine-readable JSON so SDKs can consume the same fields.
+    let mut report = serde_json::json!({
+        "simulated": {
+            "min_resource_fee": sim_min_fee,
+            "simulated_resource_fee": sim_resource_fee,
+            "instructions": sim_instructions,
+            "disk_read_bytes": sim_disk_read_bytes,
+            "write_bytes": sim_write_bytes
+        }
+    });
+
     // The RPC's preflight runs in *recording* mode: it prices the token
     // contract's own storage but never executes `__check_auth`, so the guard's
     // policy/window/heartbeat/freeze keys are missing from its footprint and
@@ -594,20 +625,22 @@ fn run(call: &Call, args: &Args) {
     const GUARD_KEY_FEE_BUMP: i64 = 100_000;
     data.resources.footprint = merged;
     data.resource_fee = data.resource_fee.saturating_add(GUARD_KEY_FEE_BUMP);
-    let min_fee: u32 = sim["minResourceFee"]
-        .as_str()
-        .expect("minResourceFee")
-        .parse()
-        .expect("fee");
-    let fee = min_fee
+    let fee = sim_min_fee
         .saturating_add(INCLUSION_FEE)
         .saturating_add(GUARD_KEY_FEE_BUMP as u32);
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!(
-            "minResourceFee: {min_fee}, resourceFee: {}, final fee: {fee}",
+            "minResourceFee: {sim_min_fee}, resourceFee(after bump): {}, final fee: {fee}",
             data.resource_fee
         );
     }
+
+    // Add bump and final-fee to the machine-readable report so callers can
+    // surface the GUARD_KEY_FEE_BUMP contribution explicitly.
+    report.as_object_mut().unwrap().insert("bump".to_string(), serde_json::json!(GUARD_KEY_FEE_BUMP));
+    report.as_object_mut().unwrap().insert("final_fee".to_string(), serde_json::json!(fee));
+    // Print compact JSON on its own line for machine consumption.
+    println!("MACHINE_OUTPUT: {}", report.to_string());
     let tx = Transaction {
         source_account: MuxedAccount::Ed25519(Uint256(source_pk)),
         fee,
@@ -636,12 +669,26 @@ fn run(call: &Call, args: &Args) {
     let status = sent["status"].as_str().unwrap_or("?").to_string();
     println!("submitted: hash={hash} status={status}");
 
+    // Attach initial on-chain metadata to the machine output and print.
+    report.as_object_mut().unwrap().insert("onchain".to_string(), serde_json::json!({"status": status, "hash": hash}));
+    println!("MACHINE_OUTPUT: {}", report.to_string());
+
     for _ in 0..20 {
         std::thread::sleep(std::time::Duration::from_secs(3));
         let gt = args.rpc.get_tx(&hash);
         let st = gt["status"].as_str().unwrap_or("PENDING");
         if st == "SUCCESS" {
             println!("RESULT: ALLOWED tx={hash}");
+            // enrich report with confirmed on-chain fee if available
+            if let Some(fee_val) = gt.get("fee_charged") {
+                if let Some(map) = report.get_mut("onchain").and_then(|v| v.as_object_mut()) {
+                    map.insert("fee_charged".to_string(), fee_val.clone());
+                }
+            }
+            if let Some(map) = report.get_mut("onchain").and_then(|v| v.as_object_mut()) {
+                map.insert("status".to_string(), serde_json::json!("SUCCESS"));
+            }
+            println!("MACHINE_OUTPUT: {}", report.to_string());
             std::process::exit(0);
         }
         if st == "FAILED" {
@@ -649,6 +696,21 @@ fn run(call: &Call, args: &Args) {
             if let Some(errx) = gt["resultXdr"].as_str() {
                 println!("  resultXdr: {errx}");
             }
+            // attach any on-chain error/result to the machine output
+            if let Some(fee_val) = gt.get("fee_charged") {
+                if let Some(map) = report.get_mut("onchain").and_then(|v| v.as_object_mut()) {
+                    map.insert("fee_charged".to_string(), fee_val.clone());
+                }
+            }
+            if let Some(rx) = gt.get("resultXdr") {
+                if let Some(map) = report.get_mut("onchain").and_then(|v| v.as_object_mut()) {
+                    map.insert("resultXdr".to_string(), rx.clone());
+                }
+            }
+            if let Some(map) = report.get_mut("onchain").and_then(|v| v.as_object_mut()) {
+                map.insert("status".to_string(), serde_json::json!("FAILED"));
+            }
+            println!("MACHINE_OUTPUT: {}", report.to_string());
             std::process::exit(if args.expect_blocked { 0 } else { 1 });
         }
     }
