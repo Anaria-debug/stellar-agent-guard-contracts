@@ -27,9 +27,11 @@ agent-tx status --guard C... --network futurenet
   `--rpc-url` together are rejected: they name two endpoints, and guessing which one
   an operator meant is exactly the failure mode presets exist to remove. A URL that
   *is* a preset endpoint is recognised, so `--rpc-url https://soroban.stellar.org`
-  still signs the mainnet payload.
-- `--network-passphrase <phrase>` overrides the passphrase (a local
-  `stellar standalone` network, a fork).
+  still signs the mainnet payload. An unrecognized URL requires an explicit
+  `--network-passphrase`; the tool never guesses the network identity.
+- `--network-passphrase <phrase>` overrides a preset passphrase or specifies the
+  network identity for a custom node (for example, a local `stellar standalone`
+  network or a fork). The resolved passphrase source is printed before submission.
 - Selecting mainnet prints a one-line reminder on stderr that this contract is
   unaudited and gates real funds; see the repository [SECURITY.md](../../SECURITY.md).
 
@@ -193,6 +195,23 @@ It does not increment the account sequence or broadcast a transaction.
 require `--agent-secret` (or `AGENT_SECRET`). They are distinct from the
 non-broadcasting `preflight` command. See the repository README for the
 submission error mapping and troubleshooting guidance.
+
+`transfer-from` constructs the token call in the exact order
+`transfer_from(from, spender, to, amount)`. It requires `--from`; the guard is
+the spender and receives the signed authorization, while `--to` and `--amount`
+occupy argument positions 2 and 3. The token must already have an allowance for
+the guard as spender. This command uses the same simulate, sign, and submit flow
+as `transfer`.
+
+Submission fees use RPC `getFeeStats.inclusionFee.mode` plus the simulated
+`minResourceFee` and the guard-footprint fee allowance. `--inclusion-fee
+<stroops>` overrides the network-reported inclusion fee. If fee statistics are
+unavailable, the tool reports that it is using the 100-stroop fallback.
+
+RPC transport failures, HTTP failures, JSON-RPC rejections, and simulation-level
+transaction rejections are reported as distinct outcomes. `--expect-blocked`
+returns success only when the simulation contains a guard `auth_checked` block;
+other transaction failures are not treated as policy denials.
 
 ## Planned: generic `invoke` subcommand (scenario 7)
 

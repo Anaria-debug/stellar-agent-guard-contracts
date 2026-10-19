@@ -75,6 +75,11 @@ Each invocation uses a fresh tx sequence as the auth nonce (the SAC's replay
 protection records every consumed nonce on-chain; the guard's own `__check_auth`
 ignores nonces, per SPEC §6).
 
+`agent-tx transfer-from` now builds `transfer_from(from, guard, to, amount)` with
+the guard as spender and preserves the token contract's exact argument order.
+This path is not demonstrated by the live fixtures: no allowance transaction
+was run or verified for the deployed testnet token.
+
 ## How to read the blocks
 
 Every scenario block below carries the account state that produced its result —
