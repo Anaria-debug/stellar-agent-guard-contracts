@@ -1573,7 +1573,7 @@ mod tests {
     fn transfer_from_invocation_uses_exact_contract_argument_order() {
         let guard: ScAddress = VALID_GUARD.parse().unwrap();
         let from: ScAddress = VALID_RECIPIENT.parse().unwrap();
-        let to: ScAddress = "GDMVA2IQH63BYCFZMOVDYCUDGJZYSUCDGCVFDPU5BLTHFUEZ6BF5EPP"
+        let to: ScAddress = "GAOLI6NMXG5X3GZ2ASTIMX24IQQW7CSGHVSOU7HOWFCH73RBZXGAKSPP"
             .parse()
             .unwrap();
         let token: ScAddress = VALID_TOKEN.parse().unwrap();
@@ -1992,7 +1992,7 @@ mod tests {
             "--from",
             VALID_RECIPIENT,
             "--to",
-            "GDMVA2IQH63BYCFZMOVDYCUDGJZYSUCDGCVFDPU5BLTHFUEZ6BF5EPP",
+            "GAOLI6NMXG5X3GZ2ASTIMX24IQQW7CSGHVSOU7HOWFCH73RBZXGAKSPP",
             "--amount",
             "50",
             "--agent-secret",
