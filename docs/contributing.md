@@ -6,24 +6,38 @@ We welcome contributions. Here's how to get started.
 
 ## Development setup
 
+The canonical version of this section — with the full annotated gate — is
+[CONTRIBUTING.md](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/CONTRIBUTING.md#development-setup).
+These are the commands CI runs, in CI's order:
+
 ```bash
 # Clone the repo
 git clone https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 
-# Run tests (33 unit + integration tests, no network needed)
-cargo test
-
-# Lint (clippy all + pedantic are denied via [lints.clippy])
-cargo clippy --all-targets --all-features
-
 # Format check
 cargo fmt --check
+
+# Lint. `-D warnings` is what makes this a gate (CI fails on warnings)
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Run tests (224 unit + integration tests, no network needed)
+cargo test
+
+# Public API docs, warnings denied
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 # Build the contract WASM (Soroban 27 targets wasm32v1-none)
 cargo build --release --target wasm32v1-none
 
-# Build the agent-tx submission helper
+# README claim audit + docs link check
+scripts/verify-readme.sh
+scripts/verify-docs-reachability.sh
+
+# tools/agent-tx is a separate cargo project: fmt, clippy, test, build
+cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
+cargo clippy --manifest-path tools/agent-tx/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path tools/agent-tx/Cargo.toml
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
 

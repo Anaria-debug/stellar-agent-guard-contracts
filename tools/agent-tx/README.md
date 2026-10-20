@@ -7,6 +7,19 @@ address. Build it from the repository root with:
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
 
+## Gates
+
+This is a separate cargo project (its own `Cargo.toml` and `Cargo.lock`), so the
+repository-root gates do not cover it — CI runs its fmt, clippy, test, and build
+steps explicitly. Run the same four commands from the repository root:
+
+```bash
+cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
+cargo clippy --manifest-path tools/agent-tx/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path tools/agent-tx/Cargo.toml
+cargo build --release --manifest-path tools/agent-tx/Cargo.toml
+```
+
 ## Network selection
 
 Every subcommand resolves its endpoint from a named preset, which fixes both the RPC

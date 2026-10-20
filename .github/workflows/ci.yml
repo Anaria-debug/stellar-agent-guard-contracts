@@ -76,6 +76,10 @@ jobs:
       - name: Verify documentation reachability
         run: scripts/verify-docs-reachability.sh
 
+      # tools/agent-tx is a separate cargo project (its own Cargo.toml and
+      # Cargo.lock), so none of the gates above see it. It signs and submits
+      # guard authorization entries, so it gets the same gates, not just a
+      # build. Keep this list in sync with CONTRIBUTING.md's local-gate block.
       - name: Agent submission tool format check (tools/agent-tx)
         run: cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
 

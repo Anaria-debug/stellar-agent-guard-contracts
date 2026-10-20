@@ -18,28 +18,59 @@ cd stellar-agent-guard-contracts
 # every cargo command below runs on the pinned compiler — install it once with
 # `rustup toolchain install`, or just run a cargo command and let rustup do it.
 
-# Run tests (31 unit + integration tests, no network needed)
-cargo test
+# ── The local gate: the commands CI runs, in CI's order ──────────────────
+# These are the commands `.github/workflows/ci.yml` job `ci` runs. Run the
+# whole block before opening a PR — a branch that is green here is the branch
+# CI sees. If you change the gate, change this block, the README's Testing &
+# CI section, and the workflow in the same PR.
 
-# Audit numeric, hash, transaction, and contract-ID claims before README PRs
-scripts/verify-readme.sh
-
-# Lint (clippy all + pedantic are denied via [lints.clippy])
-cargo clippy --all-targets --all-features
-
-# Format check
+# 1. Format check
 cargo fmt --check
 
-# Build the contract wasm (Soroban 27 targets wasm32v1-none)
+# 2. Clippy. The `-D warnings` flag is what makes this a gate; without it the
+#    `[lints.clippy] all/pedantic = "deny"` groups still print as warnings and
+#    the command exits 0 while CI fails.
+cargo clippy --all-targets --all-features -- -D warnings
+
+# 3. Unit + integration tests (224 tests, no network needed)
+cargo test
+
+# 4. Public API documentation, warnings denied
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+# 5. Build the contract wasm (Soroban 27 targets wasm32v1-none)
 cargo build --release --target wasm32v1-none
 
-# Prove the wasm build is deterministic (builds twice, diffs SHA-256);
-# this is the same check CI's `wasm-reproducible` job runs.
-./scripts/check-wasm-reproducible.sh
+# 6. Audit README claims, then the links from docs/ (`--check` in CI)
+scripts/verify-readme.sh
+scripts/verify-docs-reachability.sh
 
-# Build the agent-tx submission helper
+# 7. tools/agent-tx is a separate cargo project (its own Cargo.toml and
+#    Cargo.lock — not a workspace member), so steps 1-6 never see it. CI gates
+#    it explicitly with the same four commands; run them here too, because the
+#    build alone does not run its tests.
+cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
+cargo clippy --manifest-path tools/agent-tx/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path tools/agent-tx/Cargo.toml
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
+
+Two CI jobs sit outside the `ci` job and are not merge requirements. Run them
+when you touch the build or the declared version:
+
+```bash
+# Deterministic build (builds twice, diffs SHA-256) — the `wasm-reproducible` job.
+./scripts/check-wasm-reproducible.sh
+
+# The declared `rust-version` is proven by the `msrv` job, not by this block;
+# see "Minimum supported Rust version" below.
+```
+
+One CI step has no separate command: the **unwrap/expect guard** greps
+`src/lib.rs`, `src/types.rs`, and the non-test halves of `src/engine.rs` and
+`src/window.rs` for `.unwrap(`/`.expect(`, and fails the job if it finds any
+(see Coding Standards item 1). Keep that rule in mind while editing enforcement
+code; CI enforces it even if no test catches it.
 
 The pin is what makes the released WASM hash verifiable: a `stable` toolchain
 would move and change the bytes without any change to the repository. Bumping
@@ -293,7 +324,9 @@ layer and must not silently diverge.
 2. Conventional commit format: `type(scope): description`
    (e.g. `fix(window): use addition-form expiry to avoid low-timestamp underflow`).
 3. Rebase onto the latest `main` before pushing.
-4. Ensure CI passes (fmt, clippy, tests, both builds).
+4. Ensure the full local gate passes — run the block in
+   [Development Setup](#development-setup) before pushing; it is the command
+   list CI runs, `agent-tx` included.
 
 ## Pull Request Process
 
