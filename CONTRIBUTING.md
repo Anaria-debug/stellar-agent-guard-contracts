@@ -41,7 +41,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 # 5. Build the contract wasm (Soroban 27 targets wasm32v1-none)
 cargo build --release --target wasm32v1-none
 
-# 6. Audit README claims, then the links from docs/ (`--check` in CI)
+# 6. Audit README claims, then verify every page under docs/ is reachable
 scripts/verify-readme.sh
 scripts/verify-docs-reachability.sh
 
@@ -55,15 +55,13 @@ cargo test --manifest-path tools/agent-tx/Cargo.toml
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
 
-Two CI jobs sit outside the `ci` job and are not merge requirements. Run them
-when you touch the build or the declared version:
+Two CI jobs sit outside the `ci` job and are not merge requirements. Run the
+determinism check when you touch the build; the `msrv` job is proven by CI (see
+[Minimum supported Rust version](#minimum-supported-rust-version-msrv) below).
 
 ```bash
-# Deterministic build (builds twice, diffs SHA-256) — the `wasm-reproducible` job.
+# Builds twice in clean target dirs and diffs SHA-256 — the `wasm-reproducible` job.
 ./scripts/check-wasm-reproducible.sh
-
-# The declared `rust-version` is proven by the `msrv` job, not by this block;
-# see "Minimum supported Rust version" below.
 ```
 
 One CI step has no separate command: the **unwrap/expect guard** greps
@@ -330,9 +328,20 @@ layer and must not silently diverge.
 
 ## Pull Request Process
 
-1. Open the PR against `main`. The `ci` status check is required to merge
-   (branch protection).
-2. One reviewer approval required (branch protection).
+1. Open the PR against `main`. Merge protection is the `main-protection`
+   **ruleset**, recorded in this repository (not only in GitHub settings) at
+   [`.github/rulesets/main-protection.json`](.github/rulesets/main-protection.json)
+   and explained in [`.github/BRANCH_PROTECTION.md`](.github/BRANCH_PROTECTION.md).
+   It requires the status check named exactly `ci`, so the `ci` job key in
+   `.github/workflows/ci.yml` must not be renamed — a rename means no check by
+   that name is ever reported and **every** PR waits forever. It also requires
+   your branch to be up to date with `main` before merging. `msrv` and
+   `wasm-reproducible` are not required checks.
+   The ruleset only takes effect when a maintainer applies it in GitHub
+   settings; the committed JSON is the reviewable record, and a change to the
+   intended protection is a PR to that file plus this section.
+2. One approving review required. A push after approval dismisses it, so
+   re-request review after pushing.
 3. Describe the *why* in the PR body: what was broken/wrong, what the fix does,
    and — for enforcement changes — how it was verified (tests, and testnet
    evidence where applicable).
@@ -391,8 +400,9 @@ silent auth-semantics drift.
 
 Dependabot (`.github/dependabot.yml`, weekly, Cargo + GitHub Actions) files
 update PRs against `main` the same as any contributor PR: they must pass the
-full `ci` gate (`cargo fmt --check`, clippy with `-D warnings`, `cargo test`,
-both builds) — branch protection on `main` requires the `ci` check, so a
-dependabot PR cannot merge green-skipped. `soroban-sdk` majors are isolated in
-their own group because they can break the ABI; review those with the SPEC §1.1
-re-verification above.
+full `ci` gate (see the local-gate block above: fmt, clippy with `-D warnings`,
+tests, rustdoc, both builds, the verification scripts, and the `agent-tx`
+gates) — the [`main-protection` ruleset](.github/BRANCH_PROTECTION.md) requires
+the `ci` check, so a dependabot PR cannot merge green-skipped. `soroban-sdk`
+majors are isolated in their own group because they can break the ABI; review
+those with the SPEC §1.1 re-verification above.

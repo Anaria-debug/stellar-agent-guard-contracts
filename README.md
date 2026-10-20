@@ -942,8 +942,16 @@ tested fact rather than an aspiration. Formatting stays on the pinned channel in
 job because rustfmt output is version-sensitive. A third job, `wasm-reproducible`,
 builds the contract twice in clean target directories and fails unless both builds hash
 identically (see [Reproducible builds](#reproducible-builds)). Neither is a required
-check. `main` is protected by a branch ruleset — the `ci` check must be green and a
-review approved for changes to merge.
+check.
+
+`main` is protected by the `main-protection` ruleset: the status check named exactly
+`ci` must be green, the branch must be up to date with `main`, and one approving review
+is required (a new push dismisses it). The ruleset is recorded in the repository —
+[`.github/rulesets/main-protection.json`](.github/rulesets/main-protection.json) and
+[`.github/BRANCH_PROTECTION.md`](.github/BRANCH_PROTECTION.md) — because a rule that
+exists only in GitHub settings is invisible in review and lost if the settings change.
+The `ci` job key is load-bearing: required checks match the check-run name, so renaming
+that job leaves every PR waiting for a check that is never reported.
 
 ## Topics
 

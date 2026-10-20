@@ -365,8 +365,15 @@ Run the following verification checks in order before submitting your pull reque
 
 ## Pull request process
 
-1. Open the PR against `main`. The `ci` status check is required to merge (branch protection).
-2. One reviewer approval required (branch protection).
+1. Open the PR against `main`. The `ci` status check is required by the
+   `main-protection` ruleset, which is recorded in-repo in
+   [`.github/rulesets/main-protection.json`](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/.github/rulesets/main-protection.json)
+   and described in
+   [`.github/BRANCH_PROTECTION.md`](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/.github/BRANCH_PROTECTION.md).
+   The job key must stay named exactly `ci`; renaming it leaves every PR waiting
+   for a check that is never reported.
+2. One approving review required; a new push dismisses it, so re-request review
+   after pushing.
 3. Describe the *why* in the PR body: what was broken/wrong, what the fix does, and — for enforcement changes — how it was verified (tests, and testnet evidence where applicable).
 
 ## Project structure
