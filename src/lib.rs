@@ -1297,6 +1297,7 @@ pub mod testutils {
             "window_secs",
             "window_cap",
             "assets",
+            "asset_caps",
             "protocols",
             "recipients",
             "recipient_window_caps",
@@ -1309,6 +1310,15 @@ pub mod testutils {
             "protocol_calls_per_window",
         ];
         if !has_exact_scval_fields(value, POLICY_FIELDS) {
+            return false;
+        }
+        let Some(ScVal::Vec(Some(asset_caps))) = scval_field(value, "asset_caps") else {
+            return false;
+        };
+        if !asset_caps
+            .iter()
+            .all(|cap| has_exact_scval_fields(cap, &["asset", "per_tx_cap"]))
+        {
             return false;
         }
         let Some(ScVal::Vec(Some(protocols))) = scval_field(value, "protocols") else {
