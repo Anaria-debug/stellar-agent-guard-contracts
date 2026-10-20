@@ -203,10 +203,13 @@ fn strkey_encode(version: u8, payload: &[u8]) -> String {
 
 /// Decode a strkey secret (version 0x90 + 32-byte seed + checksum) to the seed.
 fn secret_to_seed(secret: &str) -> [u8; 32] {
-    let raw = base32_decode(secret).expect("invalid strkey secret");
-    assert_eq!(raw.len(), 35, "strkey secret must decode to 35 bytes");
-    assert_eq!(raw[0], 0x90, "not a strkey secret key");
-    raw[1..33].try_into().expect("seed length")
+    match strkey::decode_strkey(secret) {
+        Ok((ver, seed)) if ver == strkey::VER_SECRET => seed,
+        Ok(_) => exit_with("not an account secret seed (expected leading character 'S')".into()),
+        Err(err) => exit_with(format!(
+            "invalid secret seed: {err}; expected a 56-character StrKey secret seed (S...)"
+        )),
+    }
 }
 
 fn account_strkey(pubkey: &[u8; 32]) -> String {
@@ -230,61 +233,6 @@ struct Rpc {
     agent: ureq::Agent,
 }
 
-/// Why an RPC request produced no usable result.
-#[derive(Debug)]
-enum RpcError {
-    /// No complete response within the timeout (connect, send, or read).
-    Timeout {
-        method: String,
-        url: String,
-        after: Duration,
-    },
-    /// The request could not be made or was refused: DNS, connection, TLS,
-    /// or an HTTP error status.
-    Transport {
-        method: String,
-        url: String,
-        detail: String,
-    },
-    /// The endpoint answered with something that is not a JSON-RPC response.
-    BadResponse { method: String, detail: String },
-    /// The endpoint answered with a JSON-RPC `error` object.
-    JsonRpc { method: String, error: String },
-}
-
-impl std::fmt::Display for RpcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Timeout { method, url, after } => write!(
-                f,
-                "RPC {method} to {url} timed out after {}s without a response. The endpoint \
-                 may be down or overloaded: retry, raise --rpc-timeout <secs>, or pick another \
-                 endpoint with --network/--rpc-url",
-                after.as_secs_f64()
-            ),
-            Self::Transport {
-                method,
-                url,
-                detail,
-            } => write!(
-                f,
-                "RPC {method} to {url} failed: {detail}. Check the URL (--network/--rpc-url) \
-                 and the network connection"
-            ),
-            Self::BadResponse { method, detail } => {
-                write!(f, "RPC {method} returned an unreadable response: {detail}")
-            }
-            Self::JsonRpc { method, error } => write!(f, "RPC {method} error: {error}"),
-        }
-    }
-}
-
-impl RpcError {
-    fn is_timeout(&self) -> bool {
-        matches!(self, Self::Timeout { .. })
-    }
-}
-
 /// Whether an error, or anything in its source chain, is an I/O timeout.
 /// ureq reports its overall timeout as `io::ErrorKind::TimedOut` (and some
 /// platforms surface a socket read timeout as `WouldBlock`).
@@ -304,11 +252,85 @@ fn is_io_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RpcFailureKind {
+    /// No complete response within `--rpc-timeout` (connect, send, or read).
+    Timeout,
+    Transport,
+    Http,
+    JsonRpc,
+    InvalidResponse,
+}
+
+#[derive(Debug)]
+struct RpcError {
+    method: String,
+    kind: RpcFailureKind,
+    http_status: Option<u16>,
+    json_rpc_code: Option<serde_json::Value>,
+    message: String,
+}
+
+impl RpcError {
+    fn label(&self) -> &'static str {
+        match self.kind {
+            RpcFailureKind::Timeout => "RPC TIMEOUT",
+            RpcFailureKind::Transport => "TRANSPORT FAILURE",
+            RpcFailureKind::Http => "HTTP RPC FAILURE",
+            RpcFailureKind::JsonRpc => "JSON-RPC REJECTION",
+            RpcFailureKind::InvalidResponse => "INVALID RPC RESPONSE",
+        }
+    }
+
+    fn exit_code(&self) -> i32 {
+        match self.kind {
+            RpcFailureKind::Timeout | RpcFailureKind::Transport | RpcFailureKind::Http => 3,
+            RpcFailureKind::JsonRpc | RpcFailureKind::InvalidResponse => 4,
+        }
+    }
+
+    fn is_timeout(&self) -> bool {
+        self.kind == RpcFailureKind::Timeout
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RPC {} failed", self.method)?;
+        if let Some(status) = self.http_status {
+            write!(f, " (HTTP status {status})")?;
+        }
+        if let Some(code) = &self.json_rpc_code {
+            write!(f, " (JSON-RPC code {code})")?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+fn rpc_or_exit<T>(result: Result<T, RpcError>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => rpc_exit(&error, None),
+    }
+}
+
+/// Print the classified RPC failure (plus an optional hint line) and exit
+/// with its code.
+fn rpc_exit(error: &RpcError, hint: Option<String>) -> ! {
+    eprintln!("RESULT: {}", error.label());
+    eprintln!("{error}");
+    if let Some(hint) = hint {
+        eprintln!("{hint}");
+    }
+    std::process::exit(error.exit_code());
+}
+
 trait PreflightRpc {
     fn account_seq(&self, account: &str) -> i64;
     fn latest_ledger(&self) -> u32;
     fn simulate(&self, envelope: &str) -> serde_json::Value;
     fn registered_agent_pubkey(&self, guard: &ScAddress) -> [u8; 32];
+    fn inclusion_fee(&self) -> Result<Option<u32>, RpcError>;
 }
 
 impl Rpc {
@@ -323,76 +345,102 @@ impl Rpc {
 
     /// One JSON-RPC request, bounded by the timeout, with every failure
     /// classified rather than panicking.
-    fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    fn post(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
             "params": params,
         });
-        let timeout = || RpcError::Timeout {
+        let timeout = || RpcError {
             method: method.to_string(),
-            url: self.url.clone(),
-            after: self.timeout,
+            kind: RpcFailureKind::Timeout,
+            http_status: None,
+            json_rpc_code: None,
+            message: format!(
+                "no response from {} within {}s. The endpoint may be down or overloaded: \
+                 retry, raise --rpc-timeout <secs>, or pick another endpoint with \
+                 --network/--rpc-url",
+                self.url,
+                self.timeout.as_secs_f64()
+            ),
         };
-        let resp = match self
+        let response = self
             .agent
             .post(&self.url)
             .set("Content-Type", "application/json")
-            .send_string(&body.to_string())
-        {
-            Ok(resp) => resp,
-            Err(ureq::Error::Status(code, resp)) => {
-                return Err(RpcError::Transport {
+            .send_string(&body.to_string());
+        let response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) if is_io_timeout(&error) => return Err(timeout()),
+            Err(ureq::Error::Transport(error)) => {
+                return Err(RpcError {
                     method: method.to_string(),
-                    url: self.url.clone(),
-                    detail: format!("HTTP {code} {}", resp.status_text()),
-                })
-            }
-            Err(ureq::Error::Transport(t)) if is_io_timeout(&t) => return Err(timeout()),
-            Err(ureq::Error::Transport(t)) => {
-                return Err(RpcError::Transport {
-                    method: method.to_string(),
-                    url: self.url.clone(),
-                    detail: t.to_string(),
-                })
+                    kind: RpcFailureKind::Transport,
+                    http_status: None,
+                    json_rpc_code: None,
+                    message: error.to_string(),
+                });
             }
         };
+        let status = response.status();
         // The timeout also bounds reading the body: a server that sends
         // headers and then stalls ends here, not in a hang.
-        let text = resp.into_string().map_err(|e| {
-            if is_io_timeout(&e) {
+        let response_body = response.into_string().map_err(|error| {
+            if is_io_timeout(&error) {
                 timeout()
             } else {
-                RpcError::BadResponse {
+                RpcError {
                     method: method.to_string(),
-                    detail: e.to_string(),
+                    kind: RpcFailureKind::InvalidResponse,
+                    http_status: Some(status),
+                    json_rpc_code: None,
+                    message: error.to_string(),
                 }
             }
         })?;
         let json: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| RpcError::BadResponse {
+            serde_json::from_str(&response_body).map_err(|error| RpcError {
                 method: method.to_string(),
-                detail: e.to_string(),
+                kind: RpcFailureKind::InvalidResponse,
+                http_status: Some(status),
+                json_rpc_code: None,
+                message: format!("response is not valid JSON: {error}"),
             })?;
         if let Some(err) = json.get("error") {
-            return Err(RpcError::JsonRpc {
+            return Err(RpcError {
                 method: method.to_string(),
-                error: err.to_string(),
+                kind: RpcFailureKind::JsonRpc,
+                http_status: Some(status),
+                json_rpc_code: err.get("code").cloned(),
+                message: err
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| err.to_string()),
             });
         }
-        Ok(json["result"].clone())
-    }
-
-    /// [`Rpc::call`] for paths with nothing to recover: a failure ends the
-    /// invocation with exit code 1 and the classified, actionable message.
-    fn post(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
-        self.call(method, params)
-            .unwrap_or_else(|e| exit_with(e.to_string()))
+        if !(200..300).contains(&status) {
+            return Err(RpcError {
+                method: method.to_string(),
+                kind: RpcFailureKind::Http,
+                http_status: Some(status),
+                json_rpc_code: None,
+                message: json.to_string(),
+            });
+        }
+        json.get("result").cloned().ok_or_else(|| RpcError {
+            method: method.to_string(),
+            kind: RpcFailureKind::InvalidResponse,
+            http_status: Some(status),
+            json_rpc_code: None,
+            message: "response did not contain a result".to_string(),
+        })
     }
 
     fn latest_ledger(&self) -> u32 {
-        let res = self.post("getLatestLedger", serde_json::json!({}));
+        let res = rpc_or_exit(self.post("getLatestLedger", serde_json::json!({})));
         res["sequence"].as_u64().expect("latest ledger sequence") as u32
     }
 
@@ -404,10 +452,10 @@ impl Rpc {
             ScAddress::Account(a) => LedgerKey::Account(LedgerKeyAccount { account_id: a }),
             other => panic!("expected account address, got {other:?}"),
         };
-        let res = self.post(
+        let res = rpc_or_exit(self.post(
             "getLedgerEntries",
             serde_json::json!({ "keys": [b64_encode_xdr(&key)] }),
-        );
+        ));
         let entry = res["entries"][0]["xdr"].as_str().expect("ledger entry xdr");
         // getLedgerEntries returns the LedgerEntryData XDR per entry.
         let le: LedgerEntryData = xdr(entry);
@@ -418,21 +466,26 @@ impl Rpc {
     }
 
     fn simulate(&self, envelope: &str) -> serde_json::Value {
-        self.post(
+        rpc_or_exit(self.post(
             "simulateTransaction",
             serde_json::json!({ "transaction": envelope }),
-        )
+        ))
     }
 
     fn send(&self, envelope: &str) -> Result<serde_json::Value, RpcError> {
-        self.call(
+        self.post(
             "sendTransaction",
             serde_json::json!({ "transaction": envelope }),
         )
     }
 
     fn get_tx(&self, hash: &str) -> Result<serde_json::Value, RpcError> {
-        self.call("getTransaction", serde_json::json!({ "hash": hash }))
+        self.post("getTransaction", serde_json::json!({ "hash": hash }))
+    }
+
+    fn inclusion_fee(&self) -> Result<Option<u32>, RpcError> {
+        let stats = self.post("getFeeStats", serde_json::json!({}))?;
+        Ok(parse_inclusion_fee(&stats))
     }
 }
 
@@ -451,10 +504,10 @@ impl PreflightRpc for Rpc {
 
     fn registered_agent_pubkey(&self, guard: &ScAddress) -> [u8; 32] {
         let key = guard_instance_key(guard);
-        let res = self.post(
+        let res = rpc_or_exit(self.post(
             "getLedgerEntries",
             serde_json::json!({ "keys": [b64_encode_xdr(&key)] }),
-        );
+        ));
         let entry = res["entries"][0]["xdr"]
             .as_str()
             .expect("guard instance ledger entry XDR");
@@ -476,6 +529,56 @@ impl PreflightRpc for Rpc {
                 _ => None,
             })
             .expect("registered agent public key not found in guard instance storage")
+    }
+
+    fn inclusion_fee(&self) -> Result<Option<u32>, RpcError> {
+        Rpc::inclusion_fee(self)
+    }
+}
+
+fn parse_inclusion_fee(stats: &serde_json::Value) -> Option<u32> {
+    ["mode", "p50", "min"].iter().find_map(|field| {
+        let value = &stats["inclusionFee"][field];
+        value
+            .as_str()
+            .and_then(|fee| fee.parse::<u32>().ok())
+            .or_else(|| value.as_u64().and_then(|fee| u32::try_from(fee).ok()))
+    })
+}
+
+fn calculate_fee(min_resource_fee: u32, inclusion_fee: u32) -> u32 {
+    min_resource_fee
+        .saturating_add(inclusion_fee)
+        .saturating_add(GUARD_KEY_FEE_BUMP)
+}
+
+fn resolve_inclusion_fee<R: PreflightRpc>(
+    rpc: &R,
+    override_fee: Option<u32>,
+) -> (u32, &'static str) {
+    if let Some(fee) = override_fee {
+        return (fee, "explicit --inclusion-fee override");
+    }
+    match rpc.inclusion_fee() {
+        Ok(Some(fee)) => (fee, "RPC getFeeStats inclusionFee.mode"),
+        Ok(None) => {
+            eprintln!(
+                "warning: RPC fee statistics did not include an inclusion fee; using fallback {INCLUSION_FEE} stroops"
+            );
+            (
+                INCLUSION_FEE,
+                "fallback constant (fee statistics unavailable)",
+            )
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: could not read the network inclusion fee ({error}); using fallback {INCLUSION_FEE} stroops"
+            );
+            (
+                INCLUSION_FEE,
+                "fallback constant (fee statistics unavailable)",
+            )
+        }
     }
 }
 
@@ -548,6 +651,56 @@ fn print_events(events: &serde_json::Value) {
             println!("  event [{contract}] topics=({topics}) data={data}");
         }
     }
+}
+
+fn simulation_error_message(simulation: &serde_json::Value) -> Option<String> {
+    let error = simulation.get("error")?;
+    if error.is_null() {
+        None
+    } else if let Some(message) = error.as_str() {
+        Some(message.to_string())
+    } else {
+        Some(
+            error["message"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string()),
+        )
+    }
+}
+
+fn simulation_events(simulation: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    simulation["events"]
+        .as_array()
+        .or_else(|| simulation["error"]["data"]["events"].as_array())
+}
+
+fn is_guard_auth_checked_block(simulation: &serde_json::Value, guard: &ScAddress) -> bool {
+    let Some(events) = simulation_events(simulation) else {
+        return false;
+    };
+    events.iter().any(|event| {
+        let Some(b64) = event["xdr"].as_str().or_else(|| event.as_str()) else {
+            return false;
+        };
+        let Ok(decoded) = DiagnosticEvent::from_xdr_base64(b64, Limits::none()) else {
+            return false;
+        };
+        let contract_matches = match guard {
+            ScAddress::Contract(id) => decoded.event.contract_id.as_ref() == Some(id),
+            _ => false,
+        };
+        if !contract_matches {
+            return false;
+        }
+        let ContractEventBody::V0(body) = &decoded.event.body;
+        let has_topic = |expected: &str| {
+            body.topics.iter().any(|topic| {
+                matches!(topic, ScVal::Symbol(symbol) if symbol.0.as_slice() == expected.as_bytes())
+            })
+        };
+        has_topic("event_auth_checked") && has_topic("blocked")
+    })
 }
 
 // ── Footprint helpers ────────────────────────────────────────────────────
@@ -651,9 +804,11 @@ fn merge_guard_footprint(mut fp: LedgerFootprint, guard: &ScAddress) -> LedgerFo
 struct Args {
     rpc: Rpc,
     passphrase: String,
+    passphrase_source: &'static str,
     guard: ScAddress,
     secret: Option<String>,
     expect_blocked: bool,
+    inclusion_fee_override: Option<u32>,
 }
 
 fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i32> {
@@ -692,23 +847,24 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
     );
     let sim = rpc.simulate(&b64_encode_xdr(&env));
 
-    if let Some(err) = sim.get("error") {
-        if agent.is_some() {
-            println!("BLOCKED (pre-broadcast, enforced simulation):");
+    if let Some(message) = simulation_error_message(&sim) {
+        let policy_block = is_guard_auth_checked_block(&sim, &args.guard);
+        if policy_block {
+            println!("BLOCKED (pre-broadcast, guard auth_checked):");
+        } else if agent.is_some() {
+            println!("TRANSACTION REJECTED (pre-broadcast, not a guard policy block):");
         } else {
             println!("RESULT: INDETERMINATE (unsigned simulation failed):");
         }
-        if let Some(code) = err["code"].as_str() {
-            println!("  error code: {code}");
-        }
-        if let Some(msg) = err["message"].as_str() {
-            println!("  message: {msg}");
-        }
-        if let Some(events) = err["data"]["events"].as_array() {
+        println!("  message: {message}");
+        if let Some(events) = simulation_events(&sim) {
             println!("  diagnostic events:");
             print_events(&serde_json::Value::Array(events.clone()));
         }
         println!("  broadcast: no");
+        if policy_block && args.expect_blocked {
+            return Ok(());
+        }
         return Err(if agent.is_some() { 1 } else { 2 });
     }
 
@@ -718,15 +874,16 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
         .parse()
         .expect("simulation fee");
     // Quote what `run` would pay, allowance included (see GUARD_KEY_FEE_BUMP).
-    let fee = min_fee
-        .saturating_add(INCLUSION_FEE)
-        .saturating_add(GUARD_KEY_FEE_BUMP);
+    let (inclusion_fee, fee_source) = resolve_inclusion_fee(rpc, args.inclusion_fee_override);
+    let fee = calculate_fee(min_fee, inclusion_fee);
     if agent.is_some() {
         println!("RESULT: ALLOWED (preflight only)");
     } else {
         println!("RESULT: INDETERMINATE (unsigned simulation)");
         println!("  limitation: provide --secret to run signed __check_auth simulation");
     }
+    println!("network passphrase source: {}", args.passphrase_source);
+    println!("inclusion fee source: {fee_source}");
     println!("estimated fee: {fee} stroops");
     println!("broadcast: no");
     if agent.is_some() {
@@ -909,6 +1066,12 @@ enum Call {
         to: ScAddress,
         amount: i128,
     },
+    TransferFrom {
+        token: ScAddress,
+        from: ScAddress,
+        to: ScAddress,
+        amount: i128,
+    },
     Heartbeat,
 }
 
@@ -930,6 +1093,25 @@ impl Call {
                 ])
                 .expect("arg count"),
             },
+            Self::TransferFrom {
+                token,
+                from,
+                to,
+                amount,
+            } => InvokeContractArgs {
+                contract_address: token.clone(),
+                function_name: ScSymbol("transfer_from".try_into().unwrap()),
+                args: VecM::try_from(vec![
+                    ScVal::Address(from.clone()),
+                    ScVal::Address(guard.clone()),
+                    ScVal::Address(to.clone()),
+                    ScVal::I128(Int128Parts {
+                        lo: *amount as u64,
+                        hi: (*amount >> 64) as i64,
+                    }),
+                ])
+                .expect("arg count"),
+            },
             Self::Heartbeat => InvokeContractArgs {
                 contract_address: guard.clone(),
                 function_name: ScSymbol("heartbeat".try_into().unwrap()),
@@ -941,11 +1123,16 @@ impl Call {
 
 fn run(call: &Call, args: &Args) {
     let guard = &args.guard;
-    let seed = secret_to_seed(args.secret.as_deref().expect("--agent-secret required"));
+    let Some(secret) = args.secret.as_deref() else {
+        exit_with("missing --agent-secret: signing requires the registered agent's secret seed (expected secret seed 'S...'; or set AGENT_SECRET env var)".into());
+    };
+    let seed = secret_to_seed(secret);
     let agent = SigningKey::from_bytes(&seed);
     let source_pk = agent.verifying_key().to_bytes();
     let source_g = account_strkey(&source_pk);
     let network_id: [u8; 32] = Sha256::digest(args.passphrase.as_bytes()).into();
+    println!("network id: {}", hex::encode(network_id));
+    println!("network passphrase source: {}", args.passphrase_source);
 
     let seq = args.rpc.account_seq(&source_g);
     // The account entry stores the last-used sequence; the next tx uses
@@ -996,19 +1183,24 @@ fn run(call: &Call, args: &Args) {
         }
     }
 
-    if let Some(err) = sim.get("error") {
-        println!("BLOCKED (pre-broadcast, enforced simulation):");
-        if let Some(code) = err["code"].as_str() {
-            println!("  error code: {code}");
+    if let Some(message) = simulation_error_message(&sim) {
+        let policy_block = is_guard_auth_checked_block(&sim, guard);
+        if policy_block {
+            println!("BLOCKED (pre-broadcast, guard auth_checked):");
+        } else {
+            println!("TRANSACTION REJECTED (pre-broadcast, not a guard policy block):");
         }
-        if let Some(msg) = err["message"].as_str() {
-            println!("  message: {msg}");
-        }
-        if let Some(events) = err["data"]["events"].as_array() {
+        println!("  message: {message}");
+        if let Some(events) = simulation_events(&sim) {
             println!("  diagnostic events:");
             print_events(&serde_json::Value::Array(events.clone()));
         }
-        std::process::exit(if args.expect_blocked { 0 } else { 1 });
+        println!("  broadcast: no");
+        std::process::exit(if policy_block && args.expect_blocked {
+            0
+        } else {
+            1
+        });
     }
     if args.expect_blocked {
         println!("expected a block, but the enforced simulation succeeded");
@@ -1045,9 +1237,9 @@ fn run(call: &Call, args: &Args) {
         .expect("minResourceFee")
         .parse()
         .expect("fee");
-    let fee = min_fee
-        .saturating_add(INCLUSION_FEE)
-        .saturating_add(GUARD_KEY_FEE_BUMP);
+    let (inclusion_fee, fee_source) = resolve_inclusion_fee(&args.rpc, args.inclusion_fee_override);
+    let fee = calculate_fee(min_fee, inclusion_fee);
+    println!("inclusion fee source: {fee_source}");
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!(
             "minResourceFee: {min_fee}, resourceFee: {}, final fee: {fee}",
@@ -1082,13 +1274,16 @@ fn run(call: &Call, args: &Args) {
             let TransactionEnvelope::Tx(v1) = &env2 else {
                 unreachable!("sign_envelope builds a v1 envelope")
             };
-            exit_with(format!(
-                "{e}. The transaction may still have been accepted: check tx {} (getTransaction) \
-                 before resubmitting",
-                hex::encode(tx_hash(&v1.tx, &network_id))
-            ))
+            rpc_exit(
+                &e,
+                Some(format!(
+                    "The transaction may still have been accepted: check tx {} \
+                     (getTransaction) before resubmitting",
+                    hex::encode(tx_hash(&v1.tx, &network_id))
+                )),
+            )
         }
-        Err(e) => exit_with(e.to_string()),
+        Err(e) => rpc_exit(&e, None),
     };
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!("send response: {sent}");
@@ -1119,7 +1314,7 @@ fn run(call: &Call, args: &Args) {
                 eprintln!("{e}; still polling tx={hash}");
                 continue;
             }
-            Err(e) => exit_with(e.to_string()),
+            Err(e) => rpc_exit(&e, None),
         };
         let st = gt["status"].as_str().unwrap_or("PENDING");
         if st == "SUCCESS" {
@@ -1131,7 +1326,7 @@ fn run(call: &Call, args: &Args) {
             if let Some(errx) = gt["resultXdr"].as_str() {
                 println!("  resultXdr: {errx}");
             }
-            std::process::exit(if args.expect_blocked { 0 } else { 1 });
+            std::process::exit(1);
         }
     }
     println!("RESULT: TIMEOUT tx={hash}");
@@ -1238,17 +1433,31 @@ fn verify_guard(rpc: &Rpc, guard_addr: &str, _passphrase: &str) -> Result<(), St
         signatures: VecM::default(),
     });
     let sim = rpc.simulate(&b64_encode_xdr(&env));
-    if let Some(err) = sim.get("error") {
-        let msg = err["message"].as_str().unwrap_or("unknown error");
-        return Err(format!("guard verification failed: {msg}"));
+    if let Some(message) = simulation_error_message(&sim) {
+        return Err(format!("guard verification failed: {message}"));
     }
     Ok(())
 }
 
 fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
-    let alias = cli.positional("an alias")?;
-    let address = cli.positional("a guard contract address (C...)")?;
-    let admin = cli.positional("an admin account address (G...)")?;
+    let alias = cli.positional_expected(
+        "alias",
+        "an alias string (see `agent-tx guards add --help`)",
+    )?;
+    if alias == "--help" || alias == "-h" {
+        print_guards_subcommand_help("add");
+        return Ok(());
+    }
+    let address = cli.positional_expected("address", "a guard contract address (C...)")?;
+    if address == "--help" || address == "-h" {
+        print_guards_subcommand_help("add");
+        return Ok(());
+    }
+    let admin = cli.positional_expected("admin", "an admin account address (G...)")?;
+    if admin == "--help" || admin == "-h" {
+        print_guards_subcommand_help("add");
+        return Ok(());
+    }
     // Validate the two addresses first: `verify_guard` below is the first
     // place `guards add` talks to the network (issue #52).
     strkey::validate_key("guards add address", KeyKind::Contract, &address)?;
@@ -1263,10 +1472,24 @@ fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
     let mut positionals: Vec<String> = Vec::new();
     while let Some(token) = cli.next() {
         match token.as_str() {
-            "--rpc-timeout" => rpc_timeout = Some(parse_rpc_timeout(&cli.value("--rpc-timeout")?)?),
-            "--network" => network = Some(cli.value("--network")?),
-            "--rpc-url" => rpc_url = Some(cli.value("--rpc-url")?),
-            "--network-passphrase" => passphrase = Some(cli.value("--network-passphrase")?),
+            "--rpc-timeout" => {
+                rpc_timeout = Some(parse_rpc_timeout(
+                    &cli.value_expected("--rpc-timeout", "whole seconds e.g. 30")?,
+                )?)
+            }
+            "--help" | "-h" => {
+                print_guards_subcommand_help("add");
+                return Ok(());
+            }
+            "--network" => {
+                network = Some(cli.value_expected("--network", "testnet | futurenet | mainnet")?)
+            }
+            "--rpc-url" => {
+                rpc_url = Some(cli.value_expected("--rpc-url", "endpoint URL e.g. https://...")?)
+            }
+            "--network-passphrase" => {
+                passphrase = Some(cli.value_expected("--network-passphrase", "passphrase string")?)
+            }
             other if other.starts_with("--") => return Err(cli.unknown(other)),
             other => positionals.push(other.to_string()),
         }
@@ -1342,7 +1565,12 @@ fn cmd_guards_list() {
 }
 
 fn cmd_guards_remove(cli: &mut Cli) -> Result<(), String> {
-    let alias = cli.positional("an alias")?;
+    let alias =
+        cli.positional_expected("alias", "an alias string (see `agent-tx guards --help`)")?;
+    if alias == "--help" || alias == "-h" {
+        print_guards_subcommand_help("remove");
+        return Ok(());
+    }
     let mut reg = load_registry();
     let idx = reg
         .guards
@@ -1359,7 +1587,12 @@ fn cmd_guards_remove(cli: &mut Cli) -> Result<(), String> {
 }
 
 fn cmd_guards_set_default(cli: &mut Cli) -> Result<(), String> {
-    let alias = cli.positional("an alias")?;
+    let alias =
+        cli.positional_expected("alias", "an alias string (see `agent-tx guards --help`)")?;
+    if alias == "--help" || alias == "-h" {
+        print_guards_subcommand_help("set-default");
+        return Ok(());
+    }
     let mut reg = load_registry();
     if !reg.guards.iter().any(|g| g.alias == alias) {
         return Err("alias not found".into());
@@ -1381,10 +1614,10 @@ fn resolve_guard(guard_arg: Option<&str>) -> Result<String, String> {
         }
     }
     if reg.guards.is_empty() {
-        return Err("no guard specified and no guards registered. Use `agent-tx guards add <alias> <address> <admin>` to register one, or pass --guard".into());
+        return Err("missing --guard (expected contract ID 'C...'): no guard specified and no guards registered. Use `agent-tx guards add <alias> <address> <admin>` to register one, or pass --guard <C...>".into());
     }
     Err(format!(
-        "no guard specified and no default set. Registered guards:\n{}",
+        "missing --guard (expected contract ID 'C...'): no guard specified and no default set. Use --guard <C...> or choose from registered guards:\n{}",
         reg.guards
             .iter()
             .map(|g| format!("  {} -> {}", g.alias, g.address))
@@ -1428,6 +1661,93 @@ mod tests {
         assert!(map_submission_error("tx_too_early").contains("too early"));
         assert!(map_submission_error("tx_late_expiration").contains("expiration passed"));
         assert!(map_submission_error("unknown_err").contains("README.md Troubleshooting"));
+    }
+
+    #[test]
+    fn rpc_failure_classification_preserves_transport_and_json_rpc_details() {
+        let transport = RpcError {
+            method: "simulateTransaction".to_string(),
+            kind: RpcFailureKind::Transport,
+            http_status: None,
+            json_rpc_code: None,
+            message: "connection refused".to_string(),
+        };
+        assert_eq!(transport.label(), "TRANSPORT FAILURE");
+        assert_eq!(transport.exit_code(), 3);
+        assert!(transport.to_string().contains("connection refused"));
+
+        let rejection = RpcError {
+            method: "sendTransaction".to_string(),
+            kind: RpcFailureKind::JsonRpc,
+            http_status: Some(400),
+            json_rpc_code: Some(serde_json::json!(-32602)),
+            message: "tx_bad_seq".to_string(),
+        };
+        assert_eq!(rejection.label(), "JSON-RPC REJECTION");
+        assert_eq!(rejection.exit_code(), 4);
+        assert!(rejection.to_string().contains("HTTP status 400"));
+        assert!(rejection.to_string().contains("JSON-RPC code -32602"));
+    }
+
+    #[test]
+    fn fee_calculation_uses_network_inclusion_fee_and_supports_high_fees() {
+        let stats = serde_json::json!({ "inclusionFee": { "mode": "5000" } });
+        assert_eq!(parse_inclusion_fee(&stats), Some(5_000));
+        assert_eq!(calculate_fee(2_000, 5_000), 107_000);
+        assert_eq!(
+            calculate_fee(2_000, 50_000_000),
+            50_102_000,
+            "a rising network fee must not be capped at the old constant"
+        );
+        assert_eq!(parse_inclusion_fee(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn unsigned_simulation_rejection_is_not_a_guard_policy_block() {
+        let guard: ScAddress = VALID_GUARD.parse().unwrap();
+        let simulation = serde_json::json!({ "error": "tx_insufficient_fee", "events": [] });
+        assert_eq!(
+            simulation_error_message(&simulation).as_deref(),
+            Some("tx_insufficient_fee")
+        );
+        assert!(!is_guard_auth_checked_block(&simulation, &guard));
+    }
+
+    fn guard_block_event_xdr(guard: &ScAddress) -> String {
+        let ScAddress::Contract(guard_id) = guard.clone() else {
+            panic!("expected contract address");
+        };
+        let event = DiagnosticEvent {
+            in_successful_contract_call: false,
+            event: ContractEvent {
+                ext: ExtensionPoint::V0,
+                contract_id: Some(guard_id),
+                type_: ContractEventType::Contract,
+                body: ContractEventBody::V0(ContractEventV0 {
+                    topics: VecM::try_from(vec![
+                        ScVal::Symbol(ScSymbol("event_auth_checked".try_into().unwrap())),
+                        ScVal::Symbol(ScSymbol("blocked".try_into().unwrap())),
+                        ScVal::Symbol(ScSymbol("per_tx_cap_exceeded".try_into().unwrap())),
+                    ])
+                    .unwrap(),
+                    data: ScVal::Void,
+                }),
+            },
+        };
+        event.to_xdr_base64(Limits::none()).unwrap()
+    }
+
+    #[test]
+    fn guard_auth_checked_block_requires_guard_event_topics() {
+        let guard: ScAddress = VALID_GUARD.parse().unwrap();
+        let simulation = serde_json::json!({
+            "error": "HostError: auth_checked: per_tx_cap_exceeded",
+            "events": [{ "xdr": guard_block_event_xdr(&guard) }]
+        });
+        assert!(is_guard_auth_checked_block(&simulation, &guard));
+
+        let other_guard: ScAddress = VALID_TOKEN.parse().unwrap();
+        assert!(!is_guard_auth_checked_block(&simulation, &other_guard));
     }
 
     #[test]
@@ -1657,6 +1977,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transfer_from_invocation_uses_exact_contract_argument_order() {
+        let guard: ScAddress = VALID_GUARD.parse().unwrap();
+        let from: ScAddress = VALID_RECIPIENT.parse().unwrap();
+        let to: ScAddress = "GAOLI6NMXG5X3GZ2ASTIMX24IQQW7CSGHVSOU7HOWFCH73RBZXGAKSPP"
+            .parse()
+            .unwrap();
+        let token: ScAddress = VALID_TOKEN.parse().unwrap();
+        let call = Call::TransferFrom {
+            token: token.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            amount: 50,
+        };
+        let invocation = call.invocation(&guard);
+
+        assert_eq!(invocation.contract_address, token);
+        assert_eq!(invocation.function_name.to_string(), "transfer_from");
+        assert_eq!(invocation.args.len(), 4);
+        assert_eq!(invocation.args[0], ScVal::Address(from));
+        assert_eq!(invocation.args[1], ScVal::Address(guard));
+        assert_eq!(invocation.args[2], ScVal::Address(to));
+        assert_eq!(
+            invocation.args[3],
+            ScVal::I128(Int128Parts { lo: 50, hi: 0 })
+        );
+    }
+
     #[derive(Default)]
     struct MockPreflightRpc {
         sequence: std::cell::Cell<i64>,
@@ -1687,6 +2035,10 @@ mod tests {
             let seed = secret_to_seed("SBRVOEN5IIWAROJVJI2OHN2IYD2H3S75UOM3UKY7RQ42JRDPH5KRHQC4");
             SigningKey::from_bytes(&seed).verifying_key().to_bytes()
         }
+
+        fn inclusion_fee(&self) -> Result<Option<u32>, RpcError> {
+            Ok(Some(100))
+        }
     }
 
     #[test]
@@ -1699,11 +2051,13 @@ mod tests {
         let args = Args {
             rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
+            passphrase_source: "default testnet preset",
             guard: "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7"
                 .parse()
                 .unwrap(),
             secret: None,
             expect_blocked: false,
+            inclusion_fee_override: None,
         };
 
         assert_eq!(preflight(&Call::Heartbeat, &args, &rpc), Err(2));
@@ -1728,11 +2082,13 @@ mod tests {
         let args = Args {
             rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
+            passphrase_source: "default testnet preset",
             guard: "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7"
                 .parse()
                 .unwrap(),
             secret: Some("SBRVOEN5IIWAROJVJI2OHN2IYD2H3S75UOM3UKY7RQ42JRDPH5KRHQC4".to_string()),
             expect_blocked: false,
+            inclusion_fee_override: None,
         };
 
         assert_eq!(preflight(&Call::Heartbeat, &args, &rpc), Err(1));
@@ -1769,19 +2125,19 @@ mod tests {
         let rpc = Rpc::new(hung_endpoint(b""), Duration::from_millis(300));
         let started = std::time::Instant::now();
         let err = rpc
-            .call("getLatestLedger", serde_json::json!({}))
+            .post("getLatestLedger", serde_json::json!({}))
             .expect_err("a silent endpoint must not produce a result");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "bounded by the timeout"
         );
-        assert!(
-            matches!(&err, RpcError::Timeout { method, .. } if method == "getLatestLedger"),
-            "{err:?}"
-        );
+        assert!(err.is_timeout(), "{err:?}");
+        assert_eq!(err.method, "getLatestLedger");
+        assert_eq!(err.label(), "RPC TIMEOUT");
+        assert_eq!(err.exit_code(), 3);
         let message = err.to_string();
         assert!(message.contains("getLatestLedger"), "{message}");
-        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("no response"), "{message}");
         assert!(message.contains("--rpc-timeout"), "{message}");
     }
 
@@ -1791,12 +2147,10 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{";
         let rpc = Rpc::new(hung_endpoint(preamble), Duration::from_millis(300));
         let err = rpc
-            .call("simulateTransaction", serde_json::json!({}))
+            .post("simulateTransaction", serde_json::json!({}))
             .expect_err("a truncated body must not produce a result");
-        assert!(
-            matches!(&err, RpcError::Timeout { method, .. } if method == "simulateTransaction"),
-            "{err:?}"
-        );
+        assert!(err.is_timeout(), "{err:?}");
+        assert_eq!(err.method, "simulateTransaction");
     }
 
     #[test]
@@ -1805,9 +2159,9 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
         drop(listener);
         let err = Rpc::new(url, Duration::from_secs(5))
-            .call("getLatestLedger", serde_json::json!({}))
+            .post("getLatestLedger", serde_json::json!({}))
             .expect_err("nothing is listening");
-        assert!(matches!(err, RpcError::Transport { .. }), "{err:?}");
+        assert_eq!(err.kind, RpcFailureKind::Transport, "{err:?}");
         assert!(!err.is_timeout());
     }
 
@@ -1815,7 +2169,7 @@ mod tests {
     fn a_responsive_endpoint_is_unaffected_by_the_timeout() {
         let mock = MockRpc::start();
         let result = Rpc::new(mock.url.clone(), Duration::from_secs(5))
-            .call("getLatestLedger", serde_json::json!({}))
+            .post("getLatestLedger", serde_json::json!({}))
             .expect("mock answers");
         assert_eq!(result["sequence"], 1);
     }
@@ -1864,9 +2218,11 @@ mod tests {
         Args {
             rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
+            passphrase_source: "default testnet preset",
             guard: VALID_GUARD.parse().unwrap(),
             secret: Some(VALID_SECRET.to_string()),
             expect_blocked: false,
+            inclusion_fee_override: None,
         }
     }
 
@@ -1934,6 +2290,41 @@ mod tests {
         // Different ledgers: disjoint high halves, so no collision is possible.
         assert_eq!((nonces[0] as u64) >> 32, 5_000);
         assert_eq!((nonces[1] as u64) >> 32, 5_001);
+    }
+
+    #[test]
+    fn expect_blocked_only_accepts_guard_auth_checked_blocks() {
+        let guard: ScAddress = VALID_GUARD.parse().unwrap();
+        let block = MockPreflightRpc {
+            sequence: std::cell::Cell::new(7),
+            response: serde_json::json!({
+                "error": "HostError: auth_checked: per_tx_cap_exceeded",
+                "events": [{ "xdr": guard_block_event_xdr(&guard) }]
+            }),
+            ..Default::default()
+        };
+        let args = Args {
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
+            passphrase: Network::Testnet.passphrase().to_string(),
+            passphrase_source: "default testnet preset",
+            guard,
+            secret: Some(VALID_SECRET.to_string()),
+            expect_blocked: true,
+            inclusion_fee_override: None,
+        };
+        assert_eq!(preflight(&Call::Heartbeat, &args, &block), Ok(()));
+
+        // A transaction-level rejection is not a policy denial, so
+        // --expect-blocked must not turn it into success.
+        let rejection = MockPreflightRpc {
+            sequence: std::cell::Cell::new(7),
+            response: serde_json::json!({
+                "error": "tx_insufficient_fee",
+                "events": []
+            }),
+            ..Default::default()
+        };
+        assert_eq!(preflight(&Call::Heartbeat, &args, &rejection), Err(1));
     }
 
     // ── Input validation and network presets (issues #52, #54) ───────────
@@ -2028,7 +2419,15 @@ mod tests {
             ("--guard", ""),
         ];
         for (flag, value) in cases {
-            let args = argv(&["status", flag, value, "--rpc-url", &mock.url]);
+            let args = argv(&[
+                "status",
+                flag,
+                value,
+                "--rpc-url",
+                &mock.url,
+                "--network-passphrase",
+                "Local Test Network",
+            ]);
             let (cmd, rest) = args.split_first().expect("subcommand");
             let err = parse_request(cmd, rest).expect_err(&format!("{flag} '{value}' accepted"));
             assert!(err.contains(flag), "{err}");
@@ -2062,6 +2461,8 @@ mod tests {
                 value,
                 "--rpc-url",
                 &mock.url,
+                "--network-passphrase",
+                "Local Test Network",
             ]);
             let (cmd, rest) = args.split_first().expect("subcommand");
             let err = parse_request(cmd, rest).expect_err(&format!("{flag} '{value}' accepted"));
@@ -2079,7 +2480,15 @@ mod tests {
         // The control for the test above: the probe sees traffic, so its
         // silence there means no request, not a broken listener.
         let mock = MockRpc::start();
-        let args = argv(&["status", "--guard", VALID_GUARD, "--rpc-url", &mock.url]);
+        let args = argv(&[
+            "status",
+            "--guard",
+            VALID_GUARD,
+            "--rpc-url",
+            &mock.url,
+            "--network-passphrase",
+            "Local Test Network",
+        ]);
         let (_, rest) = args.split_first().expect("subcommand");
         let request = parse_request("status", rest).expect("valid inputs");
         assert_eq!(request.rpc().latest_ledger(), 1);
@@ -2104,6 +2513,8 @@ mod tests {
                 "5",
                 "--rpc-url",
                 &mock.url,
+                "--network-passphrase",
+                "Local Test Network",
             ]);
             let (_, rest) = args.split_first().expect("subcommand");
             let err = parse_request(cmd, rest).expect_err("account ID accepted as --asset");
@@ -2124,6 +2535,8 @@ mod tests {
                 "5",
                 "--rpc-url",
                 &mock.url,
+                "--network-passphrase",
+                "Local Test Network",
             ]);
             let (_, rest) = args.split_first().expect("subcommand");
             // A contract recipient is legal (`C...` addresses can receive), so
@@ -2145,6 +2558,8 @@ mod tests {
             VALID_SECRET,
             "--rpc-url",
             &mock.url,
+            "--network-passphrase",
+            "Local Test Network",
         ]);
         let (_, rest) = args.split_first().expect("subcommand");
         let err = parse_request("transfer", rest).expect_err("transfer accepted without a token");
@@ -2164,10 +2579,59 @@ mod tests {
             VALID_SECRET,
             "--rpc-url",
             &mock.url,
+            "--network-passphrase",
+            "Local Test Network",
         ]);
         let (_, rest) = args.split_first().expect("subcommand");
         parse_request("transfer", rest).expect("`--asset` rejected for transfer");
         assert!(mock.methods().is_empty(), "{:?}", mock.methods());
+    }
+
+    #[test]
+    fn transfer_from_request_requires_owner_and_accepts_fee_override() {
+        let args = argv(&[
+            "transfer-from",
+            "--guard",
+            VALID_GUARD,
+            "--token",
+            VALID_TOKEN,
+            "--from",
+            VALID_RECIPIENT,
+            "--to",
+            "GAOLI6NMXG5X3GZ2ASTIMX24IQQW7CSGHVSOU7HOWFCH73RBZXGAKSPP",
+            "--amount",
+            "50",
+            "--agent-secret",
+            VALID_SECRET,
+            "--rpc-url",
+            "http://127.0.0.1:8000/soroban/rpc",
+            "--network-passphrase",
+            "Local Test Network",
+            "--inclusion-fee",
+            "5000",
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let request = parse_request("transfer-from", rest).expect("valid transfer-from");
+        assert_eq!(request.from, Some(VALID_RECIPIENT.parse().unwrap()));
+        assert_eq!(request.inclusion_fee_override, Some(5_000));
+
+        let missing_from = argv(&[
+            "transfer-from",
+            "--guard",
+            VALID_GUARD,
+            "--token",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+            "--amount",
+            "50",
+            "--agent-secret",
+            VALID_SECRET,
+        ]);
+        let (_, rest) = missing_from.split_first().expect("subcommand");
+        assert!(parse_request("transfer-from", rest)
+            .unwrap_err()
+            .contains("missing --from"));
     }
 
     #[test]
@@ -2287,6 +2751,8 @@ mod tests {
             VALID_GUARD,
             "--rpc-url",
             "http://127.0.0.1:8000/soroban/rpc",
+            "--network-passphrase",
+            "Local Test Network",
         ]);
         let (_, rest) = args.split_first().expect("subcommand");
         let request = parse_request("status", rest).expect("rpc-url override");
@@ -2295,6 +2761,11 @@ mod tests {
             "http://127.0.0.1:8000/soroban/rpc"
         );
         assert_eq!(request.endpoint.network, None);
+        assert_eq!(request.endpoint.passphrase, "Local Test Network");
+        assert_eq!(
+            request.endpoint.passphrase_source,
+            "explicit --network-passphrase"
+        );
         assert!(request.notice().is_none());
 
         let args = argv(&[
@@ -2331,7 +2802,7 @@ mod tests {
         if std::env::var_os("AGENT_SECRET").is_some() {
             return; // the environment supplies the secret, so the requirement holds anyway
         }
-        for cmd in ["transfer", "heartbeat"] {
+        for cmd in ["transfer", "transfer-from", "heartbeat"] {
             let values = if cmd == "transfer" {
                 argv(&[
                     cmd,
@@ -2356,6 +2827,108 @@ mod tests {
             let args = argv(&["--guard", VALID_GUARD]);
             parse_request(cmd, &args).expect("read command without a secret");
         }
+    }
+
+    #[test]
+    fn help_and_usage_cover_all_subcommands() {
+        let tool = tool_help();
+        assert!(tool.contains("Usage:"));
+        assert!(tool.contains("agent-tx preflight"));
+        assert!(tool.contains("agent-tx transfer"));
+        assert!(tool.contains("agent-tx guards"));
+
+        for sub in [
+            "preflight",
+            "transfer",
+            "transfer-from",
+            "heartbeat",
+            "status",
+            "policy",
+            "check",
+        ] {
+            let help = subcommand_help(sub);
+            assert!(
+                help.contains(&format!("Usage: agent-tx {sub}")),
+                "help for {sub} must contain usage"
+            );
+            assert!(
+                help.contains("-h, --help"),
+                "help for {sub} must document help option"
+            );
+        }
+
+        let guards = guards_help();
+        assert!(guards.contains("Usage: agent-tx guards"));
+        for sub in ["add", "list", "remove", "set-default"] {
+            let help = guards_subcommand_help(sub);
+            assert!(
+                help.contains(&format!("Usage: agent-tx guards {sub}")),
+                "help for guards {sub} must contain usage"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_arguments_name_the_argument_and_expected_form() {
+        // Missing --amount must name the flag and the expected integer i128 form
+        let args = argv(&[
+            "check",
+            "--guard",
+            VALID_GUARD,
+            "--asset",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("check", rest).expect_err("check accepted without amount");
+        assert!(err.contains("--amount"), "{err}");
+        assert!(err.contains("expected integer i128"), "{err}");
+
+        // Missing value for --amount must name the flag and expected form
+        let args = argv(&[
+            "check",
+            "--guard",
+            VALID_GUARD,
+            "--asset",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+            "--amount",
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("check", rest).expect_err("flag without value accepted");
+        assert!(err.contains("--amount"), "{err}");
+        assert!(err.contains("requires a value"), "{err}");
+        assert!(err.contains("expected integer i128"), "{err}");
+
+        // Missing value for --guard
+        let args = argv(&["status", "--guard"]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("status", rest).expect_err("guard without value accepted");
+        assert!(err.contains("--guard"), "{err}");
+        assert!(err.contains("requires a value"), "{err}");
+        assert!(err.contains("expected contract ID"), "{err}");
+
+        // Missing --from in transfer-from
+        let args = argv(&[
+            "transfer-from",
+            "--guard",
+            VALID_GUARD,
+            "--token",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+            "--amount",
+            "10",
+            "--agent-secret",
+            VALID_SECRET,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err =
+            parse_request("transfer-from", rest).expect_err("transfer-from accepted without from");
+        assert!(err.contains("--from"), "{err}");
+        assert!(err.contains("expected account ID"), "{err}");
     }
 }
 
@@ -2396,21 +2969,21 @@ impl<'a> Cli<'a> {
         token
     }
 
-    /// The value belonging to the flag just consumed.
-    fn value(&mut self, flag: &str) -> Result<String, String> {
+    /// The value belonging to the flag just consumed, stating the expected form.
+    fn value_expected(&mut self, flag: &str, expected: &str) -> Result<String, String> {
         self.next()
-            .ok_or_else(|| format!("{flag} requires a value"))
+            .ok_or_else(|| format!("{flag} requires a value (expected {expected})"))
     }
 
-    fn positional(&mut self, name: &str) -> Result<String, String> {
+    fn positional_expected(&mut self, arg_name: &str, expected: &str) -> Result<String, String> {
         self.next()
-            .ok_or_else(|| format!("`{}` requires {name}", self.cmd))
+            .ok_or_else(|| format!("missing <{arg_name}>: `{}` requires {expected}", self.cmd))
     }
 
     fn unknown(&self, flag: &str) -> String {
         format!(
-            "unknown argument for `{}`: {flag} (see `agent-tx --help`)",
-            self.cmd
+            "unknown argument for `{}`: {flag} (see `agent-tx --help` or `agent-tx {} --help`)",
+            self.cmd, self.cmd
         )
     }
 }
@@ -2439,7 +3012,7 @@ fn parse_rpc_timeout(raw: &str) -> Result<Duration, String> {
 
 fn parse_amount(raw: &str) -> Result<i128, String> {
     raw.parse::<i128>().map_err(|e| {
-        format!("invalid --amount '{raw}': {e}; expected a signed integer in whole units")
+        format!("invalid --amount '{raw}': {e}; expected an integer i128 in whole units")
     })
 }
 
@@ -2450,12 +3023,14 @@ fn parse_amount(raw: &str) -> Result<i128, String> {
 struct Request {
     guard: ScAddress,
     token: Option<ScAddress>,
+    from: Option<ScAddress>,
     to: Option<ScAddress>,
     amount: Option<i128>,
     secret: Option<String>,
     endpoint: Endpoint,
     rpc_timeout: Duration,
     expect_blocked: bool,
+    inclusion_fee_override: Option<u32>,
 }
 
 impl Request {
@@ -2473,9 +3048,11 @@ impl Request {
         Args {
             rpc: self.rpc(),
             passphrase: self.endpoint.passphrase.clone(),
+            passphrase_source: self.endpoint.passphrase_source,
             guard: self.guard.clone(),
             secret: self.secret.clone(),
             expect_blocked: self.expect_blocked,
+            inclusion_fee_override: self.inclusion_fee_override,
         }
     }
 }
@@ -2486,6 +3063,7 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     let mut guard = None;
     let mut token = None;
     let mut token_field = String::new();
+    let mut from = None;
     let mut to = None;
     let mut amount = None;
     let mut secret = None;
@@ -2495,24 +3073,60 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     let mut passphrase = None;
     let mut rpc_timeout = DEFAULT_RPC_TIMEOUT;
     let mut expect_blocked = false;
+    let mut inclusion_fee_override = None;
 
     while let Some(flag) = cli.next() {
         match flag.as_str() {
-            "--guard" => guard = Some(cli.value("--guard")?),
+            "-h" | "--help" => {
+                return Err(format!(
+                    "help requested for `{cmd}` (see `agent-tx {cmd} --help`)"
+                ));
+            }
+            "--guard" => guard = Some(cli.value_expected("--guard", "contract ID 'C...'")?),
             "--token" | "--asset" => {
                 token_field = flag.clone();
-                token = Some(cli.value(&flag)?);
+                token = Some(cli.value_expected(&flag, "contract ID 'C...'")?);
             }
-            "--to" => to = Some(cli.value("--to")?),
-            "--amount" => amount = Some(parse_amount(&cli.value("--amount")?)?),
+            "--from" => {
+                from =
+                    Some(cli.value_expected("--from", "account ID 'G...' or contract ID 'C...'")?)
+            }
+            "--to" => {
+                to =
+                    Some(cli.value_expected(
+                        "--to",
+                        "recipient account ID 'G...' or contract ID 'C...'",
+                    )?)
+            }
+            "--amount" => {
+                amount = Some(parse_amount(
+                    &cli.value_expected("--amount", "integer i128")?,
+                )?)
+            }
+            "--inclusion-fee" => {
+                let raw = cli.value_expected("--inclusion-fee", "stroops as u32")?;
+                inclusion_fee_override = Some(raw.parse::<u32>().map_err(|error| {
+                    format!("invalid --inclusion-fee '{raw}': {error}; expected stroops as u32")
+                })?);
+            }
             "--agent-secret" | "--secret" => {
                 secret_field = flag.clone();
-                secret = Some(cli.value(&flag)?);
+                secret = Some(cli.value_expected(&flag, "secret seed 'S...'")?);
             }
-            "--network" => network = Some(cli.value("--network")?),
-            "--rpc-url" => rpc_url = Some(cli.value("--rpc-url")?),
-            "--network-passphrase" => passphrase = Some(cli.value("--network-passphrase")?),
-            "--rpc-timeout" => rpc_timeout = parse_rpc_timeout(&cli.value("--rpc-timeout")?)?,
+            "--network" => {
+                network = Some(cli.value_expected("--network", "testnet | futurenet | mainnet")?)
+            }
+            "--rpc-url" => {
+                rpc_url = Some(cli.value_expected("--rpc-url", "endpoint URL e.g. https://...")?)
+            }
+            "--network-passphrase" => {
+                passphrase = Some(cli.value_expected("--network-passphrase", "passphrase string")?)
+            }
+            "--rpc-timeout" => {
+                rpc_timeout = parse_rpc_timeout(
+                    &cli.value_expected("--rpc-timeout", "whole seconds e.g. 30")?,
+                )?
+            }
             "--expect-blocked" => expect_blocked = true,
             other => return Err(cli.unknown(other)),
         }
@@ -2540,9 +3154,9 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     if let Some(secret) = &secret {
         strkey::validate_key(&secret_field, KeyKind::Secret, secret)?;
     }
-    if matches!(cmd, "transfer" | "heartbeat") && secret.is_none() {
+    if matches!(cmd, "transfer" | "transfer-from" | "heartbeat") && secret.is_none() {
         return Err(format!(
-            "missing --agent-secret (or AGENT_SECRET): `{cmd}` signs and submits, so it requires \
+            "missing --agent-secret (or AGENT_SECRET; expected secret seed 'S...'): `{cmd}` signs and submits, so it requires \
              the registered agent's secret seed"
         ));
     }
@@ -2550,13 +3164,14 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     // The spend-shaped subcommands take a token and a recipient. `transfer`
     // names the token flag `--token`, `preflight`/`check` name it `--asset`;
     // either spelling is accepted, and a complaint names the one used.
-    let spend_flags = matches!(cmd, "preflight" | "transfer" | "check");
+    let spend_flags = matches!(cmd, "preflight" | "transfer" | "transfer-from" | "check");
     let default_token_field = if cmd == "transfer" {
         "--token"
     } else {
         "--asset"
     };
     let mut parsed_token = None;
+    let mut parsed_from = None;
     let mut parsed_to = None;
     if spend_flags {
         let token_field = if token_field.is_empty() {
@@ -2564,80 +3179,299 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
         } else {
             token_field
         };
-        let raw = token
-            .as_deref()
-            .ok_or_else(|| format!("missing {token_field}: `{cmd}` requires it"))?;
+        let raw = token.as_deref().ok_or_else(|| {
+            format!("missing {token_field} (expected contract ID 'C...'): `{cmd}` requires it")
+        })?;
         parsed_token = Some(validate_address(&token_field, KeyKind::Contract, raw)?);
+        if cmd == "transfer-from" {
+            let raw = from
+                .as_deref()
+                .ok_or_else(|| "missing --from (expected account ID 'G...' or contract ID 'C...'): `transfer-from` requires it".to_string())?;
+            parsed_from = Some(validate_address("--from", KeyKind::Recipient, raw)?);
+        } else if from.is_some() {
+            return Err("--from is only valid for `transfer-from`".to_string());
+        }
         let raw = to
             .as_deref()
-            .ok_or_else(|| format!("missing --to: `{cmd}` requires it"))?;
+            .ok_or_else(|| format!("missing --to (expected recipient account ID 'G...' or contract ID 'C...'): `{cmd}` requires it"))?;
         parsed_to = Some(validate_address("--to", KeyKind::Recipient, raw)?);
         if amount.is_none() {
-            return Err(format!("missing --amount: `{cmd}` requires it"));
+            return Err(format!(
+                "missing --amount (expected integer i128): `{cmd}` requires it"
+            ));
         }
     }
 
     Ok(Request {
         guard,
         token: parsed_token,
+        from: parsed_from,
         to: parsed_to,
         amount,
         secret,
         endpoint,
         rpc_timeout,
         expect_blocked,
+        inclusion_fee_override,
     })
 }
 
-fn print_help() {
-    println!("agent-tx — simulate or submit Soroban transactions for Stellar Agent Guard");
-    println!("Usage:");
-    println!("  agent-tx preflight --guard <C...> --asset <C...> --to <G...> --amount <N> [--secret <S...>]");
-    println!("  agent-tx transfer --guard <C...> --token <C...> --to <G...> --amount <N> --agent-secret <S...>");
-    println!("  agent-tx heartbeat --guard <C...> --agent-secret <S...>");
-    println!("  agent-tx status --guard <C...> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx policy --guard <C...> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx check --guard <C...> --asset <C...> --to <G...> --amount <N> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx guards <add|list|remove|set-default> ...");
-    println!();
-    println!("Network selection:");
-    println!("  --network testnet|futurenet|mainnet   named preset endpoint + passphrase (default: testnet)");
-    println!(
-        "                                        mainnet: {}",
-        Network::Mainnet.rpc_url()
-    );
-    println!(
-        "                                        futurenet: {}",
-        Network::Futurenet.rpc_url()
-    );
-    println!("  --rpc-url <url>                       any endpoint; overrides the default, and is");
-    println!("                                        refused together with an explicit --network");
-    println!("  --network-passphrase <passphrase>     override the preset's passphrase (advanced:");
-    println!("                                        private or non-standard networks)");
-    println!(
-        "  --rpc-timeout <secs>                  per-request RPC timeout (default: {}s); a",
+fn tool_help() -> String {
+    format!(
+        "agent-tx — simulate or submit Soroban transactions for Stellar Agent Guard\n\
+         \n\
+         Usage:\n\
+         \x20 agent-tx preflight --guard <C...> --asset <C...> --to <G...> --amount <N> [--secret <S...>]\n\
+         \x20 agent-tx transfer --guard <C...> --token <C...> --to <G...> --amount <N> --agent-secret <S...>\n\
+         \x20 agent-tx transfer-from --guard <C...> --token <C...> --from <G|C...> --to <G|C...> --amount <N> --agent-secret <S...>\n\
+         \x20 agent-tx heartbeat --guard <C...> --agent-secret <S...>\n\
+         \x20 agent-tx status --guard <C...> [--network testnet|futurenet|mainnet]\n\
+         \x20 agent-tx policy --guard <C...> [--network testnet|futurenet|mainnet]\n\
+         \x20 agent-tx check --guard <C...> --asset <C...> --to <G...> --amount <N> [--network testnet|futurenet|mainnet]\n\
+         \x20 agent-tx guards <add|list|remove|set-default> ...\n\
+         \n\
+         Run `agent-tx <subcommand> --help` for detailed help on any subcommand.\n\
+         \n\
+         Network selection:\n\
+         \x20 --network testnet|futurenet|mainnet   named preset endpoint + passphrase (default: testnet)\n\
+         \x20                                       mainnet: {}\n\
+         \x20                                       futurenet: {}\n\
+         \x20 --rpc-url <url>                       any endpoint; overrides the default, and is\n\
+         \x20                                       refused together with an explicit --network\n\
+         \x20 --network-passphrase <passphrase>     override the preset's passphrase (advanced:\n\
+         \x20                                       private or non-standard networks)\n\
+         \x20 --inclusion-fee <stroops>             override the RPC-reported inclusion fee\n\
+         \x20 --rpc-timeout <secs>                  per-request RPC timeout (default: {}s); a\n\
+         \x20                                       timeout exits 3 naming the RPC method\n\
+         \x20 Custom --rpc-url values require --network-passphrase unless the URL is a known preset.\n\
+         \x20 Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr.\n\
+         \x20 A StrKey's leading character encodes the key type, not the network, so address\n\
+         \x20 validation cannot catch a wrong-network address; the preset plus passphrase decide\n\
+         \x20 which network a call reaches.\n\
+         \n\
+         Inputs: --guard/--asset/--token must be a contract ID (C...), --to an account (G...) or\n\
+         contract (C...) ID, --agent-secret a secret seed (S...). All are checked for the\n\
+         correct prefix, length and CRC16 checksum before any RPC request is made.\n\
+         Preflight exit codes: 0=admitted, 1=blocked (signed simulation), 2=unsigned/inconclusive.\n\
+         Troubleshooting: See README.md 'Troubleshooting — Submission Errors' table for error mapping and concrete fix flags (--fee-multiplier, etc.).\n\
+         The stellar CLI cannot sign auth entries for contract addresses; use agent-tx for heartbeat calls (see tools/agent-tx/README.md).",
+        Network::Mainnet.rpc_url(),
+        Network::Futurenet.rpc_url(),
         DEFAULT_RPC_TIMEOUT.as_secs()
-    );
-    println!("                                        timeout exits 1 naming the RPC method");
-    println!(
-        "  Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr."
-    );
-    println!("  A StrKey's leading character encodes the key type, not the network, so address");
-    println!(
-        "  validation cannot catch a wrong-network address; the preset plus passphrase decide"
-    );
-    println!("  which network a call reaches.");
-    println!();
-    println!(
-        "Inputs: --guard/--asset/--token must be a contract ID (C...), --to an account (G...) or"
-    );
-    println!("contract (C...) ID, --agent-secret a secret seed (S...). All are checked for the");
-    println!("correct prefix, length and CRC16 checksum before any RPC request is made.");
-    println!(
-        "Preflight exit codes: 0=admitted, 1=blocked (signed simulation), 2=unsigned/inconclusive."
-    );
-    println!("Troubleshooting: See README.md 'Troubleshooting — Submission Errors' table for error mapping and concrete fix flags (--fee-multiplier, etc.).");
-    println!("The stellar CLI cannot sign auth entries for contract addresses; use agent-tx for heartbeat calls (see tools/agent-tx/README.md).");
+    )
+}
+
+fn print_help() {
+    println!("{}", tool_help());
+}
+
+fn subcommand_help(cmd: &str) -> String {
+    match cmd {
+        "preflight" => {
+            "Usage: agent-tx preflight --guard <C...> --asset <C...> --to <G|C...> --amount <N> [options]\n\
+             \n\
+             Simulate a prospective transfer without submitting to the network.\n\
+             Exit codes: 0 = admitted by policy, 1 = blocked by guard policy, 2 = unsigned/inconclusive.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --asset <C...>              Token contract address (C...); synonym: --token\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \n\
+             Options:\n\
+             \x20 --secret <S...>             Agent secret seed (S...) for signed simulation auth\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 --expect-blocked            Invert exit code: exit 0 if simulation blocked, 1 if admitted\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "transfer" => {
+            "Usage: agent-tx transfer --guard <C...> --token <C...> --to <G|C...> --amount <N> --agent-secret <S...> [options]\n\
+             \n\
+             Sign and submit a transfer from the guard contract to the recipient.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --token <C...>              Token contract address (C...); synonym: --asset\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \x20 --agent-secret <S...>       Registered agent's secret seed (S...); or set AGENT_SECRET env var\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 --expect-blocked            Expect the transaction to be rejected by policy\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "transfer-from" => {
+            "Usage: agent-tx transfer-from --guard <C...> --token <C...> --from <G|C...> --to <G|C...> --amount <N> --agent-secret <S...> [options]\n\
+             \n\
+             Sign and submit a transfer_from authorized by the guard account.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --token <C...>              Token contract address (C...)\n\
+             \x20 --from <G|C...>             Source account (G...) or contract (C...) debited by allowance\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \x20 --agent-secret <S...>       Registered agent's secret seed (S...); or set AGENT_SECRET env var\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 --expect-blocked            Expect the transaction to be rejected by policy\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "heartbeat" => {
+            "Usage: agent-tx heartbeat --guard <C...> --agent-secret <S...> [options]\n\
+             \n\
+             Send a heartbeat transaction to keep the guard's dead man's switch (DMS) from expiring.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --agent-secret <S...>       Registered agent's secret seed (S...); or set AGENT_SECRET env var\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "status" => {
+            "Usage: agent-tx status --guard <C...> [options]\n\
+             \n\
+             Inspect the guard's on-chain status (frozen state, heartbeat expiration, policy revision).\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "policy" => {
+            "Usage: agent-tx policy --guard <C...> [options]\n\
+             \n\
+             Fetch and display active spending limits and policy configuration for the guard.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "check" => {
+            "Usage: agent-tx check --guard <C...> --asset <C...> --to <G|C...> --amount <N> [options]\n\
+             \n\
+             Simulate an unsigned transfer against guard policy and display the verdict.\n\
+             \n\
+             Required arguments:\n\
+             \x20 --guard <C...>              Guard contract address (C...) or registered alias\n\
+             \x20 --asset <C...>              Token contract address (C...); synonym: --token\n\
+             \x20 --to <G|C...>               Recipient account ID (G...) or contract ID (C...)\n\
+             \x20 --amount <N>                Amount to transfer (integer i128 in whole units/stroops)\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 -h, --help                  Print this help message\n".to_string()
+        }
+        "guards" => guards_help(),
+        _ => tool_help(),
+    }
+}
+
+fn print_subcommand_help(cmd: &str) {
+    println!("{}", subcommand_help(cmd));
+}
+
+fn guards_help() -> String {
+    "Usage: agent-tx guards <subcommand> [args...]\n\
+     \n\
+     Manage the local registry of guard contracts and aliases.\n\
+     \n\
+     Subcommands:\n\
+     \x20 add <alias> <address> <admin> [--network <name> | --rpc-url <url>] [--network-passphrase <pass>] [--rpc-timeout <secs>]\n\
+     \x20     Register a guard contract address and admin under an alias\n\
+     \x20 list\n\
+     \x20     List all registered guard aliases and current default\n\
+     \x20 remove <alias>\n\
+     \x20     Remove an alias from the local registry\n\
+     \x20 set-default <alias>\n\
+     \x20     Set the default guard alias used when --guard is omitted\n\
+     \n\
+     Run `agent-tx guards <subcommand> --help` for help on a guards subcommand.\n\
+     Options:\n\
+     \x20 -h, --help   Print this help message\n".to_string()
+}
+
+fn print_guards_help() {
+    println!("{}", guards_help());
+}
+
+fn guards_subcommand_help(sub: &str) -> String {
+    match sub {
+        "add" => "Usage: agent-tx guards add <alias> <address> <admin> [options]\n\
+             \n\
+             Register a guard contract address and admin under a local alias.\n\
+             \n\
+             Positional arguments:\n\
+             \x20 <alias>       Unique alias name for the guard\n\
+             \x20 <address>     Guard contract address (C...)\n\
+             \x20 <admin>       Admin account address (G...)\n\
+             \n\
+             Options:\n\
+             \x20 --network <preset>          Network preset: testnet | futurenet | mainnet\n\
+             \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
+             \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
+             \x20 -h, --help                  Print this help message\n"
+            .to_string(),
+        "list" => "Usage: agent-tx guards list\n\
+             \n\
+             List all registered guard aliases and indicate the default guard.\n"
+            .to_string(),
+        "remove" => "Usage: agent-tx guards remove <alias>\n\
+             \n\
+             Remove a guard alias from the local registry.\n\
+             \n\
+             Positional arguments:\n\
+             \x20 <alias>   The alias to remove\n"
+            .to_string(),
+        "set-default" => "Usage: agent-tx guards set-default <alias>\n\
+             \n\
+             Set the default guard alias used when --guard is omitted.\n\
+             \n\
+             Positional arguments:\n\
+             \x20 <alias>   The registered alias to set as default\n"
+            .to_string(),
+        _ => guards_help(),
+    }
+}
+
+fn print_guards_subcommand_help(sub: &str) {
+    println!("{}", guards_subcommand_help(sub));
 }
 
 // ── Read-only diagnostics (status, policy, check) ───────────────────────
@@ -2680,11 +3514,7 @@ fn cmd_status(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), Str
     let keys = [instance_key, policy_key, heartbeat_key, frozen_key];
     let keys_xdr: Vec<String> = keys.iter().map(b64_encode_xdr).collect();
 
-    let res = rpc.post("getLedgerEntries", serde_json::json!({ "keys": keys_xdr }));
-
-    if let Some(err) = res.get("error") {
-        return Err(format!("failed to fetch guard status: {}", err));
-    }
+    let res = rpc_or_exit(rpc.post("getLedgerEntries", serde_json::json!({ "keys": keys_xdr })));
 
     let entries = res["entries"].as_array().ok_or("no entries in response")?;
 
@@ -2759,14 +3589,10 @@ fn cmd_status(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), Str
 /// Fetch and display the current policy configuration
 fn cmd_policy(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), String> {
     let policy_key = guard_data_key(guard, GuardKey::Policy);
-    let res = rpc.post(
+    let res = rpc_or_exit(rpc.post(
         "getLedgerEntries",
         serde_json::json!({ "keys": [b64_encode_xdr(&policy_key)] }),
-    );
-
-    if let Some(err) = res.get("error") {
-        return Err(format!("failed to fetch policy: {}", err));
-    }
+    ));
 
     let entries = res["entries"].as_array().ok_or("no entries in response")?;
 
@@ -2831,12 +3657,10 @@ fn cmd_check(
 
     let sim = rpc.simulate(&b64_encode_xdr(&env));
 
-    if let Some(err) = sim.get("error") {
-        if let Some(code) = err["code"].as_str() {
-            println!("result: blocked");
-            println!("reason: {}", code);
-        }
-        if let Some(events) = err["data"]["events"].as_array() {
+    if let Some(error) = simulation_error_message(&sim) {
+        println!("result: rejected (unsigned simulation; no guard policy verdict)");
+        println!("reason: {error}");
+        if let Some(events) = simulation_events(&sim) {
             for ev in events {
                 if let Some(b64) = ev["xdr"].as_str() {
                     let de: DiagnosticEvent = xdr(b64);
@@ -2869,8 +3693,20 @@ fn exit_with(message: String) -> ! {
 }
 
 fn run_guards(argv: &[String]) {
+    if argv.is_empty() || argv[0] == "--help" || argv[0] == "-h" || argv[0] == "help" {
+        print_guards_help();
+        return;
+    }
+    let sub = &argv[0];
+    if argv.len() > 1 && (argv[1] == "--help" || argv[1] == "-h" || argv[1] == "help") {
+        print_guards_subcommand_help(sub);
+        return;
+    }
     let mut cli = Cli::new("guards", argv);
-    let subcommand = match cli.positional("a subcommand: add | list | remove | set-default") {
+    let subcommand = match cli.positional_expected(
+        "subcommand",
+        "a subcommand: add | list | remove | set-default (see `agent-tx guards --help`)",
+    ) {
         Ok(subcommand) => subcommand,
         Err(message) => exit_with(message),
     };
@@ -2883,7 +3719,7 @@ fn run_guards(argv: &[String]) {
         "remove" => cmd_guards_remove(&mut cli),
         "set-default" => cmd_guards_set_default(&mut cli),
         other => Err(format!(
-            "unknown guards subcommand: {other} (expected add, list, remove or set-default)"
+            "unknown guards subcommand: {other} (expected add, list, remove or set-default; see `agent-tx guards --help`)"
         )),
     };
     if let Err(message) = result {
@@ -2897,8 +3733,39 @@ fn main() {
         print_help();
         std::process::exit(1);
     };
-    if cmd == "--help" || cmd == "-h" {
-        print_help();
+    if cmd == "--help" || cmd == "-h" || cmd == "help" {
+        if let Some(sub) = rest.first() {
+            if sub == "guards" {
+                if let Some(sub_sub) = rest.get(1) {
+                    print_guards_subcommand_help(sub_sub);
+                } else {
+                    print_guards_help();
+                }
+            } else {
+                print_subcommand_help(sub);
+            }
+        } else {
+            print_help();
+        }
+        return;
+    }
+    if rest
+        .iter()
+        .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
+    {
+        if cmd == "guards" {
+            if let Some(sub_sub) = rest.first() {
+                if matches!(sub_sub.as_str(), "add" | "list" | "remove" | "set-default") {
+                    print_guards_subcommand_help(sub_sub);
+                } else {
+                    print_guards_help();
+                }
+            } else {
+                print_guards_help();
+            }
+        } else {
+            print_subcommand_help(cmd);
+        }
         return;
     }
     if cmd == "guards" {
@@ -2907,7 +3774,7 @@ fn main() {
     }
     if !matches!(
         cmd.as_str(),
-        "preflight" | "transfer" | "heartbeat" | "status" | "policy" | "check"
+        "preflight" | "transfer" | "transfer-from" | "heartbeat" | "status" | "policy" | "check"
     ) {
         exit_with(format!(
             "unknown subcommand '{cmd}' (see `agent-tx --help`)"
@@ -2941,32 +3808,71 @@ fn main() {
             }
         }
         "check" => {
-            let asset = request.token.clone().expect("validated --asset");
-            let to = request.to.clone().expect("validated --to");
-            let amount = request.amount.expect("validated --amount");
+            let (asset, to, amount) =
+                match (request.token.clone(), request.to.clone(), request.amount) {
+                    (Some(asset), Some(to), Some(amount)) => (asset, to, amount),
+                    _ => exit_with(
+                        "missing required argument for `check` (see `agent-tx check --help`)"
+                            .into(),
+                    ),
+                };
             if let Err(e) = cmd_check(&rpc, &request.guard, &asset, &to, amount, &passphrase) {
                 exit_with(e);
             }
         }
         "preflight" => {
-            let call = Call::Transfer {
-                token: request.token.clone().expect("validated --asset"),
-                to: request.to.clone().expect("validated --to"),
-                amount: request.amount.expect("validated --amount"),
+            let (token, to, amount) = match (
+                request.token.clone(),
+                request.to.clone(),
+                request.amount,
+            ) {
+                (Some(token), Some(to), Some(amount)) => (token, to, amount),
+                _ => exit_with(
+                    "missing required argument for `preflight` (see `agent-tx preflight --help`)"
+                        .into(),
+                ),
             };
+            let call = Call::Transfer { token, to, amount };
             let args = request.args();
             let result = preflight(&call, &args, &args.rpc);
             std::process::exit(result.err().unwrap_or(0));
         }
         "transfer" => {
-            let call = Call::Transfer {
-                token: request.token.clone().expect("validated --token"),
-                to: request.to.clone().expect("validated --to"),
-                amount: request.amount.expect("validated --amount"),
+            let (token, to, amount) =
+                match (request.token.clone(), request.to.clone(), request.amount) {
+                    (Some(token), Some(to), Some(amount)) => (token, to, amount),
+                    _ => exit_with(
+                        "missing required argument for `transfer` (see `agent-tx transfer --help`)"
+                            .into(),
+                    ),
+                };
+            let call = Call::Transfer { token, to, amount };
+            run(&call, &request.args());
+        }
+        "transfer-from" => {
+            let (token, from, to, amount) = match (
+                request.token.clone(),
+                request.from.clone(),
+                request.to.clone(),
+                request.amount,
+            ) {
+                (Some(token), Some(from), Some(to), Some(amount)) => (token, from, to, amount),
+                _ => exit_with(
+                    "missing required argument for `transfer-from` (see `agent-tx transfer-from --help`)"
+                        .into(),
+                ),
+            };
+            let call = Call::TransferFrom {
+                token,
+                from,
+                to,
+                amount,
             };
             run(&call, &request.args());
         }
         "heartbeat" => run(&Call::Heartbeat, &request.args()),
-        _ => unreachable!(),
+        _ => exit_with(format!(
+            "unknown subcommand '{cmd}' (see `agent-tx --help`)"
+        )),
     }
 }

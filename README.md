@@ -12,7 +12,7 @@
 <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0"/>
 </a>
 <a href="https://www.rust-lang.org/">
-<img src="https://img.shields.io/badge/rust-1.85%2B-blue" alt="Rust 1.85+"/>
+<img src="https://img.shields.io/badge/rust-1.91%2B-blue" alt="Rust 1.91+"/>
 </a>
 <a href="https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/">....
 <img src="https://img.shields.io/badge/docs-GitBook-blue" alt="Documentation"/>
@@ -21,7 +21,7 @@
 
 # Stellar Agent Guard — Contracts
 
-📚 **[Documentation](https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/)**
+📚 **[Documentation](https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/)** • **[SPEC ↔ GitBook Cross-Reference](docs/README.md#spec--gitbook-cross-reference-map)**
 
 **Non-custodial, account-level spending firewall for autonomous AI agents on Stellar.**
 
@@ -96,9 +96,12 @@ Full recipient/amount enforcement — spend caps, allowlists, per-transaction li
 git clone https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 217 tests, isolated (no network)
+cargo test                                      # 225 tests, isolated (no network)
 
-# Read live state from the Phase-1 testnet deployment (no auth, simulation only)
+# Read live state from the Phase-1 testnet deployment (no auth, simulation only).
+# Live, testnet protocol 28, 2026-09-08: the fixture account was DMS-frozen
+# (heartbeat_expired: true) — the designed end state after the 60s grace lapsed.
+# The read still succeeds because reads are permissionless.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- status
 # → {"admin_frozen":false,"has_policy":true,"heartbeat_expired":true,"last_heartbeat":1788855212,"now":1788863857}
@@ -123,6 +126,9 @@ authorization is rejected with `not_initialized`/`no_policy`.
 
 Called twice, it fails with `AlreadyInitialized` — verified live:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the fixture account was already
+# initialized, so this second call is rejected — demonstrates the retry hazard
+# below, not a failed deployment.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- \
   initialize --admin GD5S5O2MZ6FSMFH6QILG37KSQNRVR3RPSWBTTV4JOUJ7J6TWLLL5LAVS \
@@ -173,6 +179,10 @@ Config is validated **before** anything is written; invalid config fails with
 fixture policy installs cleanly (emits `EventPolicySet`), and an invalid active window
 (`active_until <= active_from`) is rejected with `Error(Contract, #4)`:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: simulated against the deployed account
+# while it was DMS-frozen. The admin write is still admitted — the dead-man gate
+# guards agent authorizations, not admin policy writes — and emits EventPolicySet.
+# Simulation does not persist this call.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- set_policy --config '{
     "active_from": 0, "active_until": 0, "allow_any_recipient": false,
@@ -221,9 +231,9 @@ Admin-only. Re-binds the agent's Ed25519 public key. The admin never gains fund-
 power — it can only replace the key the account will authenticate. Verified live
 (simulation): emits `EventAgentRotated`.
 
-Full operational runbook — scheduled rotation, suspected-leak ordering
-(freeze → rotate → unfreeze), rollback, and the admin-key handover
-ceremony: [`docs/key-rotation.md`](docs/key-rotation.md).
+Full operational runbook — scheduled hygiene, lost-key recovery (handling DMS
+expiration via `unfreeze`), suspected-leak ordering (freeze → rotate → unfreeze),
+rollback, and the admin-key handover ceremony: [`docs/key-rotation.md`](docs/key-rotation.md).
 
 ### `propose_admin_rotation` / `confirm_admin_rotation` / `cancel_admin_rotation`
 ```rust
@@ -259,9 +269,10 @@ The `stellar` CLI cannot invoke it, because it cannot sign Soroban auth entries 
 address is a contract. Use the repo's submission helper instead:
 ```bash
 cd tools/agent-tx && cargo build --release
+# Read without echo so the secret is not saved in shell history.
+read -rsp "Agent secret: " AGENT_SECRET; echo; export AGENT_SECRET
 ./target/release/agent-tx heartbeat \
-  --guard CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
-  --agent-secret S...   # the registered agent's Ed25519 secret (AGENT_SECRET env also works)
+  --guard CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7
 ```
 
 For the full steady-state loop an agent must run (heartbeat cadence, per-transfer
@@ -281,11 +292,13 @@ guarantee of the eventual inclusion fee.
 
 ```bash
 cd tools/agent-tx && cargo build --release
+# Read without echo so the secret is not saved in shell history.
+read -rsp "Agent secret: " AGENT_SECRET; echo; export AGENT_SECRET
 ./target/release/agent-tx preflight \
   --guard CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --asset CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7 \
   --to GDUYLFVFLVISVOM5FK5KTBA446VQQ7NBRRFMLNLKLISKL26LJGKUVRRX \
-  --amount 1100 --secret "$AGENT_SECRET"
+  --amount 1100
 # BLOCKED (pre-broadcast, enforced simulation)
 # diagnostic event: auth_checked, blocked, per_tx_cap_exceeded
 # broadcast: no
@@ -293,11 +306,12 @@ cd tools/agent-tx && cargo build --release
 
 The example exceeds the fixture policy's `per_tx_cap: 1000`. Exit codes:
 `0` means signed simulation admitted the call, `1` means signed simulation
-blocked it, and `2` means the unsigned simulation was inconclusive. `--secret`
-is optional (or supplied via `AGENT_SECRET`): without it the tool retrieves the
+blocked it, and `2` means the unsigned simulation was inconclusive. The secret
+is optional: without `AGENT_SECRET` the tool retrieves the
 registered public key and estimates a fee, but cannot sign the custom-account
 authorization, so it cannot establish whether `__check_auth` will admit the
-transfer. See [`tools/agent-tx/README.md`](tools/agent-tx/README.md) for details.
+transfer. The command above prompts without echo so the secret is not saved in
+shell history. See [`tools/agent-tx/README.md`](tools/agent-tx/README.md) for details.
 
 ### `freeze` / `unfreeze`
 ```rust
@@ -331,6 +345,9 @@ For gate ordering and full incident guidance, see [SPEC §4.2](SPEC.md#42-admin-
 The real Phase-1 unfreeze — the DMS-reversal transaction verified on-chain (tx
 `dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5`):
 ```bash
+# Live, testnet protocol 28, 2026-09-08 (on-chain): the account had self-frozen
+# when the 60s grace lapsed; this admin unfreeze is the only path back (the
+# agent's own heartbeat is rejected while expired). Submitted and confirmed.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source guard_admin --send=yes -- unfreeze
 # → ✅ Transaction submitted successfully!  tx=dd327d32b18bfc6cebdf6c956503fe5318e28f8a8bc86a88cb7ee42c5d46b5e5
@@ -345,6 +362,9 @@ read may extend the policy TTL and incur rent if it is below the threshold in [S
 simulation does not persist the extension. Verified live against the deployed contract — this is
 the real installed fixture policy:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the account is DMS-frozen but the
+# policy still reads — permissionless reads are not gated by the dead-man switch.
+# This is the policy currently installed on the fixture account (DMS grace 60s).
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- policy
 # → {"active_from":0,"active_until":0,"allow_any_recipient":false,
@@ -384,6 +404,9 @@ account. When submitted on-ledger, this read may extend persistent-entry TTLs an
 simulation does not persist those extensions (SPEC §9.5).
 Verified live:
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the fixture account's 60s DMS grace
+# lapsed after the Phase-1 runs, so it reports heartbeat_expired: true. That is
+# the self-freeze working as designed, not a broken read.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- status
 # → {"admin_frozen":false,"has_policy":true,"heartbeat_expired":true,"last_heartbeat":1788855212,"now":1788863857}
@@ -407,6 +430,10 @@ telemetry sees one vocabulary. Submitting it on-ledger may extend persistent-ent
 incur rent (SPEC §9.5); simulation does not persist those extensions. Verified live (this account is
 DMS-frozen, so the honest answer today is blocked):
 ```bash
+# Live, testnet protocol 28, 2026-09-08: the account was DMS-frozen, so this
+# simulated 50-unit transfer is blocked at the dead-man gate (heartbeat_expired)
+# before caps or allowlists are consulted. That is a correct answer to "can this
+# transfer go through right now?", not a failure of the contract.
 stellar contract invoke --id CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7 \
   --network testnet --source-account guard_admin --send=no -- \
   check --asset CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7 \
@@ -432,6 +459,9 @@ pub fn check_detailed(env: Env, asset: Address, to: Address, amount: i128) -> Ch
 ```
 Example CLI read for a policy with a 150-unit rolling cap and 40 units already spent:
 ```bash
+# Illustrative shape, not a live capture: a 150-unit window with 40 already
+# spent, 25 more requested → Allowed, 110 remaining. Replace the placeholders
+# with real IDs; this block documents the fields, not a verified run.
 stellar contract invoke --id GUARD_CONTRACT_ID --network testnet --source-account operator --send=no -- \
   check_detailed --asset ASSET_CONTRACT_ID --to RECIPIENT_ADDRESS --amount 25
 # → {"result":"Allowed","remaining_window":"110","per_tx_cap":"1000",\
@@ -621,37 +651,59 @@ its own commit so the hash change is reviewable on its own.
 ## How it works
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
-│ Transaction requires │─────▶│ __check_auth         │─────▶│ Verify agent Ed25519 │
-│ the account's auth   │      │ (host-invoked)       │      │ signature over auth  │
-└──────────────────────┘      └──────────────────────┘      │ payload (bad sig ⇒  │
-                                                             │ host trap)          │
-                                                             └──────────┬───────────┘
-                                                                        ▼
-┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
-│ Load PolicyConfig,   │◀─────│ Contexts >64 block   │◀─────│ Load instance +      │
-│ AdminFrozen,         │      │ before gates; else   │      │ persistent state     │
-│ LastHeartbeat, now   │      │ admin → DMS → pause  │      │ (agent key, policy,  │
-└──────────┬───────────┘      │ → active window      │      │ window, heartbeat)   │
-           │                  └──────────────────────┘      └──────────────────────┘
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ Transaction requires │───▶│ __check_auth         │───▶│ Verify agent Ed25519 │
+│ the account's auth   │    │ (host-invoked)       │    │ signature over auth  │
+│                      │    │                      │    │ payload              │
+│ [HOLDS FUNDS]        │    │ [HOST-ENFORCED]      │    │                      │
+│ Contract is account; │    │ Single enforcement   │    │ [HOST-ENFORCED]      │
+│ funds live in agent's│    │ vector (SPEC §1)     │    │ Host ed25519_verify; │
+│ own smart account    │    │                      │    │ bad sig traps frame  │
+│ with balances held   │    │ [NO FUNDS]           │    │ before policy eval   │
+│ at contract address  │    │ No third-party vault,│    │ (SPEC §1.1, §4.1)    │
+│ by SAC (SPEC §1)     │    │ no top_up, no deposit│    │                      │
+│                      │    │ step (SPEC §1)       │    │                      │
+└──────────────────────┘    └──────────────────────┘    └──────────┬───────────┘
+                                                [POLICY-BOUND]     │
+                                                From here, auth is │
+                                                policy-bound       ▼
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ Load PolicyConfig,   │◀───│ Contexts >64 block   │◀───│ Load instance +      │
+│ AdminFrozen,         │    │ before gates; else   │    │ persistent state     │
+│ LastHeartbeat, now   │    │ admin → DMS → pause  │    │ (agent key, policy,  │
+└──────────┬───────────┘    │ → active window      │    │ window, heartbeat)   │
+           │                └──────────────────────┘    └──────────────────────┘
            ▼
-┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
-│ Per-context decision │─────▶│ parse_call: classify │─────▶│ Enforce per kind:    │
-│ loop — every context │      │ each auth context    │      │ • AssetTransfer →    │
-│ must pass            │      │ (SelfCall /          │      │   recipient allowlist│
-└──────────────────────┘      │  CreateContract /    │      │   + per-tx cap +     │
-                              │  Unknown / AssetOther│      │   rolling window     │
-                              │  / AssetTransfer /   │      │ • Protocol → contract│
-                              │  Protocol)           │      │   + fn allowlist     │
-                              └──────────────────────┘      │ • anything else →    │
-                                                             │   default-deny       │
-                                                             └──────────┬───────────┘
-                                                                        ▼
-                              ┌────────────────────────────────────────────────────┐
-                              │ All contexts admissible?  Yes → commit staged      │
-                              │ window admissions → Ok(()).  No → Err(reason) —     │
-                              │ the whole transaction is rejected pre-broadcast.   │
-                              └────────────────────────────────────────────────────┘
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ Per-context decision │───▶│ parse_call: classify │───▶│ Enforce per kind:    │
+│ loop — every context │    │ each auth context    │    │ • AssetTransfer →    │
+│ must pass            │    │ (SelfCall /          │    │   recipient allowlist│
+└──────────────────────┘    │  CreateContract /    │    │   + per-tx cap +     │
+                            │  Unknown / AssetOther│    │   rolling window     │
+                            │  / AssetTransfer /   │    │ • Protocol → contract│
+                            │  Protocol)           │    │   + fn allowlist     │
+                            └──────────────────────┘    │ • anything else →    │
+                                                        │   default-deny       │
+                                                        └──────────┬───────────┘
+                                                                   ▼
+                          ┌────────────────────────────────────────────────────┐
+                          │ All contexts admissible?  Yes → commit staged      │
+                          │ window admissions → Ok(()).  No → Err(reason) —    │
+                          │ the whole transaction is rejected pre-broadcast.   │
+                          └────────────────────────────────────────────────────┘
+
+Trust boundaries & custody legend (SPEC §1):
+  [HOST-ENFORCED] Host-enforced step: Soroban host routes require_auth through
+                  __check_auth (SPEC §1); host crypto verification traps
+                  on bad signature (SPEC §1.1, §4.1).
+  [HOLDS FUNDS]   Contract is account (SPEC §1); funds live in agent's own
+                  smart account with balances held at contract address by
+                  Stellar Asset Contracts (SPEC §1).
+  [NO FUNDS]      Check logic takes no custody: there is no third-party vault,
+                  no top_up, no deposit step (SPEC §1).
+  [POLICY-BOUND]  From here, agent authorization is policy-bound: policy admin
+                  holds no fund-moving authority of any kind (admin functions
+                  change policy and freeze state only) (SPEC §1).
 ```
 
 Walkthrough, matching the real code path in `src/lib.rs` / `src/engine.rs`:
@@ -682,7 +734,8 @@ Walkthrough, matching the real code path in `src/lib.rs` / `src/engine.rs`:
 7. **All-or-nothing commit.** Window admissions are staged and only committed to storage
    if *every* context passes — a partially-validating batch can never spend. `Ok(())`
    approves; `Err(reason)` rejects the entire transaction, and the `auth_checked` event
-  records the outcome either way — with the same observability caveat as step 6 above:
+  records the outcome either way. Its data includes the authorized contract and function, so
+  a blocked decision identifies the denied call. The event has the same observability caveat as step 6 above:
    an allowed decision's event is committed, a blocked one exists only in diagnostics
    (the transaction it rolled back with carried it away). See [SPEC §9](SPEC.md#9-events-and-telemetry).
 
@@ -774,12 +827,31 @@ Stellar Agent Guard operates across three dedicated repositories:
   build if that file, the SPEC §4 table, the “How it works” walkthrough above, the
   `Error` enum, and `src/engine.rs` disagree — so the three artifacts cannot drift
   apart silently.
-- `SPEC.md` — the full architecture specification.
+- `docs/README.md` — documentation contributor guide and the [SPEC ↔ GitBook cross-reference map](docs/README.md#spec--gitbook-cross-reference-map).
+- `SPEC.md` — the full architecture specification (normative source of truth).
 
 ## ✅ Verified against live testnet
 
+### How to read the output blocks in this README
+
+One convention applies to every fenced block, so a copied snippet keeps its caveat
+(issue #418):
+
+- **`# Live, <network> protocol <n>, <date>: <account state>. <what the result
+  demonstrates>.`** The first line inside a live block names the state the account
+  was in and what the output is evidence for. Live values are historical: they
+  describe the account at capture time, not today.
+- A block **without** a `# Live` line is not evidence of on-chain behaviour: it is
+  a command (no output shown), local build/tool output (`# → target/...`), or an
+  illustrative shape with placeholders such as `GUARD_CONTRACT_ID`.
+- [`tests/fixtures/README.md`](tests/fixtures/README.md) uses the same convention,
+  and each of its scenario blocks also carries the transaction hash and ledger that
+  prove it.
+
 Phase 1 was proven end-to-end against a **real deployed contract** on Stellar testnet
-(protocol 28, `Test SDF Network ; September 2015`), cross-checked on-chain:
+(protocol 28, `Test SDF Network ; September 2015`), cross-checked on-chain. The values
+below are the Phase-1 record from 2026-09-08 — history, not a claim about the account's
+current state (the `status` block in the function reference above shows that):
 
 - **Guard (custom account) contract ID**:
   `CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7`
@@ -835,11 +907,11 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-217 tests (unit + integration) cover the policy decision engine — including the regression
+225 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `217 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `225 passed; 0 failed`.
 
 ```bash
 cargo test
@@ -849,10 +921,14 @@ cargo fmt --check
 
 Every push runs these gates on GitHub Actions (`.github/workflows/ci.yml`, job `ci`):
 format → clippy (`-D warnings`) → unit + integration tests → contract wasm build →
-`agent-tx` build. A second job, `wasm-reproducible`, builds the contract twice in clean
-target directories and fails unless both builds hash identically (see
-[Reproducible builds](#reproducible-builds)). `main` is protected by a branch ruleset —
-the `ci` check must be green and a review approved for changes to merge.
+`agent-tx` build. A second job, `msrv`, reads `rust-version` from `Cargo.toml`
+(currently `1.91.0`), installs that release with the `wasm32v1-none` target, and runs
+clippy, the test suite, and the contract build on it — so the declared minimum is a
+tested fact rather than an aspiration. Formatting stays on the pinned channel in that
+job because rustfmt output is version-sensitive. A third job, `wasm-reproducible`,
+builds the contract twice in clean target directories and fails unless both builds hash
+identically (see [Reproducible builds](#reproducible-builds)). `main` is protected by a
+branch ruleset — the `ci` check must be green and a review approved for changes to merge.
 
 ## Topics
 

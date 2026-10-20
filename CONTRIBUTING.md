@@ -46,6 +46,45 @@ would move and change the bytes without any change to the repository. Bumping
 `channel` in `rust-toolchain.toml` changes the released artifact hash, so do it
 in its own commit (issue #67).
 
+### Minimum supported Rust version (MSRV)
+
+`Cargo.toml` declares `rust-version = "1.91.0"`, and the `msrv` job in
+`.github/workflows/ci.yml` installs exactly that release — including the
+`wasm32v1-none` target — and runs clippy, `cargo test`, and the wasm build on
+it. The job reads the field from `Cargo.toml`, so changing that one value is
+what changes what CI proves; there is no second hardcoded version to forget.
+`cargo fmt` deliberately stays on the pinned channel in the `ci` job: rustfmt
+output is version-sensitive, and one formatter authority avoids two
+contradictory definitions of "formatted" (issue #410).
+
+The floor comes from the dependency graph, not from preference: `soroban-sdk`
+27.0.6 itself declares `rust-version = "1.91.0"`. If a dependency bump needs a
+newer compiler:
+
+1. Raise `rust-version` in the same PR as the bump — never as a drive-by — and
+   say why in the PR body.
+2. Update every version claim: the `README.md` badge, `docs/installation.md`,
+   and this section.
+3. Update [`SECURITY.md` § Verified against](SECURITY.md#verified-against),
+   because the security model is verified against a specific toolchain and
+   SDK, not against "Rust" in general.
+4. Let the `msrv` CI leg prove the new floor before merging.
+
+Do **not** declare a lower MSRV than the graph supports. Before issue #410 this
+repository declared 1.85 while `soroban-sdk` required 1.91, so a contributor's
+first `cargo build` failed on a version the README called supported.
+
+### Documentation site (GitBook)
+
+The published docs at
+<https://soroban-cost-estimator.gitbook.io/stellar-agent-guard-contracts/> are
+synced from this repository by GitBook Git Sync — there is no build or deploy
+workflow in `.github/workflows/`. What gets synced, what triggers a sync, how
+to preview a change, who can publish, and which file wins between
+`gitbook-docs.yaml` and `docs/SUMMARY.md` are documented in
+[`docs/README.md`](docs/README.md). Read that before adding, moving, or renaming
+a page; after any such change, run `scripts/verify-docs-reachability.sh`.
+
 The `stellar` CLI cannot sign Soroban authorization entries whose address is a
 contract. Heartbeat testing uses the guard contract's own address, so the CLI
 cannot submit a heartbeat; use `agent-tx` for this path. See the
@@ -97,10 +136,27 @@ This removes all `target/` directories and `*.wasm` artifacts. The `.gitignore` 
 6. **Testnet-proof pattern:** behavior that changes what `__check_auth` admits
    or blocks should add a unit/integration test **and**, where it is a user-
    visible enforcement change, be recorded in the testnet proof plan
-   (`tests/fixtures/README.md` **and** its machine-readable twin
-   `tests/fixtures/index.json`) per the Phase-1 exit-criteria pattern. The two
-   files are cross-checked by `tests/fixtures_index.rs`, so editing one without
+   ([`tests/fixtures/README.md`](tests/fixtures/README.md) **and** its machine-readable twin
+   [`tests/fixtures/index.json`](tests/fixtures/index.json)) per the Phase-1 exit-criteria pattern. The two
+   files are cross-checked by [`tests/fixtures_index.rs`](tests/fixtures_index.rs), so editing one without
    the other fails `cargo test`.
+
+   - **User-visible enforcement changes (proof entry required):**
+     - *Decision-table changes:* modifying what `__check_auth` admits or blocks, or changing error codes, event topics, or diagnostic data emitted on allow or deny.
+     - *Storage-layout & key-schema changes:* modifying storage keys, types, footprint, or TTL management (these probably require an entry because they alter on-chain state persistence, footprint, or contract upgrade/migration compatibility observable by callers).
+     - *Policy/guard rules:* adding, modifying, or removing policy constraints, guards, or authorization paths.
+   - **Changes not user-visible (no proof entry required):**
+     - *Gas/CPU/memory optimizations:* pure internal performance tuning where admit/block outcomes, storage layouts, and emitted events remain identical.
+     - *Documentation & formatting:* comments, documentation, and formatting updates.
+     - *Internal refactorings:* restructuring internal helper functions or test-only harness code with zero external behavioral change or storage impact.
+   - **Evidence bar & responsibility:**
+     - A proof entry requires an on-chain testnet transaction hash (`tx hash`) plus captured event/diagnostic output (`topics: [event_auth_checked, <outcome>, <reason>]`), matching the exact format defined in [`tests/fixtures/README.md`](tests/fixtures/README.md) and recorded in `tests/fixtures/index.json`.
+     - The PR author proposing the change is responsible for capturing and recording the testnet proof entry (using `tools/agent-tx` or standard Soroban CLI against testnet). When live testnet credentials or deployment fixtures are maintainer-gated during release/verification, the author provides the reproducible simulation script and rationale in the PR, and maintainers record the live hashes upon verification.
+   - **Impractical on testnet (fallback rationale):**
+     - If an enforcement-affecting change is impractical or non-deterministic to reproduce on live public testnet (e.g. extreme timestamp/ledger boundaries, race conditions, or host resource-exhaustion edge cases):
+       1. Provide a comprehensive deterministic unit or host-routed integration test ([`src/integration_tests.rs`](src/integration_tests.rs)) exercising the exact enforcement path in the Soroban test environment (`Env`).
+       2. Include a clear written rationale in the PR description and proof plan documentation detailing why live testnet reproduction is impractical and how the unit/integration tests conclusively verify the invariant.
+   - See [`tests/fixtures/README.md`](tests/fixtures/README.md) and [`SPEC.md` §11](SPEC.md#11-testnet-proof-plan-scenarios-18-five-proven-three-planned) for scenario definitions and fixture schemas.
 7. **Denial-reason messages:** `docs/reason-glossary.md` is the canonical
    message-content source for SDK/UI work — map new user-facing denial text to
    its agent/operator/auditor columns instead of inventing new phrasing.
@@ -293,7 +349,12 @@ tasks for the Drips Stellar Wave contributor sprints.
 When bumping `soroban-sdk` version in `Cargo.toml`, you **must** re-verify
 SPEC §1.1 quotes against the new SDK source (`src/auth.rs`, `src/custom_account.rs`).
 Update the version comment in `Cargo.toml` and the SPEC §1.1 header accordingly.
-This is the mechanical ratchet preventing silent auth-semantics drift.
+Also update the SDK row in
+[`SECURITY.md` § Verified against](SECURITY.md#verified-against), which names
+the protocol and SDK the security model was actually verified against — a bump
+without that update leaves a security document claiming a version that is no
+longer the one in `Cargo.lock`. This is the mechanical ratchet preventing
+silent auth-semantics drift.
 
 Dependabot (`.github/dependabot.yml`, weekly, Cargo + GitHub Actions) files
 update PRs against `main` the same as any contributor PR: they must pass the

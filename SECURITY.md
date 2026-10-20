@@ -123,6 +123,67 @@ announced here and in the README.
 | ------- | ------------------ |
 | 0.1.x   | :white_check_mark: |
 
+## Verified against
+
+A security model is only meaningful relative to a platform. This revision of
+the model was verified against:
+
+| Component | Version | Evidence |
+|---|---|---|
+| Stellar protocol | **28** (testnet, `Test SDF Network ; September 2015`) | The five Phase-1 scenarios were run on protocol 28 and recorded on 2026-09-08 — [`tests/fixtures/README.md`](tests/fixtures/README.md), and `network.protocol: 28` in [`tests/fixtures/index.json`](tests/fixtures/index.json). |
+| `soroban-sdk` | **27.0.6** (`Cargo.toml`, pinned in `Cargo.lock`) | The host surface this contract relies on is quoted from that exact release in [SPEC §1.1](SPEC.md#11-sdk-and-host-surface-this-is-built-on-soroban-sdk-27); the host-routed tests in `src/integration_tests.rs` exercise `__check_auth` through the real Soroban host on this version. |
+| Rust | MSRV **1.91.0**; released artifacts built on the pinned **1.99.0** channel | `rust-version` in `Cargo.toml` (proven by the `msrv` CI job), `channel` in `rust-toolchain.toml` (used by the `release` workflow and proven deterministic by `wasm-reproducible`), and `provenance.txt` attached to every release. |
+
+**What "verified against" means here:** the guarantees in the next section were
+checked against a deployed contract on that protocol, with that SDK, by the
+recorded testnet transactions. It does **not** mean audited (see the disclaimer
+at the top), and it does not automatically carry forward to a later protocol or
+a different build.
+
+The on-chain evidence is deliberately outside this file: the scenario table,
+transaction hashes, ledgers, and emitted `auth_checked` topics live in
+[`tests/fixtures/README.md`](tests/fixtures/README.md) and its machine-readable
+twin [`tests/fixtures/index.json`](tests/fixtures/index.json). Read them before
+relying on this table; if the two disagree, the fixture index is the record of
+what actually happened.
+
+### When a version changes
+
+- **Stellar protocol changes** (testnet/mainnet upgrade, or any host change that
+touches custom-account dispatch, authorization contexts, or `__check_auth`):
+  re-run the recorded scenarios against the new protocol, update the table above
+  and the fixture network fields in the same PR, then release. Do not bump the
+  number without new evidence. If a release must ship before re-verification,
+  mark this section **STALE — verified against protocol <old> only** here and in
+  the release notes, so nobody deploys under a false assumption.
+- **`soroban-sdk` changes:** the dependency-drift ratchet in
+  [CONTRIBUTING.md § Dependency drift check](CONTRIBUTING.md#dependency-drift-check)
+  requires re-verifying the SPEC §1.1 quotes against the new source. Update the
+  SDK row here in the same PR as the bump. A bump that changes authorization or
+  context semantics also re-runs the fixtures; if that has not happened, mark
+  this section stale rather than leaving a stale version named as verified.
+- **Rust toolchain / MSRV changes:** update the Rust row from `Cargo.toml` and
+  `rust-toolchain.toml` in the same PR as the bump. Re-verification of the
+  security model is not implied, but the released WASM hash changes when the
+  build channel changes, so treat the artifact as a new release (the
+  reproducibility job and `provenance.txt` cover that separately).
+
+**Absence of an explicit version is itself the signal:** if this section does
+not name the protocol and SDK you are deploying, treat the model as unverified
+for that deployment, regardless of the supported-versions table above.
+
+### Where the drift watch lives
+
+- [`CONTRIBUTING.md` § Dependency drift check](CONTRIBUTING.md#dependency-drift-check)
+  — the review-time ratchet: a `soroban-sdk` bump must re-verify SPEC §1.1 and
+  update this section.
+- [`.github/dependabot.yml`](.github/dependabot.yml) — weekly Cargo and Actions
+  update PRs; `soroban-sdk` majors are isolated because they can change the ABI.
+- [`.github/workflows/host-watch.yml`](.github/workflows/host-watch.yml) — the
+  weekly live compatibility watch: it reports the Futurenet protocol version and
+  exercises a real `__check_auth` on Futurenet. A protocol change shows up there
+  first; when it does, this section is the document to update.
+
 ## Security Model (what the contract guarantees — and does not)
 
 Guarded on-chain, inside `__check_auth`, unbypassable by a compromised agent key:
@@ -171,8 +232,8 @@ verbatim live capture and the rejection classes — is
 [`docs/functions/check-auth.md`](docs/functions/check-auth.md#what-an-operator-sees-when-this-rejects-issue-425).
 The reason-symbol vocabulary is [docs/reason-glossary.md](docs/reason-glossary.md);
 the reversal procedure for a frozen account — including the two-gate case where
-`unfreeze` alone is not enough — is SPEC §5.2 and the incident variant of
-[`docs/key-rotation.md`](docs/key-rotation.md#incident-variant-suspected-agent-key-leak).
+`unfreeze` alone is not enough — is SPEC §5.2 and the recovery runbook / incident
+variant of [`docs/key-rotation.md`](docs/key-rotation.md#incident-variant-suspected-agent-key-leak).
 `tools/agent-tx preflight --secret …` is the enforced pre-broadcast path (exit
 `0` admitted, `1` blocked, `2` indeterminate) and it never submits.
 
