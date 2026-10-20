@@ -61,19 +61,14 @@ enum RunOutcome {
     /// The submitted transaction had an empty hash.
     EmptyHash(String),
     /// The transaction was submitted and succeeded.
-    TransactionSuccess {
-        hash: String,
-        status: String,
-    },
+    TransactionSuccess { hash: String, status: String },
     /// The transaction was submitted but failed.
     TransactionFailure {
         hash: String,
         result_xdr: Option<String>,
     },
     /// The transaction submission timed out.
-    TransactionTimeout {
-        hash: String,
-    },
+    TransactionTimeout { hash: String },
 }
 
 // ── strkey (base32 + CRC16-XModem) ───────────────────────────────────────
@@ -3328,7 +3323,11 @@ fn main() {
             };
             let args = request.args();
             match run(&call, &args) {
-                RunOutcome::SimulationBlocked { error_code, error_message, events } => {
+                RunOutcome::SimulationBlocked {
+                    error_code,
+                    error_message,
+                    events,
+                } => {
                     std::process::exit(if args.expect_blocked { 0 } else { 1 });
                 }
                 RunOutcome::SimulationSuccessUnexpectedBlock => {
@@ -3355,7 +3354,11 @@ fn main() {
             let call = Call::Heartbeat;
             let args = request.args();
             match run(&call, &args) {
-                RunOutcome::SimulationBlocked { error_code, error_message, events } => {
+                RunOutcome::SimulationBlocked {
+                    error_code,
+                    error_message,
+                    events,
+                } => {
                     std::process::exit(if args.expect_blocked { 0 } else { 1 });
                 }
                 RunOutcome::SimulationSuccessUnexpectedBlock => {
