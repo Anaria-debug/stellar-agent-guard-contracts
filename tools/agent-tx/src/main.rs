@@ -839,14 +839,14 @@ enum CallKind {
 /// Target key in contract storage.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum StorageTarget {
-    Persistent(&'static str),
+    Persistent(GuardKey),
     Instance,
 }
 
 impl StorageTarget {
     fn to_ledger_key(self, guard: &ScAddress) -> LedgerKey {
         match self {
-            Self::Persistent(name) => guard_data_key(guard, name),
+            Self::Persistent(key) => guard_data_key(guard, key),
             Self::Instance => guard_instance_key(guard),
         }
     }
@@ -894,19 +894,19 @@ struct StorageKeyTouch {
 /// - Instance: contains contract instance, admin, and agent pubkey; declared read-write as engine may write TTL.
 const GUARD_STORAGE_TOUCHES: &[StorageKeyTouch] = &[
     StorageKeyTouch {
-        target: StorageTarget::Persistent("Policy"),
+        target: StorageTarget::Persistent(GuardKey::Policy),
         written_on: WriteCondition::Never,
     },
     StorageKeyTouch {
-        target: StorageTarget::Persistent("AdminFrozen"),
+        target: StorageTarget::Persistent(GuardKey::AdminFrozen),
         written_on: WriteCondition::Never,
     },
     StorageKeyTouch {
-        target: StorageTarget::Persistent("Window"),
+        target: StorageTarget::Persistent(GuardKey::Window),
         written_on: WriteCondition::OnTransfer,
     },
     StorageKeyTouch {
-        target: StorageTarget::Persistent("LastHeartbeat"),
+        target: StorageTarget::Persistent(GuardKey::LastHeartbeat),
         written_on: WriteCondition::OnHeartbeat,
     },
     StorageKeyTouch {
@@ -2089,34 +2089,38 @@ mod tests {
             .collect();
         assert_eq!(names, ["Policy", "Window", "LastHeartbeat", "AdminFrozen"]);
 
+        // The footprint table declares exactly those keys plus the instance.
         let guard: ScAddress = VALID_GUARD.parse().unwrap();
-        let fp = guard_footprint(&guard);
-        assert!(fp.read_only.is_empty());
-        let expected: Vec<LedgerKey> = GuardKey::CHECK_AUTH_READS
+        let declared: Vec<StorageTarget> = GUARD_STORAGE_TOUCHES.iter().map(|t| t.target).collect();
+        let expected: Vec<StorageTarget> = GuardKey::CHECK_AUTH_READS
             .iter()
-            .map(|&k| guard_data_key(&guard, k))
-            .chain([guard_instance_key(&guard)])
+            .map(|&k| StorageTarget::Persistent(k))
+            .chain([StorageTarget::Instance])
             .collect();
-        assert_eq!(fp.read_write.to_vec(), expected);
-        // Merging into a footprint that already holds the keys adds nothing.
-        assert_eq!(merge_guard_footprint(fp.clone(), &guard), fp);
+        assert_eq!(declared.len(), expected.len());
+        for target in &expected {
+            assert!(
+                declared.contains(target),
+                "{target:?} missing from footprint"
+            );
+        }
+
+        for kind in [CallKind::Transfer, CallKind::Heartbeat, CallKind::ReadOnly] {
+            let fp = guard_footprint(&guard, kind);
+            // Merging into a footprint that already holds the keys adds nothing.
+            assert_eq!(merge_guard_footprint(fp.clone(), &guard, kind), fp);
+        }
 
         // Keys the simulation declared read-only stay read-only, never
         // duplicated into read-write.
         let policy = guard_data_key(&guard, GuardKey::Policy);
-        let instance = guard_instance_key(&guard);
         let sim = LedgerFootprint {
-            read_only: VecM::try_from(vec![policy.clone(), instance.clone()]).unwrap(),
+            read_only: VecM::try_from(vec![policy.clone()]).unwrap(),
             read_write: VecM::default(),
         };
-        let merged = merge_guard_footprint(sim, &guard);
-        assert_eq!(
-            merged.read_only.to_vec(),
-            [policy.clone(), instance.clone()]
-        );
+        let merged = merge_guard_footprint(sim, &guard, CallKind::Transfer);
+        assert_eq!(merged.read_only.iter().filter(|k| **k == policy).count(), 1);
         assert!(!merged.read_write.contains(&policy));
-        assert!(!merged.read_write.contains(&instance));
-        assert_eq!(merged.read_write.len(), 3);
     }
 
     #[test]
@@ -2161,7 +2165,13 @@ mod tests {
 
         // The per-key byte bound holds for the keys actually declared.
         let guard: ScAddress = VALID_GUARD.parse().unwrap();
-        let keys = guard_keys(&guard);
+        let fp = guard_footprint(&guard, CallKind::Transfer);
+        let keys: Vec<LedgerKey> = fp
+            .read_only
+            .iter()
+            .chain(fp.read_write.iter())
+            .cloned()
+            .collect();
         assert_eq!(keys.len() as i64, GUARD_FOOTPRINT_KEYS);
         for key in keys {
             let len = key.to_xdr(Limits::none()).unwrap().len() as i64;
@@ -3250,14 +3260,14 @@ mod tests {
 
         // Transfer writes Window and Instance key (engine TTL)
         assert_eq!(rw_keys.len(), 2);
-        assert!(rw_keys.contains(&guard_data_key(&guard, "Window")));
+        assert!(rw_keys.contains(&guard_data_key(&guard, GuardKey::Window)));
         assert!(rw_keys.contains(&guard_instance_key(&guard)));
 
         // Transfer only reads Policy, AdminFrozen, and LastHeartbeat
         assert_eq!(ro_keys.len(), 3);
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Policy)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::AdminFrozen)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
 
         // Read-only and read-write sets must be disjoint
         for key in &ro_keys {
@@ -3278,14 +3288,14 @@ mod tests {
 
         // Heartbeat writes LastHeartbeat and Instance key (engine TTL)
         assert_eq!(rw_keys.len(), 2);
-        assert!(rw_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(rw_keys.contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
         assert!(rw_keys.contains(&guard_instance_key(&guard)));
 
         // Heartbeat only reads Policy, AdminFrozen, and Window
         assert_eq!(ro_keys.len(), 3);
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Window")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Policy)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::AdminFrozen)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Window)));
 
         // Read-only and read-write sets must be disjoint
         for key in &ro_keys {
@@ -3310,10 +3320,10 @@ mod tests {
 
         // All persistent keys are in read-only
         assert_eq!(ro_keys.len(), 4);
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Window")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Policy)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::AdminFrozen)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Window)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
     }
 
     #[test]
@@ -3330,24 +3340,28 @@ mod tests {
         assert_eq!(transfer_merged.read_only.len(), 3);
         assert!(transfer_merged
             .read_write
-            .contains(&guard_data_key(&guard, "Window")));
+            .contains(&guard_data_key(&guard, GuardKey::Window)));
         assert!(transfer_merged
             .read_only
-            .contains(&guard_data_key(&guard, "LastHeartbeat")));
+            .contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
 
         let heartbeat_merged = merge_guard_footprint(empty_fp, &guard, CallKind::Heartbeat);
         assert_eq!(heartbeat_merged.read_write.len(), 2);
         assert_eq!(heartbeat_merged.read_only.len(), 3);
         assert!(heartbeat_merged
             .read_write
-            .contains(&guard_data_key(&guard, "LastHeartbeat")));
+            .contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
         assert!(heartbeat_merged
             .read_only
-            .contains(&guard_data_key(&guard, "Window")));
+            .contains(&guard_data_key(&guard, GuardKey::Window)));
 
         // Merge onto simulated footprint that already has token contract keys
         let token_addr: ScAddress = VALID_TOKEN.parse().expect("valid token");
-        let token_rw = guard_data_key(&token_addr, "Balance");
+        let token_rw = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: token_addr,
+            key: ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
+            durability: ContractDataDurability::Persistent,
+        });
         let simulated_fp = LedgerFootprint {
             read_only: VecM::default(),
             read_write: VecM::try_from(vec![token_rw.clone()]).expect("bound"),
@@ -3357,7 +3371,7 @@ mod tests {
         assert!(merged.read_write.contains(&token_rw));
         assert!(merged
             .read_write
-            .contains(&guard_data_key(&guard, "Window")));
+            .contains(&guard_data_key(&guard, GuardKey::Window)));
         assert_eq!(merged.read_write.len(), 3); // token_rw + Window + Instance
         assert_eq!(merged.read_only.len(), 3); // Policy + AdminFrozen + LastHeartbeat
     }
@@ -3419,6 +3433,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--agent-secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
@@ -3435,6 +3450,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
@@ -3452,6 +3468,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
@@ -3464,6 +3481,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "-h",
@@ -3473,6 +3491,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--guard",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "-h",
             "--help",
@@ -3485,6 +3504,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--amount",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "-h",
             "--help",
