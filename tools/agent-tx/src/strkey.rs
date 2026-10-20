@@ -22,7 +22,7 @@
 use super::{base32_decode, crc16_xmodem, VER_ACCOUNT, VER_CONTRACT};
 
 /// Version byte of an account secret seed (`S...`).
-const VER_SECRET: u8 = 0x90;
+pub(crate) const VER_SECRET: u8 = 0x90;
 /// A 32-byte payload with version byte and CRC16 checksum, base-32 encoded:
 /// `ceil(35 * 8 / 5) == 56` characters, with no `=` padding.
 const STRKEY_LEN: usize = 56;
