@@ -9,6 +9,7 @@ jobs:
   # Job name must stay exactly `ci`: the repo's `main-protection` ruleset
   # (phase 0) requires the `ci` status check on `main`.
   ci:
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
