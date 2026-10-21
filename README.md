@@ -96,7 +96,7 @@ Full recipient/amount enforcement — spend caps, allowlists, per-transaction li
 git clone https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 cargo build --release --target wasm32v1-none   # → target/wasm32v1-none/release/stellar_agent_guard_contracts.wasm
-cargo test                                      # 224 tests, isolated (no network)
+cargo test                                      # 228 tests, isolated (no network)
 
 # Read live state from the Phase-1 testnet deployment (no auth, simulation only).
 # Live, testnet protocol 28, 2026-09-08: the fixture account was DMS-frozen
@@ -575,13 +575,10 @@ cargo build --release --target wasm32v1-none
 # stellar CLI cannot — see "heartbeat" above)
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 # → target/release/agent-tx
-
-# full gate suite (see Testing & CI)
-cargo test
-cargo clippy --all-targets --all-features
-cargo fmt --check
 ```
-Both builds and all three gates were re-run green on this machine during the README pass.
+
+Both builds are covered by the full local gate; the complete list of commands CI
+runs, in CI's order, is in [Testing & CI](#testing--ci).
 
 ### Download a released artifact (instead of building)
 
@@ -807,7 +804,7 @@ Stellar Agent Guard operates across three dedicated repositories:
 - `src/integration_tests.rs` — contract-level tests that exercise the real
   `__check_auth` path, including Ed25519 auth-signature verification (SPEC §11).
 - `tools/agent-tx/` — submission helper that signs Soroban auth entries for the guard
-  (custom-account) address and submits real testnet transactions. The `stellar` CLI
+  (custom-account) address and submits real testnet transactions. See [tools/agent-tx/README.md](tools/agent-tx/README.md) for install, usage, secret handling, and what it is for. The `stellar` CLI
   cannot sign auth entries whose address is a contract, so this tool fills that gap; it
   is the prototype of the Phase 2 SDK's signing path.
 - `examples/agent-loop.md` — the steady-state **24/7 agent runtime loop**: heartbeat
@@ -907,28 +904,54 @@ and honestly reports the DMS has since expired, exactly as designed.
 
 ## Testing & CI
 
-224 tests (unit + integration) cover the policy decision engine — including the regression
+228 tests (unit + integration) cover the policy decision engine — including the regression
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `224 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `228 passed; 0 failed`.
+
+These are the commands CI runs, in the order the `ci` job runs them — the same
+block a contributor can copy (see also
+[CONTRIBUTING.md](CONTRIBUTING.md#development-setup)):
 
 ```bash
-cargo test
-cargo clippy --all-targets --all-features   # clippy `all` + `pedantic` denied via Cargo.toml lints
 cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings   # -D warnings makes the Cargo.toml lint groups a gate
+cargo test
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo build --release --target wasm32v1-none
+scripts/verify-readme.sh
+scripts/verify-docs-reachability.sh
+# tools/agent-tx is a separate cargo project — CI gates it explicitly too
+cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
+cargo clippy --manifest-path tools/agent-tx/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path tools/agent-tx/Cargo.toml
+cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
 
 Every push runs these gates on GitHub Actions (`.github/workflows/ci.yml`, job `ci`):
-format → clippy (`-D warnings`) → unit + integration tests → contract wasm build →
-`agent-tx` build. A second job, `msrv`, reads `rust-version` from `Cargo.toml`
+format → unwrap/expect guard → clippy (`-D warnings`) → unit + integration tests →
+public-API docs (`-D warnings`) → contract wasm build → README claim audit → docs link
+check → `agent-tx` format, clippy, tests, and build. The unwrap/expect guard is a grep
+over the enforcement sources and has no separate local command.
+
+A second job, `msrv`, reads `rust-version` from `Cargo.toml`
 (currently `1.91.0`), installs that release with the `wasm32v1-none` target, and runs
 clippy, the test suite, and the contract build on it — so the declared minimum is a
 tested fact rather than an aspiration. Formatting stays on the pinned channel in that
 job because rustfmt output is version-sensitive. A third job, `wasm-reproducible`,
 builds the contract twice in clean target directories and fails unless both builds hash
-identically (see [Reproducible builds](#reproducible-builds)). `main` is protected by a
-branch ruleset — the `ci` check must be green and a review approved for changes to merge.
+identically (see [Reproducible builds](#reproducible-builds)). Neither is a required
+check.
+
+`main` is protected by the `main-protection` ruleset: the status check named exactly
+`ci` must be green, the branch must be up to date with `main`, and one approving review
+is required (a new push dismisses it). The ruleset is recorded in the repository —
+[`.github/rulesets/main-protection.json`](.github/rulesets/main-protection.json) and
+[`.github/BRANCH_PROTECTION.md`](.github/BRANCH_PROTECTION.md) — because a rule that
+exists only in GitHub settings is invisible in review and lost if the settings change.
+The `ci` job key is load-bearing: required checks match the check-run name, so renaming
+that job leaves every PR waiting for a check that is never reported.
 
 ## Topics
 
