@@ -6,24 +6,38 @@ We welcome contributions. Here's how to get started.
 
 ## Development setup
 
+The canonical version of this section — with the full annotated gate — is
+[CONTRIBUTING.md](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/CONTRIBUTING.md#development-setup).
+These are the commands CI runs, in CI's order:
+
 ```bash
 # Clone the repo
 git clone https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts.git
 cd stellar-agent-guard-contracts
 
-# Run tests (33 unit + integration tests, no network needed)
-cargo test
-
-# Lint (clippy all + pedantic are denied via [lints.clippy])
-cargo clippy --all-targets --all-features
-
 # Format check
 cargo fmt --check
+
+# Lint. `-D warnings` is what makes this a gate (CI fails on warnings)
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Run tests (224 unit + integration tests, no network needed)
+cargo test
+
+# Public API docs, warnings denied
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 # Build the contract WASM (Soroban 27 targets wasm32v1-none)
 cargo build --release --target wasm32v1-none
 
-# Build the agent-tx submission helper
+# README claim audit + docs link check
+scripts/verify-readme.sh
+scripts/verify-docs-reachability.sh
+
+# tools/agent-tx is a separate cargo project: fmt, clippy, test, build
+cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
+cargo clippy --manifest-path tools/agent-tx/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path tools/agent-tx/Cargo.toml
 cargo build --release --manifest-path tools/agent-tx/Cargo.toml
 ```
 
@@ -351,8 +365,15 @@ Run the following verification checks in order before submitting your pull reque
 
 ## Pull request process
 
-1. Open the PR against `main`. The `ci` status check is required to merge (branch protection).
-2. One reviewer approval required (branch protection).
+1. Open the PR against `main`. The `ci` status check is required by the
+   `main-protection` ruleset, which is recorded in-repo in
+   [`.github/rulesets/main-protection.json`](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/.github/rulesets/main-protection.json)
+   and described in
+   [`.github/BRANCH_PROTECTION.md`](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/.github/BRANCH_PROTECTION.md).
+   The job key must stay named exactly `ci`; renaming it leaves every PR waiting
+   for a check that is never reported.
+2. One approving review required; a new push dismisses it, so re-request review
+   after pushing.
 3. Describe the *why* in the PR body: what was broken/wrong, what the fix does, and — for enforcement changes — how it was verified (tests, and testnet evidence where applicable).
 
 ## Project structure
