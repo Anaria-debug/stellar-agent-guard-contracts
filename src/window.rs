@@ -445,6 +445,7 @@ mod tests {
     #![allow(clippy::items_after_statements)]
     #![allow(clippy::similar_names)]
     #![allow(clippy::doc_markdown)]
+    #![allow(clippy::manual_is_multiple_of)]
     use super::*;
 
     #[test]
@@ -558,10 +559,7 @@ mod tests {
             assert_eq!(reference.total, reference_sum);
 
             for (index, expected) in reference.entries.iter().enumerate() {
-                let actual = ledger
-                    .entries
-                    .get(u32::try_from(index).unwrap())
-                    .unwrap();
+                let actual = ledger.entries.get(u32::try_from(index).unwrap()).unwrap();
                 assert_eq!(
                     (actual.ts, actual.amount),
                     (expected.ts, expected.amount),
