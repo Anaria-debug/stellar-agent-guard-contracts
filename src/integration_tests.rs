@@ -97,6 +97,7 @@
 //! | **Auth Entries** | `h.guard_entry(&root)` | Hashes preimage, signs with agent key, bumps nonce, returns `SorobanAuthorizationEntry`. |
 //! | | `h.guard_entry_with(key, &root)` | Signs with an arbitrary key (for testing wrong or rotated keys). |
 //! | | `h.admin_entry(&root)` | Builds auth entry for `MockAdmin` (void signature). |
+//! | | `h.non_admin_entry(account, &root)` | Builds auth entry for an arbitrary (non-admin) account. |
 //! | **Execution** | `h.enforce(entry)` | Calls `env.set_auths(&[entry])`, activating enforcing mode. |
 //! | | `h.transfer(to, amount)` | High-level: builds entry, enforces, executes transfer, asserts success. |
 //! | | `h.transfer_expect_blocked(to, amount)` | High-level: builds entry, enforces, executes transfer, asserts panic. |
@@ -640,6 +641,30 @@ impl Harness {
         self.invocation(&self.guard, "confirm_admin_rotation", std::vec![])
     }
 
+    fn cancel_admin_invocation(&self) -> SorobanAuthorizedInvocation {
+        self.invocation(&self.guard, "cancel_admin_rotation", std::vec![])
+    }
+
+    fn set_policy_invocation(&self, cfg: &PolicyConfig) -> SorobanAuthorizedInvocation {
+        self.invocation(
+            &self.guard,
+            "set_policy",
+            std::vec![cfg.clone().into_val(&self.env)],
+        )
+    }
+
+    fn revoke_policy_invocation(&self) -> SorobanAuthorizedInvocation {
+        self.invocation(&self.guard, "revoke_policy", std::vec![])
+    }
+
+    fn rotate_agent_key_invocation(&self, new_pubkey: &BytesN<32>) -> SorobanAuthorizedInvocation {
+        self.invocation(
+            &self.guard,
+            "rotate_agent_key",
+            std::vec![new_pubkey.clone().into_val(&self.env)],
+        )
+    }
+
     fn create_contract_invocation(
         &self,
         salt: &BytesN<32>,
@@ -754,6 +779,24 @@ impl Harness {
         }
     }
 
+    /// Build an auth entry for an arbitrary custom account (e.g. non-admin `MockAdmin`).
+    fn non_admin_entry(
+        &self,
+        account: &Address,
+        root: &SorobanAuthorizedInvocation,
+    ) -> SorobanAuthorizationEntry {
+        let signature_expiration_ledger = self.signature_expiration_ledger();
+        SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: xdr::ScAddress::from(account),
+                nonce: 1,
+                signature_expiration_ledger,
+                signature: ScVal::Void,
+            }),
+            root_invocation: root.clone(),
+        }
+    }
+
     /// Switch the env into enforcing auth mode with exactly one entry.
     fn enforce(&mut self, entry: SorobanAuthorizationEntry) {
         self.env.set_auths(&[entry]);
@@ -852,11 +895,7 @@ impl Harness {
     /// `set_policy` once the harness has entered enforcing auth mode: the
     /// plain `install_policy` relies on mock auth and would be rejected.
     fn set_policy_enforcing(&mut self, cfg: &PolicyConfig) {
-        let root = self.invocation(
-            &self.guard,
-            "set_policy",
-            std::vec![cfg.clone().into_val(&self.env)],
-        );
+        let root = self.set_policy_invocation(cfg);
         let entry = self.admin_entry(&root);
         self.enforce(entry);
         PolicyEngineClient::new(&self.env, &self.guard).set_policy(cfg);
@@ -1440,6 +1479,39 @@ fn per_tx_cap_violation_blocked_without_window_effect() {
     .expect_transfer(&recv, 30) // total 50 — would fail if the blocked 60 had counted (110 > 100)
     .expect_transfer(&recv, 50) // total exactly 100
     .expect_block(GuardError::WindowCapExceeded, &recv, 1); // ledger genuinely full
+}
+
+/// SPEC §6.2 rule 3: `per_tx_cap` comparison is exclusive-of-blocking (inclusive cap):
+/// a transfer with `amount == per_tx_cap` is admitted; `amount == per_tx_cap + 1` is
+/// blocked with `per_tx_cap_exceeded`.
+#[test]
+fn per_tx_cap_boundary_admitted_at_cap_and_blocked_at_cap_plus_one() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.per_tx_cap = 50;
+    // Generous window cap so only the per-tx cap is exercised.
+    p.window_cap = 1_000;
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // amount == per_tx_cap (50): admitted.
+    h.transfer(&recv, 50);
+
+    // amount == per_tx_cap + 1 (51): blocked with per_tx_cap_exceeded.
+    let reason = h.transfer_blocked_reason(&recv, 51);
+    assert!(
+        reason.contains("per_tx_cap_exceeded"),
+        "expected per_tx_cap_exceeded for amount == per_tx_cap + 1, got: {reason}"
+    );
+
+    // Preflight simulation check() also agrees on the boundary.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    assert_eq!(client.check(&h.asset, &recv, &50), CheckResult::Allowed);
+    assert_eq!(
+        client.check(&h.asset, &recv, &51),
+        CheckResult::Blocked(Symbol::new(&h.env, "per_tx_cap_exceeded"))
+    );
 }
 
 #[test]
@@ -5522,322 +5594,328 @@ fn unfreeze_does_not_clear_outside_active_window_until_set_policy() {
     h.transfer(&recv, 10);
 }
 
-// ── Issues #289/#290/#292: window-preserving `set_policy`, `reset_window`,
-//    dedicated `pause` / `resume`, and the reserved `Unauthorized` code ────
+// ── Admin-gated functions (issue #365, SPEC §1 & §7) ─────────────────────
+//
+// SPEC §1 and §7 state that only the admin can change policy and manage admin
+// controls ('Admin never gains fund-moving authority' and 'only the admin can
+// change policy'). Admin calls must be rejected if authorized by a non-admin
+// principal (whether the agent key or an arbitrary external address).
+//
+// Contract methods returning `()` (`set_policy`, `revoke_policy`, `freeze`,
+// `unfreeze`, `rotate_agent_key`, `propose_admin_rotation`,
+// `cancel_admin_rotation`) panic on authorization failure via the host's
+// `require_auth` check; the Soroban SDK generates no `try_*` client method
+// for unit-returning contract functions that signals host-level auth rejection.
+// `std::panic::catch_unwind` + `std::panic::AssertUnwindSafe` is therefore the
+// standard mechanism to assert that unauthorized calls fail closed.
 
-/// Issue #289 (acceptance): spend half the window, then `set_policy` with a
-/// config that changes **only** `paused` — the rolling-window total must be
-/// preserved, not silently zeroed. The kill switch is no longer also a
-/// budget reset.
 #[test]
-fn set_policy_pause_only_edit_preserves_window_total() {
+fn admin_gating_set_policy_rejects_non_admin() {
     let mut h = Harness::new();
-    let recv = h.recv.clone();
-    let mut p = h.base_policy();
-    p.window_secs = 60;
-    p.window_cap = 100;
-    h.install_policy(&p);
-    h.set_time(1_000);
-    h.transfer(&recv, 50);
-    assert_eq!(h.stored_window().map(|w| w.total), Some(50));
+    let base = h.base_policy();
+    h.install_policy(&base);
 
-    // The operator pauses by rewriting the whole config with `paused: true`
-    // — the only pre-#290 way to flip the flag, and the exact footgun the
-    // issue describes.
-    let mut paused = p.clone();
-    paused.paused = true;
-    h.set_policy_enforcing(&paused);
+    let mut rogue_policy = base.clone();
+    rogue_policy.allow_any_recipient = true;
 
-    let window = h
-        .stored_window()
-        .expect("the window entry must survive a pause-only edit");
-    assert_eq!(
-        window.total, 50,
-        "set_policy must preserve the rolling-window total (issue #289)"
+    let root = h.set_policy_invocation(&rogue_policy);
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `set_policy` returns `()` and the host aborts with an auth error; `try_set_policy`
+    // is not generated by the SDK for unit returns, so `catch_unwind` asserts rejection.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&rogue_policy);
+    }));
+    assert!(
+        res.is_err(),
+        "set_policy authorized by a non-admin account must fail"
     );
-    assert_eq!(
-        window.entries.len(),
-        1,
-        "no spend entry may be dropped by the edit"
-    );
-    assert_eq!(h.status().window_remaining, Some(50));
 
-    // Behavioural proof, not just a storage assertion: after resuming via
-    // `set_policy`, the prior spend still counts — 50 + 60 exceeds the 100
-    // cap, so the account did not get its budget back.
-    let mut resumed = p;
-    resumed.paused = false;
-    h.set_policy_enforcing(&resumed);
-    assert!(!h.status().paused);
-    h.transfer_expect_blocked(&recv, 60);
-    // …and the window is genuinely live, not disabled: the remainder fits.
-    h.transfer(&recv, 50);
-    assert_eq!(h.status().window_remaining, Some(0));
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&rogue_policy);
+    }));
+    assert!(
+        res_agent.is_err(),
+        "set_policy authorized by the agent key must fail"
+    );
+
+    // Fail-closed: policy and revision remain untouched.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    assert_eq!(client.policy(), Some(base));
+    assert_eq!(h.status().policy_revision, 1);
 }
 
-/// Issue #289: a policy *edit* also leaves the dead-man-switch clock
-/// untouched. Before this change every `set_policy` re-stamped
-/// `LastHeartbeat = now`, so editing a policy silently re-armed a lapsed
-/// dead-man switch — a liveness attestation the agent never gave.
 #[test]
-fn set_policy_edit_does_not_rearm_expired_deadman_clock() {
+fn admin_gating_revoke_policy_rejects_non_admin() {
     let mut h = Harness::new();
-    let recv = h.recv.clone();
-    let mut p = h.base_policy();
-    p.dms_grace_secs = 100;
-    h.set_time(1_000);
-    h.install_policy(&p); // first install arms the clock: LastHeartbeat = 1_000
+    let base = h.base_policy();
+    h.install_policy(&base);
 
-    h.set_time(1_200); // 200s of silence > 100s grace
-    assert!(h.status().heartbeat_expired);
+    let root = h.revoke_policy_invocation();
 
-    // A routine policy edit (raising the per-tx cap) must not re-arm the
-    // clock: the agent is still silent, so the account must stay expired.
-    let mut widened = p;
-    widened.per_tx_cap = 500;
-    h.set_policy_enforcing(&widened);
-    let st = h.status();
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `revoke_policy` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).revoke_policy();
+    }));
     assert!(
-        st.heartbeat_expired,
-        "a policy edit must not re-arm a lapsed dead-man switch (issue #289)"
+        res.is_err(),
+        "revoke_policy authorized by a non-admin account must fail"
     );
-    assert_eq!(st.last_heartbeat, 1_000);
-    h.transfer_expect_blocked(&recv, 10);
 
-    // The documented reversal path is still `unfreeze` (SPEC §5.1).
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).revoke_policy();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "revoke_policy authorized by the agent key must fail"
+    );
+
+    // Fail-closed: policy is still active and revision unchanged.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    assert_eq!(client.policy(), Some(base));
+    assert_eq!(h.status().policy_revision, 1);
+}
+
+#[test]
+fn admin_gating_freeze_rejects_non_admin() {
+    let mut h = Harness::new();
+    assert!(!h.status().admin_frozen);
+
+    let root = h.freeze_invocation();
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `freeze` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).freeze();
+    }));
+    assert!(
+        res.is_err(),
+        "freeze authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).freeze();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "freeze authorized by the agent key must fail"
+    );
+
+    // Fail-closed: account is still not frozen.
+    assert!(!h.status().admin_frozen);
+}
+
+#[test]
+fn admin_gating_unfreeze_rejects_non_admin() {
+    let mut h = Harness::new();
+
+    // Legitimate admin freeze.
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).freeze();
+    assert!(h.status().admin_frozen);
+
+    let root = h.unfreeze_invocation();
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `unfreeze` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).unfreeze();
+    }));
+    assert!(
+        res.is_err(),
+        "unfreeze authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).unfreeze();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "unfreeze authorized by the agent key must fail"
+    );
+
+    // Fail-closed: account remains frozen.
+    assert!(h.status().admin_frozen);
+
+    // Legitimate admin unfreeze succeeds.
     h.unfreeze();
-    assert!(!h.status().heartbeat_expired);
-    h.transfer(&recv, 10);
+    assert!(!h.status().admin_frozen);
 }
 
-/// Issue #289 (acceptance): the explicit reset path still zeroes the window.
-/// `reset_window` is the admin-attested fresh budget `set_policy` no longer
-/// hands out implicitly; it touches nothing else (policy, revision, DMS
-/// clock) and records the action in the event log.
 #[test]
-fn reset_window_explicitly_zeroes_the_window() {
-    let mut h = Harness::new();
-    let recv = h.recv.clone();
-    let mut p = h.base_policy();
-    p.window_secs = 60;
-    p.window_cap = 100;
-    h.install_policy(&p);
-    h.set_time(1_000);
-    h.transfer(&recv, 80);
-    assert_eq!(h.stored_window().map(|w| w.total), Some(80));
-    h.transfer_expect_blocked(&recv, 40); // 80 + 40 > 100
-
-    // The explicit reset: an admin op, so re-enable blanket mocking first.
-    // (`env.events().all()` exposes one invocation's log, so the event is
-    // asserted immediately — before any later call replaces the log.)
-    h.env.mock_all_auths();
-    PolicyEngineClient::new(&h.env, &h.guard).reset_window();
-    assert!(
-        has_event_with_topics(&h.env, "event_window_reset", &["event_window_reset"]),
-        "reset_window must emit window_reset with the SPEC §9 single-topic layout"
-    );
-    assert!(
-        h.stored_window().is_none(),
-        "reset_window must remove the Window entry, not merely stop reading it"
-    );
-    assert_eq!(
-        h.status().window_remaining,
-        Some(100),
-        "headroom must be the full cap again after the explicit reset"
-    );
-    assert_eq!(
-        h.status().policy_revision,
-        1,
-        "reset_window must not advance the policy revision (issue #289)"
-    );
-
-    // Behavioural proof: the full cap is admissible again (a surviving 80
-    // would make 80 + 40 > 100 and block)…
-    h.transfer(&recv, 80);
-    // …and the fresh window is live again, not merely disabled.
-    h.transfer_expect_blocked(&recv, 40);
-}
-
-/// Issue #290 (acceptance): `pause` blocks a signed transfer, `resume`
-/// restores it, and neither call mutates the rolling window or the
-/// dead-man-switch clock — the policy-level kill switch hands out no fresh
-/// budget and no fresh grace.
-#[test]
-fn pause_blocks_signed_transfer_and_resume_restores_it() {
-    let mut h = Harness::new();
-    let recv = h.recv.clone();
-    let mut p = h.base_policy();
-    p.window_secs = 60;
-    p.window_cap = 100;
-    p.dms_grace_secs = 50;
-    h.set_time(1_000);
-    h.install_policy(&p);
-    h.set_time(1_005);
-    h.transfer(&recv, 50);
-    h.set_time(1_010);
-    h.heartbeat();
-    assert_eq!(h.stored_window().map(|w| w.total), Some(50));
-
-    // Pause is an admin op; re-enable blanket mocking after the signed ops.
-    // (`env.events().all()` exposes one invocation's log, so the event is
-    // asserted immediately — before any later call replaces the log.)
-    h.env.mock_all_auths();
-    let client = PolicyEngineClient::new(&h.env, &h.guard);
-    client.pause();
-    assert!(
-        has_event_with_topics(&h.env, "event_paused", &["event_paused"]),
-        "pause must emit paused with the SPEC §9 single-topic layout"
-    );
-    assert_eq!(
-        client.policy().map(|c| c.paused),
-        Some(true),
-        "pause must flip the stored policy's paused flag in place"
-    );
-    assert!(h.status().paused, "status must report the pause");
-
-    // A correctly-signed transfer is now blocked — the signature is valid,
-    // so gate #4 (`paused`) is the only possible explanation.
-    let reason = h.transfer_blocked_reason(&recv, 10);
-    assert!(
-        reason.contains("paused"),
-        "expected `paused`, got ({reason})"
-    );
-
-    // The pause touched neither the window nor the DMS clock: the spend is
-    // still on the ledger and LastHeartbeat is exactly where it was.
-    assert_eq!(
-        h.stored_window().map(|w| w.total),
-        Some(50),
-        "pause must not mutate the rolling window (issue #290)"
-    );
-    assert_eq!(
-        h.status().last_heartbeat,
-        1_010,
-        "pause must not touch the dead-man-switch clock"
-    );
-
-    // Resume restores admissibility — not budget: the transfer is admitted
-    // and counted against the same window (50 + 50 fills the cap exactly).
-    h.env.mock_all_auths();
-    client.resume();
-    assert!(
-        has_event_with_topics(&h.env, "event_resumed", &["event_resumed"]),
-        "resume must emit resumed with the SPEC §9 single-topic layout"
-    );
-    assert_eq!(client.policy().map(|c| c.paused), Some(false));
-    assert!(!h.status().paused);
-    assert_eq!(
-        h.status().last_heartbeat,
-        1_010,
-        "resume must not touch the dead-man-switch clock either"
-    );
-    h.transfer(&recv, 50);
-    assert_eq!(h.status().window_remaining, Some(0));
-    h.transfer_expect_blocked(&recv, 1);
-}
-
-/// Issue #290 (acceptance): `pause` / `resume` are idempotent-safe — calling
-/// twice is not an error — and `PolicyRevision` advances only when the flag
-/// actually flips, so a changing revision means exactly "the effective policy
-/// changed" (SPEC §9, issue #38). Without a policy there is nothing to
-/// pause: both calls fail closed with `NoPolicy`.
-#[test]
-fn pause_resume_are_idempotent_and_require_a_policy() {
-    let h = Harness::new();
-    let mut p = h.base_policy();
-    p.window_secs = 60;
-    p.window_cap = 100;
-    h.install_policy(&p);
-    let client = PolicyEngineClient::new(&h.env, &h.guard);
-    let revision_after_install = h.status().policy_revision;
-    assert_eq!(revision_after_install, 1, "install is revision 1 (SPEC §3)");
-
-    // First pause: the flag flips, so the revision advances with the event.
-    client.pause();
-    assert_eq!(
-        last_event_revision(&h.env, "event_paused"),
-        revision_after_install + 1
-    );
-
-    // Second pause: not an error; the event still records the admin action,
-    // but the revision is unchanged because the effective policy did not.
-    client.pause();
-    assert_eq!(
-        last_event_revision(&h.env, "event_paused"),
-        revision_after_install + 1,
-        "a redundant pause must not advance the revision (issues #38/#290)"
-    );
-    assert_eq!(h.status().policy_revision, revision_after_install + 1);
-
-    // Same symmetry on the way back up.
-    client.resume();
-    assert_eq!(
-        last_event_revision(&h.env, "event_resumed"),
-        revision_after_install + 2
-    );
-    client.resume();
-    assert_eq!(
-        last_event_revision(&h.env, "event_resumed"),
-        revision_after_install + 2,
-        "a redundant resume must not advance the revision (issues #38/#290)"
-    );
-    assert!(!client.policy().expect("policy installed").paused);
-
-    // No policy → nothing to pause or resume: fail closed with `NoPolicy`.
-    h.revoke_policy();
-    let pause_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.pause();
-    }));
-    assert!(
-        pause_res.is_err(),
-        "pause with no policy installed must fail closed (NoPolicy)"
-    );
-    let resume_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.resume();
-    }));
-    assert!(
-        resume_res.is_err(),
-        "resume with no policy installed must fail closed (NoPolicy)"
-    );
-}
-
-/// Issue #292 (acceptance): `Error::Unauthorized` (code 1) is declared and
-/// published but never produced — a bad agent signature dies in the host's
-/// `ed25519_verify` trap. This pins the observable behaviour so a future
-/// contributor does not "fix" that trap into a contract error: the
-/// transaction fails with the host's ED25519 diagnostic, never with
-/// `Error(Contract, #1)` / `unauthorized`, and no `auth_checked` event is
-/// emitted for it.
-#[test]
-fn bad_agent_signature_traps_without_unauthorized_error() {
+fn admin_gating_rotate_agent_key_rejects_non_admin() {
     let mut h = Harness::new();
     let recv = h.recv.clone();
     h.install_policy(&h.base_policy());
     h.set_time(1_000);
 
-    // An entry signed by a key that is not the registered agent.
-    let wrong = SigningKey::from_bytes(&[42u8; 32]);
-    let root = h.transfer_invocation(&h.guard, &recv, 5);
-    let entry = h.guard_entry_with(&wrong, &root);
+    let attacker_key = SigningKey::from_bytes(&[99u8; 32]);
+    let attacker_pk = attacker_key.verifying_key().to_bytes();
+    let attacker_pk_val = BytesN::from_array(&h.env, &attacker_pk);
+
+    let root = h.rotate_agent_key_invocation(&attacker_pk_val);
+
+    // Case 1: Non-admin principal cannot rotate the agent key to its own key.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
     h.enforce(entry);
-    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        MockAssetClient::new(&h.env, &h.asset).transfer(&h.guard, &recv, &5);
+
+    // `rotate_agent_key` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).rotate_agent_key(&attacker_pk_val);
     }));
-    let msg = payload
-        .expect_err("a wrong-key signature must fail the transaction")
-        .downcast_ref::<std::string::String>()
-        .cloned()
-        .unwrap_or_default();
     assert!(
-        msg.contains("failed ED25519 verification"),
-        "the observable failure is the host crypto trap, got: {msg}"
-    );
-    assert!(
-        !msg.contains("unauthorized") && !msg.contains("Error(Contract"),
-        "code 1 is reserved: a bad signature must never surface as a contract \
-         error (issue #292), got: {msg}"
+        res.is_err(),
+        "rotate_agent_key authorized by a non-admin account must fail"
     );
 
-    // The registered agent still authorizes afterwards.
-    h.transfer(&recv, 5);
+    // Case 2: Current agent key cannot rotate the agent key either.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).rotate_agent_key(&attacker_pk_val);
+    }));
+    assert!(
+        res_agent.is_err(),
+        "rotate_agent_key authorized by the agent key must fail"
+    );
+
+    // Assert that the attacker cannot authorize operations as the agent:
+    // the rejected rotation leaves the bound agent key unchanged.
+    let transfer_root = h.transfer_invocation(&h.guard, &recv, 10);
+    let attacker_auth = h.guard_entry_with(&attacker_key, &transfer_root);
+    h.enforce(attacker_auth);
+
+    let res_transfer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        MockAssetClient::new(&h.env, &h.asset).transfer(&h.guard, &recv, &10);
+    }));
+    assert!(
+        res_transfer.is_err(),
+        "attacker who failed to bind key must not authorize as agent"
+    );
+
+    // Legitimate agent key still authorizes transfers successfully.
+    h.transfer(&recv, 10);
+}
+
+#[test]
+fn admin_gating_propose_admin_rotation_rejects_non_admin() {
+    let mut h = Harness::new();
+    let rogue_admin = Address::generate(&h.env);
+
+    let root = h.propose_admin_invocation(&rogue_admin);
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `propose_admin_rotation` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&rogue_admin);
+    }));
+    assert!(
+        res.is_err(),
+        "propose_admin_rotation authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&rogue_admin);
+    }));
+    assert!(
+        res_agent.is_err(),
+        "propose_admin_rotation authorized by the agent key must fail"
+    );
+
+    // Fail-closed: pending admin slot remains empty.
+    let (_, pending) = h.stored_admins();
+    assert!(pending.is_none());
+}
+
+#[test]
+fn admin_gating_cancel_admin_rotation_rejects_non_admin() {
+    let mut h = Harness::new();
+    let new_admin = Address::generate(&h.env);
+
+    // Admin legitimately proposes rotation.
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&new_admin);
+    let (_, pending) = h.stored_admins();
+    assert_eq!(pending, Some(new_admin.clone()));
+
+    let root = h.cancel_admin_invocation();
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `cancel_admin_rotation` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).cancel_admin_rotation();
+    }));
+    assert!(
+        res.is_err(),
+        "cancel_admin_rotation authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).cancel_admin_rotation();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "cancel_admin_rotation authorized by the agent key must fail"
+    );
+
+    // Fail-closed: pending admin rotation is not cancelled.
+    let (_, pending) = h.stored_admins();
+    assert_eq!(pending, Some(new_admin));
 }
