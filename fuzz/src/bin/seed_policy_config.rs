@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     protocols.push_back(stellar_agent_guard_contracts::ProtocolRule {
         contract: Address::generate(&env),
         fns: Some(allowed_functions),
+        paused: false,
     });
     let valid_nonempty_policy = PolicyConfig {
         per_tx_cap: 100,
