@@ -951,7 +951,7 @@ and honestly reports the DMS has since expired, exactly as designed.
 for the rolling-window prune underflow at low timestamps, the per-tx-cap arithmetic that
 proves blocked transactions never consume the window, and dead-man-switch timeline edge
 cases — plus `__check_auth` Ed25519 signature verification and the full enforcement
-scenario matrix (SPEC §11). Verified green this session: `228 passed; 0 failed`.
+scenario matrix (SPEC §11). Verified green this session: `229 passed; 0 failed`.
 
 These are the commands CI runs, in the order the `ci` job runs them — the same
 block a contributor can copy (see also
