@@ -213,7 +213,9 @@ pub struct PolicyConfig {
     pub active_from: u64,
     /// Active window end (unix seconds); 0 = unrestricted.
     pub active_until: u64,
-    /// Admin kill switch.
+    /// Admin kill switch. Flipped in place by the `pause()` / `resume()` admin
+    /// entry points (issue #290), which touch no other field — the rolling
+    /// window and the dead-man-switch clock survive a pause.
     pub paused: bool,
     /// Dead-man switch grace (seconds); 0 = disabled.
     pub dms_grace_secs: u64,
@@ -486,7 +488,15 @@ pub enum DataKey {
 #[repr(u32)]
 pub enum Error {
     // Generic / lifecycle (1..=9)
-    /// Required signer did not authorize the operation.
+    /// **Reserved — never emitted** (issue #292). A bad agent signature is
+    /// rejected by `env.crypto().ed25519_verify`, which traps the host frame
+    /// (`InvokeError::Abort`) *before* any policy state is read, and every
+    /// admin write path enforces `require_auth(Admin)` at the host level;
+    /// neither produces a contract error this enum could return. The variant
+    /// (and code 1) is kept so the published ABI error table and off-chain
+    /// `REASON_CODES` mappings stay wire-stable — do not add a check that
+    /// returns it. Pinned by `bad_agent_signature_traps_without_unauthorized_error`
+    /// and documented in SPEC §7.1 / §10.2.
     Unauthorized = 1,
     /// Initialization has already been completed.
     AlreadyInitialized = 2,
