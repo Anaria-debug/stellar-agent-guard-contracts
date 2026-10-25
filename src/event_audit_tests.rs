@@ -279,6 +279,7 @@ fn audit_event_payloads_and_topics() {
         recipients: vec![&h.env],
         recipient_window_caps: vec![&h.env],
         blocked_recipients: vec![&h.env],
+        asset_caps: vec![&h.env],
         allow_any_recipient: false,
         active_from: 0,
         active_until: 0,
@@ -401,6 +402,7 @@ fn audit_event_payloads_and_topics() {
         recipients: vec![&h.env],
         recipient_window_caps: vec![&h.env],
         blocked_recipients: vec![&h.env],
+        asset_caps: vec![&h.env],
         allow_any_recipient: false,
         active_from: 0,
         active_until: 0,
@@ -513,6 +515,7 @@ fn policy_revision_sequence_is_incremental_and_stamped_on_auth_events() {
         recipients: vec![&h.env],
         recipient_window_caps: vec![&h.env],
         blocked_recipients: vec![&h.env],
+        asset_caps: vec![&h.env],
         allow_any_recipient: false,
         active_from: 0,
         active_until: 0,
@@ -614,7 +617,7 @@ fn window_merge_event_emits_once_at_the_entry_bound() {
         ledger.merges.is_empty(),
         "no merge or event below the bound"
     );
-    assert!(env.events().all().events().is_empty());
+    assert_eq!(env.events().all().events(), []);
 
     ledger.admit(crate::types::MAX_WINDOW_ENTRIES as u64, 1);
     assert_eq!(ledger.merges.len(), 1);
