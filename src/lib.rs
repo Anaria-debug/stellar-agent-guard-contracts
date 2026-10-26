@@ -1460,9 +1460,15 @@ pub mod testutils {
     }
 
     fn scval_is_address(value: &soroban_sdk::xdr::ScVal) -> bool {
-        use soroban_sdk::xdr::ScVal;
+        use soroban_sdk::xdr::{ScAddress, ScVal};
 
-        matches!(value, ScVal::Address(_))
+        // `Address` only represents account and contract addresses. Other
+        // `ScAddress` variants still convert to host objects, but not to
+        // `AddressObject`, so a lazy `Vec::get` would abort on them.
+        matches!(
+            value,
+            ScVal::Address(ScAddress::Account(_) | ScAddress::Contract(_))
+        )
     }
 
     fn scval_is_bool(value: &soroban_sdk::xdr::ScVal) -> bool {
@@ -1506,7 +1512,7 @@ pub mod testutils {
         let ScVal::Vec(Some(items)) = value else {
             return false;
         };
-        items.iter().all(|item| matches!(item, ScVal::Address(_)))
+        items.iter().all(scval_is_address)
     }
 
     fn policy_config_scval_has_safe_struct_shape(value: &soroban_sdk::xdr::ScVal) -> bool {
