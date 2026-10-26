@@ -3046,7 +3046,7 @@ mod tests {
         );
         std::fs::write(&path, format!("{VALID_SECRET}\n")).expect("write temp secret file");
 
-        let mock = MockHttpServer::start_with_seq_and_ledger(0, 100);
+        let mock = MockRpc::start();
         let args = argv(&[
             "heartbeat",
             "--guard",
@@ -3079,7 +3079,7 @@ mod tests {
         );
         std::fs::write(&path, format!("{VALID_SECRET}\n")).expect("write temp secret file");
 
-        let mock = MockHttpServer::start_with_seq_and_ledger(0, 100);
+        let mock = MockRpc::start();
         let args = argv(&[
             "heartbeat",
             "--guard",
@@ -3103,7 +3103,7 @@ mod tests {
 
     #[test]
     fn agent_secret_file_missing_path_is_error() {
-        let mock = MockHttpServer::start_with_seq_and_ledger(0, 100);
+        let mock = MockRpc::start();
         let args = argv(&[
             "heartbeat",
             "--guard",
@@ -3130,7 +3130,7 @@ mod tests {
         // This test ensures parse_request itself succeeds and the secret is
         // populated correctly — the warning side-effect is on stderr so we
         // cannot assert it here without capturing stderr.
-        let mock = MockHttpServer::start_with_seq_and_ledger(0, 100);
+        let mock = MockRpc::start();
         let args = argv(&[
             "heartbeat",
             "--guard",
@@ -3174,7 +3174,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn help_and_usage_cover_all_subcommands() {
@@ -4057,10 +4056,8 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
             }
             "--agent-secret-file" => {
                 secret_field = flag.clone();
-                secret_file = Some(cli.value_expected(
-                    "--agent-secret-file",
-                    "file path or '-' for stdin",
-                )?);
+                secret_file =
+                    Some(cli.value_expected("--agent-secret-file", "file path or '-' for stdin")?);
             }
             "--network" => {
                 network = Some(cli.value_expected("--network", "testnet | futurenet | mainnet")?)
@@ -4131,7 +4128,6 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
              the registered agent's secret seed"
         ));
     }
-
 
     // The spend-shaped subcommands take a token and a recipient. `transfer`
     // names the token flag `--token`, `preflight`/`check` name it `--asset`;
