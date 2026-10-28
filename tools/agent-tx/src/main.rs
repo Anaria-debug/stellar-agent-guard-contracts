@@ -868,6 +868,8 @@ fn simulation_report(sim: &serde_json::Value) -> RunReport {
         Some(err) => RunReport::blocked(sim_reason(err)),
         None => RunReport::allowed(),
     }
+}
+
 fn simulation_error_message(simulation: &serde_json::Value) -> Option<String> {
     let error = simulation.get("error")?;
     if error.is_null() {
@@ -1193,40 +1195,27 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
     };
     let report = args.reporter.complete(report, Some(latest));
 
-    if let Some(err) = sim.get("error") {
-        if agent.is_some() {
-            args.reporter.line(format_args!(
-                "BLOCKED (pre-broadcast, enforced simulation):"
-            ));
     if let Some(message) = simulation_error_message(&sim) {
         let policy_block = is_guard_auth_checked_block(&sim, &args.guard);
         if policy_block {
-            println!("BLOCKED (pre-broadcast, guard auth_checked):");
+            args.reporter
+                .line(format_args!("BLOCKED (pre-broadcast, guard auth_checked):"));
         } else if agent.is_some() {
-            println!("TRANSACTION REJECTED (pre-broadcast, not a guard policy block):");
+            args.reporter.line(format_args!(
+                "TRANSACTION REJECTED (pre-broadcast, not a guard policy block):"
+            ));
         } else {
             args.reporter.line(format_args!(
                 "RESULT: INDETERMINATE (unsigned simulation failed):"
             ));
         }
-        if let Some(code) = err["code"].as_str() {
-            args.reporter.line(format_args!("  error code: {code}"));
-        }
-        if let Some(msg) = err["message"].as_str() {
-            args.reporter.line(format_args!("  message: {msg}"));
-        }
-        if let Some(events) = err["data"]["events"].as_array() {
+        args.reporter.line(format_args!("  message: {message}"));
+        if let Some(events) = simulation_events(&sim) {
             args.reporter.line(format_args!("  diagnostic events:"));
             print_events(&serde_json::Value::Array(events.clone()), &args.reporter);
         }
         args.reporter.line(format_args!("  broadcast: no"));
         args.reporter.emit(&report);
-        println!("  message: {message}");
-        if let Some(events) = simulation_events(&sim) {
-            println!("  diagnostic events:");
-            print_events(&serde_json::Value::Array(events.clone()));
-        }
-        println!("  broadcast: no");
         if policy_block && args.expect_blocked {
             return Ok(());
         }
@@ -1251,14 +1240,16 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
             "  limitation: provide --secret to run signed __check_auth simulation"
         ));
     }
+    args.reporter.line(format_args!(
+        "network passphrase source: {}",
+        args.passphrase_source
+    ));
+    args.reporter
+        .line(format_args!("inclusion fee source: {fee_source}"));
     args.reporter
         .line(format_args!("estimated fee: {fee} stroops"));
     args.reporter.line(format_args!("broadcast: no"));
     args.reporter.emit(&report);
-    println!("network passphrase source: {}", args.passphrase_source);
-    println!("inclusion fee source: {fee_source}");
-    println!("estimated fee: {fee} stroops");
-    println!("broadcast: no");
     if agent.is_some() {
         Ok(())
     } else {
@@ -1499,8 +1490,12 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
     let source_pk = agent.verifying_key().to_bytes();
     let source_g = account_strkey(&source_pk);
     let network_id: [u8; 32] = Sha256::digest(args.passphrase.as_bytes()).into();
-    println!("network id: {}", hex::encode(network_id));
-    println!("network passphrase source: {}", args.passphrase_source);
+    args.reporter
+        .line(format_args!("network id: {}", hex::encode(network_id)));
+    args.reporter.line(format_args!(
+        "network passphrase source: {}",
+        args.passphrase_source
+    ));
 
     let seq = args.rpc.account_seq(&source_g);
     // The account entry stores the last-used sequence; the next tx uses
@@ -1557,25 +1552,33 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
         }
     }
 
-    if let Some(err) = sim.get("error") {
-        let report = args
-            .reporter
-            .complete(simulation_report(&sim), Some(latest));
-        args.reporter.line(format_args!(
-            "BLOCKED (pre-broadcast, enforced simulation):"
-        ));
-        if let Some(code) = err["code"].as_str() {
-            args.reporter.line(format_args!("  error code: {code}"));
+    if let Some(message) = simulation_error_message(&sim) {
+        let policy_block = is_guard_auth_checked_block(&sim, guard);
+        if policy_block {
+            args.reporter
+                .line(format_args!("BLOCKED (pre-broadcast, guard auth_checked):"));
+        } else {
+            args.reporter.line(format_args!(
+                "TRANSACTION REJECTED (pre-broadcast, not a guard policy block):"
+            ));
         }
-        if let Some(msg) = err["message"].as_str() {
-            args.reporter.line(format_args!("  message: {msg}"));
-        }
-        if let Some(events) = err["data"]["events"].as_array() {
+        args.reporter.line(format_args!("  message: {message}"));
+        let events = simulation_events(&sim).cloned();
+        if let Some(ref events) = events {
             args.reporter.line(format_args!("  diagnostic events:"));
             print_events(&serde_json::Value::Array(events.clone()), &args.reporter);
         }
+        args.reporter.line(format_args!("  broadcast: no"));
+        let report = args
+            .reporter
+            .complete(simulation_report(&sim), Some(latest));
         args.reporter.emit(&report);
-        std::process::exit(if args.expect_blocked { 0 } else { 1 });
+        return RunOutcome::SimulationBlocked {
+            policy_block,
+            error_code: sim["error"]["code"].as_str().map(str::to_string),
+            error_message: Some(message),
+            events,
+        };
     }
     if args.expect_blocked {
         let report = args
@@ -1585,30 +1588,6 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
             "expected a block, but the enforced simulation succeeded"
         ));
         args.reporter.emit(&report);
-        std::process::exit(1);
-    if let Some(message) = simulation_error_message(&sim) {
-        let policy_block = is_guard_auth_checked_block(&sim, guard);
-        if policy_block {
-            println!("BLOCKED (pre-broadcast, guard auth_checked):");
-        } else {
-            println!("TRANSACTION REJECTED (pre-broadcast, not a guard policy block):");
-        }
-        println!("  message: {message}");
-        let events = simulation_events(&sim).cloned();
-        if let Some(ref events) = events {
-            println!("  diagnostic events:");
-            print_events(&serde_json::Value::Array(events.clone()));
-        }
-        println!("  broadcast: no");
-        return RunOutcome::SimulationBlocked {
-            policy_block,
-            error_code: sim["error"]["code"].as_str().map(str::to_string),
-            error_message: Some(message),
-            events,
-        };
-    }
-    if args.expect_blocked {
-        println!("expected a block, but the enforced simulation succeeded");
         return RunOutcome::SimulationSuccessUnexpectedBlock;
     }
 
@@ -1628,13 +1607,22 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
     let sim_write_bytes = data.resources.write_bytes;
     let sim_resource_fee = data.resource_fee;
 
-    println!("SIMULATION ESTIMATE (pre-submit, simulated values):");
-    println!("  min_resource_fee: {sim_min_fee}");
-    println!("  simulated_resource_fee: {sim_resource_fee}");
-    println!("  instructions: {sim_instructions}");
-    println!("  disk_read_bytes: {sim_disk_read_bytes}");
-    println!("  write_bytes: {sim_write_bytes}");
-    println!("  note: these are simulated estimates, not on-chain actuals");
+    args.reporter.line(format_args!(
+        "SIMULATION ESTIMATE (pre-submit, simulated values):"
+    ));
+    args.reporter
+        .line(format_args!("  min_resource_fee: {sim_min_fee}"));
+    args.reporter
+        .line(format_args!("  simulated_resource_fee: {sim_resource_fee}"));
+    args.reporter
+        .line(format_args!("  instructions: {sim_instructions}"));
+    args.reporter
+        .line(format_args!("  disk_read_bytes: {sim_disk_read_bytes}"));
+    args.reporter
+        .line(format_args!("  write_bytes: {sim_write_bytes}"));
+    args.reporter.line(format_args!(
+        "  note: these are simulated estimates, not on-chain actuals"
+    ));
 
     // Machine-readable JSON so SDKs can consume the same fields.
     let mut report = serde_json::json!({
@@ -1683,7 +1671,8 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
         .expect("fee");
     let (inclusion_fee, fee_source) = resolve_inclusion_fee(&args.rpc, args.inclusion_fee_override);
     let fee = calculate_fee(min_fee, inclusion_fee);
-    println!("inclusion fee source: {fee_source}");
+    args.reporter
+        .line(format_args!("inclusion fee source: {fee_source}"));
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!(
             "minResourceFee: {sim_min_fee}, resourceFee(after bump): {}, final fee: {fee}",
@@ -1702,7 +1691,7 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
         .unwrap()
         .insert("final_fee".to_string(), serde_json::json!(fee));
     // Print compact JSON on its own line for machine consumption.
-    println!("MACHINE_OUTPUT: {report}");
+    args.reporter.line(format_args!("MACHINE_OUTPUT: {report}"));
     let tx = Transaction {
         source_account: MuxedAccount::Ed25519(Uint256(source_pk)),
         fee,
@@ -1753,7 +1742,6 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
             .reporter
             .complete(RunReport::failed("submission_failed"), Some(latest));
         args.reporter.emit(&report);
-        std::process::exit(1);
         return RunOutcome::SendError(human);
     }
     let hash = sent["hash"].as_str().unwrap_or_default().to_string();
@@ -1765,7 +1753,6 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
             .reporter
             .complete(RunReport::failed("submission_failed"), Some(latest));
         args.reporter.emit(&report);
-        std::process::exit(1);
         return RunOutcome::EmptyHash(human);
     }
     let status = sent["status"].as_str().unwrap_or("?").to_string();
@@ -1791,30 +1778,6 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
             args.reporter
                 .line(format_args!("RESULT: ALLOWED tx={hash}"));
             args.reporter.emit(&report);
-            std::process::exit(0);
-        }
-        if st == "FAILED" {
-            let report = args.reporter.complete(
-                RunReport::failed("tx_failed").with_tx_hash(&hash),
-                Some(latest),
-            );
-            args.reporter.line(format_args!("RESULT: FAILED tx={hash}"));
-            if let Some(errx) = gt["resultXdr"].as_str() {
-                args.reporter.line(format_args!("  resultXdr: {errx}"));
-            }
-            args.reporter.emit(&report);
-            std::process::exit(if args.expect_blocked { 0 } else { 1 });
-        }
-    }
-    let report = args.reporter.complete(
-        RunReport::failed("timeout").with_tx_hash(&hash),
-        Some(latest),
-    );
-    args.reporter
-        .line(format_args!("RESULT: TIMEOUT tx={hash}"));
-    args.reporter.emit(&report);
-    std::process::exit(1);
-            println!("RESULT: ALLOWED tx={hash}");
             outcome = Some(RunOutcome::TransactionSuccess {
                 hash: hash.clone(),
                 status: st.to_string(),
@@ -1822,11 +1785,16 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
             break;
         }
         if st == "FAILED" {
-            println!("RESULT: FAILED tx={hash}");
+            let report = args.reporter.complete(
+                RunReport::failed("tx_failed").with_tx_hash(&hash),
+                Some(latest),
+            );
+            args.reporter.line(format_args!("RESULT: FAILED tx={hash}"));
             let result_xdr = gt["resultXdr"].as_str().map(|s| s.to_string());
             if let Some(ref errx) = result_xdr {
-                println!("  resultXdr: {errx}");
+                args.reporter.line(format_args!("  resultXdr: {errx}"));
             }
+            args.reporter.emit(&report);
             outcome = Some(RunOutcome::TransactionFailure {
                 hash: hash.clone(),
                 result_xdr,
@@ -1837,7 +1805,13 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
     if let Some(outcome) = outcome {
         return outcome;
     }
-    println!("RESULT: TIMEOUT tx={hash}");
+    let report = args.reporter.complete(
+        RunReport::failed("timeout").with_tx_hash(&hash),
+        Some(latest),
+    );
+    args.reporter
+        .line(format_args!("RESULT: TIMEOUT tx={hash}"));
+    args.reporter.emit(&report);
     RunOutcome::TransactionTimeout { hash }
 }
 
@@ -2746,6 +2720,10 @@ mod tests {
             guard: VALID_GUARD.parse().unwrap(),
             secret: Some(VALID_SECRET.to_string()),
             expect_blocked: false,
+            reporter: Reporter {
+                json: false,
+                network: Some(Network::Testnet),
+            },
             inclusion_fee_override: None,
         }
     }
@@ -2834,6 +2812,10 @@ mod tests {
             guard,
             secret: Some(VALID_SECRET.to_string()),
             expect_blocked: true,
+            reporter: Reporter {
+                json: false,
+                network: Some(Network::Testnet),
+            },
             inclusion_fee_override: None,
         };
         assert_eq!(preflight(&Call::Heartbeat, &args, &block), Ok(()));
@@ -3352,210 +3334,6 @@ mod tests {
             parse_request(cmd, &args).expect("read command without a secret");
         }
     }
-
-    // ── Machine-readable output (issue #390) ───────────────────────────────
-
-    /// The guard's own rejection event as the RPC hands it back — topics
-    /// `(event_auth_checked, blocked, <reason>)` — encoded as the diagnostic
-    /// event XDR the simulation error carries.
-    fn blocked_event(reason: &str) -> String {
-        let topics = vec![
-            ScVal::Symbol(ScSymbol("event_auth_checked".try_into().unwrap())),
-            ScVal::Symbol(ScSymbol("blocked".try_into().unwrap())),
-            ScVal::Symbol(ScSymbol(reason.try_into().unwrap())),
-        ];
-        let event = ContractEvent {
-            ext: ExtensionPoint::V0,
-            contract_id: None,
-            type_: ContractEventType::Diagnostic,
-            body: ContractEventBody::V0(ContractEventV0 {
-                topics: VecM::try_from(topics).expect("topic count"),
-                data: ScVal::Void,
-            }),
-        };
-        b64_encode_xdr(&DiagnosticEvent {
-            in_successful_contract_call: false,
-            event,
-        })
-    }
-
-    fn json_report(report: &RunReport) -> serde_json::Value {
-        serde_json::from_str(&report.to_json()).expect("the object is valid JSON")
-    }
-
-    #[test]
-    fn json_shape_of_the_allowed_path() {
-        let sim = serde_json::json!({ "minResourceFee": "200" });
-        let report = Reporter {
-            json: true,
-            network: Some(Network::Testnet),
-        }
-        .complete(simulation_report(&sim), Some(412_345));
-
-        let value = json_report(&report);
-        let object = value.as_object().expect("one JSON object");
-        assert_eq!(value["outcome"], "allowed");
-        assert_eq!(value["ledger"], 412_345);
-        assert_eq!(value["network"], "testnet");
-        // An admitted run has nothing to explain and nothing to track yet.
-        assert_eq!(
-            object.len(),
-            3,
-            "unexpected fields on the allowed path: {object:?}"
-        );
-        assert!(value.get("reason").is_none(), "{value}");
-        assert!(value.get("tx_hash").is_none(), "{value}");
-    }
-
-    #[test]
-    fn json_shape_of_the_blocked_path_carries_the_reason_symbol() {
-        let sim = serde_json::json!({
-            "error": {
-                "code": "simulation",
-                "message": "auth_checked: per_tx_cap_exceeded",
-                "data": { "events": [ { "xdr": blocked_event("per_tx_cap_exceeded") } ] }
-            }
-        });
-        let report = Reporter {
-            json: true,
-            network: Some(Network::Testnet),
-        }
-        .complete(simulation_report(&sim), Some(412_345));
-
-        let value = json_report(&report);
-        assert_eq!(value["outcome"], "blocked");
-        assert_eq!(
-            value["reason"], "per_tx_cap_exceeded",
-            "the guard's own `auth_checked` topic is the reason"
-        );
-        assert_eq!(value["ledger"], 412_345);
-        assert_eq!(value["network"], "testnet");
-        assert!(
-            value.get("tx_hash").is_none(),
-            "nothing was broadcast: {value}"
-        );
-        assert_eq!(
-            value.as_object().expect("one JSON object").len(),
-            4,
-            "{value}"
-        );
-    }
-
-    #[test]
-    fn json_shape_of_a_submitted_transaction_carries_the_hash() {
-        let report = Reporter {
-            json: true,
-            network: Some(Network::Testnet),
-        }
-        .complete(
-            RunReport::allowed().with_tx_hash("deadbeefdeadbeef"),
-            Some(412_345),
-        );
-
-        let value = json_report(&report);
-        assert_eq!(value["outcome"], "allowed");
-        assert_eq!(value["tx_hash"], "deadbeefdeadbeef");
-        assert!(value.get("reason").is_none(), "{value}");
-    }
-
-    #[test]
-    fn json_reason_degrades_predictably_when_no_event_symbol_is_present() {
-        // The guard's event when the RPC decoded one …
-        let with_event = serde_json::json!({
-            "error": { "code": "simulation", "data": { "events": [ { "xdr": blocked_event("window_cap_exceeded") } ] } }
-        });
-        assert_eq!(
-            simulation_report(&with_event).reason,
-            Some("window_cap_exceeded".into())
-        );
-
-        // … the `auth_checked:` tail of the message when it did not …
-        let with_message = serde_json::json!({
-            "error": { "code": "simulation", "message": "auth_checked: recipient_not_allowed" }
-        });
-        assert_eq!(
-            simulation_report(&with_message).reason,
-            Some("recipient_not_allowed".into())
-        );
-
-        // … and the RPC error code rather than no `reason` at all.
-        let code_only = serde_json::json!({
-            "error": { "code": "simulation", "message": "HostError: Error(Contract, #2)" }
-        });
-        assert_eq!(
-            simulation_report(&code_only).reason,
-            Some("simulation".into())
-        );
-
-        // A failed run always names its failure with a stable symbol.
-        for (report, expected) in [
-            (RunReport::failed("timeout"), "timeout"),
-            (RunReport::failed("submission_failed"), "submission_failed"),
-        ] {
-            let value = json_report(&report);
-            assert_eq!(value["outcome"], "failed");
-            assert_eq!(value["reason"], expected);
-        }
-    }
-
-    #[test]
-    fn the_json_flag_is_opt_in_and_reaches_every_report() {
-        let base = [
-            "check",
-            "--guard",
-            VALID_GUARD,
-            "--asset",
-            VALID_TOKEN,
-            "--to",
-            VALID_RECIPIENT,
-            "--amount",
-            "5",
-            "--network",
-            "futurenet",
-        ];
-
-        let without = argv(&base);
-        let (cmd, rest) = without.split_first().expect("subcommand");
-        let request = parse_request(cmd, rest).expect("valid inputs");
-        assert!(!request.json, "prose stays the default");
-        assert!(!request.reporter().json);
-        assert!(
-            !request.args().reporter.json,
-            "preflight/run inherit it too"
-        );
-        assert_eq!(request.reporter().network, Some(Network::Futurenet));
-
-        let mut with_flag = base.to_vec();
-        with_flag.push("--json");
-        let with_flag = argv(&with_flag);
-        let (cmd, rest) = with_flag.split_first().expect("subcommand");
-        let request = parse_request(cmd, rest).expect("--json is a valid flag");
-        assert!(request.json);
-        assert!(request.reporter().json);
-        assert!(request.args().reporter.json);
-        assert_eq!(
-            request.reporter().network,
-            Some(Network::Futurenet),
-            "the object's network field comes from the resolved preset"
-        );
-    }
-}
-
-fn map_submission_error(err_str: &str) -> String {
-    if err_str.contains("tx_insufficient_fee") || err_str.contains("insufficient") {
-        "Submission failed due to insufficient fee (tx_insufficient_fee). Fix: Resubmit with a higher fee or use --fee-multiplier <VAL> (see README.md Troubleshooting).".into()
-    } else if err_str.contains("tx_bad_seq") || err_str.contains("seq") {
-        "Submission failed due to sequence number collision/mismatch (tx_bad_seq). Fix: Ensure account sequence is up-to-date and resubmit (see README.md Troubleshooting).".into()
-    } else if err_str.contains("tx_too_early") {
-        "Submission failed because transaction is too early (tx_too_early). Fix: Wait for the next ledger or check node time sync (see README.md Troubleshooting).".into()
-    } else if err_str.contains("tx_late_expiration") {
-        "Submission failed because transaction/signature expiration passed (tx_late_expiration). Fix: Increase signature expiration ledger delta --sig-expiration-ledgers <VAL> (see README.md Troubleshooting).".into()
-    } else {
-        format!("Submission failed: {err_str}. Refer to README.md Troubleshooting section for exact remediation flags.")
-    }
-}
-
-// ── Argument parsing ─────────────────────────────────────────────────────
 
     #[test]
     fn agent_secret_file_loads_secret_from_file() {
@@ -4241,6 +4019,193 @@ fn map_submission_error(err_str: &str) -> String {
         assert!(encoded.starts_with('S'));
         assert_eq!(encoded.len(), 56);
     }
+
+    // ── Machine-readable output (issue #390) ───────────────────────────────
+
+    /// The guard's own rejection event as the RPC hands it back — topics
+    /// `(event_auth_checked, blocked, <reason>)` — encoded as the diagnostic
+    /// event XDR the simulation error carries.
+    fn blocked_event(reason: &str) -> String {
+        let topics = vec![
+            ScVal::Symbol(ScSymbol("event_auth_checked".try_into().unwrap())),
+            ScVal::Symbol(ScSymbol("blocked".try_into().unwrap())),
+            ScVal::Symbol(ScSymbol(reason.try_into().unwrap())),
+        ];
+        let event = ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Diagnostic,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: VecM::try_from(topics).expect("topic count"),
+                data: ScVal::Void,
+            }),
+        };
+        b64_encode_xdr(&DiagnosticEvent {
+            in_successful_contract_call: false,
+            event,
+        })
+    }
+
+    fn json_report(report: &RunReport) -> serde_json::Value {
+        serde_json::from_str(&report.to_json()).expect("the object is valid JSON")
+    }
+
+    #[test]
+    fn json_shape_of_the_allowed_path() {
+        let sim = serde_json::json!({ "minResourceFee": "200" });
+        let report = Reporter {
+            json: true,
+            network: Some(Network::Testnet),
+        }
+        .complete(simulation_report(&sim), Some(412_345));
+
+        let value = json_report(&report);
+        let object = value.as_object().expect("one JSON object");
+        assert_eq!(value["outcome"], "allowed");
+        assert_eq!(value["ledger"], 412_345);
+        assert_eq!(value["network"], "testnet");
+        // An admitted run has nothing to explain and nothing to track yet.
+        assert_eq!(
+            object.len(),
+            3,
+            "unexpected fields on the allowed path: {object:?}"
+        );
+        assert!(value.get("reason").is_none(), "{value}");
+        assert!(value.get("tx_hash").is_none(), "{value}");
+    }
+
+    #[test]
+    fn json_shape_of_the_blocked_path_carries_the_reason_symbol() {
+        let sim = serde_json::json!({
+            "error": {
+                "code": "simulation",
+                "message": "auth_checked: per_tx_cap_exceeded",
+                "data": { "events": [ { "xdr": blocked_event("per_tx_cap_exceeded") } ] }
+            }
+        });
+        let report = Reporter {
+            json: true,
+            network: Some(Network::Testnet),
+        }
+        .complete(simulation_report(&sim), Some(412_345));
+
+        let value = json_report(&report);
+        assert_eq!(value["outcome"], "blocked");
+        assert_eq!(
+            value["reason"], "per_tx_cap_exceeded",
+            "the guard's own `auth_checked` topic is the reason"
+        );
+        assert_eq!(value["ledger"], 412_345);
+        assert_eq!(value["network"], "testnet");
+        assert!(
+            value.get("tx_hash").is_none(),
+            "nothing was broadcast: {value}"
+        );
+        assert_eq!(
+            value.as_object().expect("one JSON object").len(),
+            4,
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn json_shape_of_a_submitted_transaction_carries_the_hash() {
+        let report = Reporter {
+            json: true,
+            network: Some(Network::Testnet),
+        }
+        .complete(
+            RunReport::allowed().with_tx_hash("deadbeefdeadbeef"),
+            Some(412_345),
+        );
+
+        let value = json_report(&report);
+        assert_eq!(value["outcome"], "allowed");
+        assert_eq!(value["tx_hash"], "deadbeefdeadbeef");
+        assert!(value.get("reason").is_none(), "{value}");
+    }
+
+    #[test]
+    fn json_reason_degrades_predictably_when_no_event_symbol_is_present() {
+        // The guard's event when the RPC decoded one …
+        let with_event = serde_json::json!({
+            "error": { "code": "simulation", "data": { "events": [ { "xdr": blocked_event("window_cap_exceeded") } ] } }
+        });
+        assert_eq!(
+            simulation_report(&with_event).reason,
+            Some("window_cap_exceeded".into())
+        );
+
+        // … the `auth_checked:` tail of the message when it did not …
+        let with_message = serde_json::json!({
+            "error": { "code": "simulation", "message": "auth_checked: recipient_not_allowed" }
+        });
+        assert_eq!(
+            simulation_report(&with_message).reason,
+            Some("recipient_not_allowed".into())
+        );
+
+        // … and the RPC error code rather than no `reason` at all.
+        let code_only = serde_json::json!({
+            "error": { "code": "simulation", "message": "HostError: Error(Contract, #2)" }
+        });
+        assert_eq!(
+            simulation_report(&code_only).reason,
+            Some("simulation".into())
+        );
+
+        // A failed run always names its failure with a stable symbol.
+        for (report, expected) in [
+            (RunReport::failed("timeout"), "timeout"),
+            (RunReport::failed("submission_failed"), "submission_failed"),
+        ] {
+            let value = json_report(&report);
+            assert_eq!(value["outcome"], "failed");
+            assert_eq!(value["reason"], expected);
+        }
+    }
+
+    #[test]
+    fn the_json_flag_is_opt_in_and_reaches_every_report() {
+        let base = [
+            "check",
+            "--guard",
+            VALID_GUARD,
+            "--asset",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+            "--amount",
+            "5",
+            "--network",
+            "futurenet",
+        ];
+
+        let without = argv(&base);
+        let (cmd, rest) = without.split_first().expect("subcommand");
+        let request = parse_request(cmd, rest).expect("valid inputs");
+        assert!(!request.json, "prose stays the default");
+        assert!(!request.reporter().json);
+        assert!(
+            !request.args().reporter.json,
+            "preflight/run inherit it too"
+        );
+        assert_eq!(request.reporter().network, Some(Network::Futurenet));
+
+        let mut with_flag = base.to_vec();
+        with_flag.push("--json");
+        let with_flag = argv(&with_flag);
+        let (cmd, rest) = with_flag.split_first().expect("subcommand");
+        let request = parse_request(cmd, rest).expect("--json is a valid flag");
+        assert!(request.json);
+        assert!(request.reporter().json);
+        assert!(request.args().reporter.json);
+        assert_eq!(
+            request.reporter().network,
+            Some(Network::Futurenet),
+            "the object's network field comes from the resolved preset"
+        );
+    }
 }
 
 fn map_submission_error(err_str: &str) -> String {
@@ -4285,6 +4250,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
+            "--json",
             "-h",
             "--help",
         ],
@@ -4303,6 +4269,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
+            "--json",
             "-h",
             "--help",
         ],
@@ -4322,6 +4289,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
+            "--json",
             "-h",
             "--help",
         ],
@@ -4335,6 +4303,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
+            "--json",
             "-h",
             "--help",
         ],
@@ -4344,6 +4313,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--rpc-url",
             "--rpc-timeout",
             "--network-passphrase",
+            "--json",
             "-h",
             "--help",
         ],
@@ -4357,6 +4327,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--rpc-url",
             "--rpc-timeout",
             "--network-passphrase",
+            "--json",
             "-h",
             "--help",
         ],
@@ -4756,6 +4727,12 @@ fn tool_help() -> String {
          Inputs: --guard/--asset/--token must be a contract ID (C...), --to an account (G...) or\n\
          contract (C...) ID, --agent-secret a secret seed (S...). All are checked for the\n\
          correct prefix, length and CRC16 checksum before any RPC request is made.\n\
+         \n\
+         Output:\n\
+         \x20 --json                            one machine-readable JSON object on\n\
+         \x20                                   stdout; the prose moves to stderr and\n\
+         \x20                                   the fields are documented in the\n\
+         \x20                                   tools/agent-tx/README.md\n\
          Preflight exit codes: 0=admitted, 1=blocked (signed simulation), 2=unsigned/inconclusive.\n\
          Troubleshooting: See README.md 'Troubleshooting — Submission Errors' table for error mapping and concrete fix flags (--fee-multiplier, etc.).\n\
          The stellar CLI cannot sign auth entries for contract addresses; use agent-tx for heartbeat calls (see tools/agent-tx/README.md).",
@@ -4766,56 +4743,6 @@ fn tool_help() -> String {
 }
 
 fn print_help() {
-    println!("agent-tx — simulate or submit Soroban transactions for Stellar Agent Guard");
-    println!("Usage:");
-    println!("  agent-tx preflight --guard <C...> --asset <C...> --to <G...> --amount <N> [--secret <S...>]");
-    println!("  agent-tx transfer --guard <C...> --token <C...> --to <G...> --amount <N> --agent-secret <S...>");
-    println!("  agent-tx heartbeat --guard <C...> --agent-secret <S...>");
-    println!("  agent-tx status --guard <C...> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx policy --guard <C...> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx check --guard <C...> --asset <C...> --to <G...> --amount <N> [--network testnet|futurenet|mainnet]");
-    println!("  agent-tx guards <add|list|remove|set-default> ...");
-    println!();
-    println!("Network selection:");
-    println!("  --network testnet|futurenet|mainnet   named preset endpoint + passphrase (default: testnet)");
-    println!(
-        "                                        mainnet: {}",
-        Network::Mainnet.rpc_url()
-    );
-    println!(
-        "                                        futurenet: {}",
-        Network::Futurenet.rpc_url()
-    );
-    println!("  --rpc-url <url>                       any endpoint; overrides the default, and is");
-    println!("                                        refused together with an explicit --network");
-    println!("  --network-passphrase <passphrase>     override the preset's passphrase (advanced:");
-    println!("                                        private or non-standard networks)");
-    println!(
-        "  Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr."
-    );
-    println!("  A StrKey's leading character encodes the key type, not the network, so address");
-    println!(
-        "  validation cannot catch a wrong-network address; the preset plus passphrase decide"
-    );
-    println!("  which network a call reaches.");
-    println!();
-    println!(
-        "Inputs: --guard/--asset/--token must be a contract ID (C...), --to an account (G...) or"
-    );
-    println!("contract (C...) ID, --agent-secret a secret seed (S...). All are checked for the");
-    println!("correct prefix, length and CRC16 checksum before any RPC request is made.");
-    println!();
-    println!("Output:");
-    println!("  --json                            one machine-readable JSON object on");
-    println!("                                    stdout; the prose moves to stderr and");
-    println!("                                    the fields are documented in the");
-    println!("                                    tools/agent-tx/README.md");
-    println!();
-    println!(
-        "Preflight exit codes: 0=admitted, 1=blocked (signed simulation), 2=unsigned/inconclusive."
-    );
-    println!("Troubleshooting: See README.md 'Troubleshooting — Submission Errors' table for error mapping and concrete fix flags (--fee-multiplier, etc.).");
-    println!("The stellar CLI cannot sign auth entries for contract addresses; use agent-tx for heartbeat calls (see tools/agent-tx/README.md).");
     println!("{}", tool_help());
 }
 
@@ -5160,9 +5087,6 @@ fn cmd_policy(
     _passphrase: &str,
     reporter: &Reporter,
 ) -> Result<(), String> {
-    let policy_key = guard_data_key(guard, "Policy");
-    let res = rpc.post(
-fn cmd_policy(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), String> {
     let policy_key = guard_data_key(guard, GuardKey::Policy);
     let res = rpc_or_exit(rpc.post(
         "getLedgerEntries",
@@ -5255,14 +5179,12 @@ fn cmd_check(
     let report = reporter.complete(simulation_report(&sim), None);
 
     if let Some(err) = sim.get("error") {
-        if let Some(code) = err["code"].as_str() {
-            reporter.line(format_args!("result: blocked"));
-            reporter.line(format_args!("reason: {}", code));
-        }
-        if let Some(events) = err["data"]["events"].as_array() {
-    if let Some(error) = simulation_error_message(&sim) {
-        println!("result: rejected (unsigned simulation; no guard policy verdict)");
-        println!("reason: {error}");
+        let reason = err["code"]
+            .as_str()
+            .or_else(|| err.as_str())
+            .unwrap_or("unknown");
+        reporter.line(format_args!("result: blocked"));
+        reporter.line(format_args!("reason: {reason}"));
         if let Some(events) = simulation_events(&sim) {
             for ev in events {
                 if let Some(b64) = ev["xdr"].as_str() {
@@ -5306,6 +5228,7 @@ fn run_guards(argv: &[String]) {
              and produce no run verdict (see tools/agent-tx/README.md)"
                 .to_string(),
         );
+    }
     if argv.is_empty() || argv[0] == "--help" || argv[0] == "-h" || argv[0] == "help" {
         print_guards_help();
         return;
@@ -5422,9 +5345,14 @@ fn main() {
             }
         }
         "check" => {
-            let asset = request.token.clone().expect("validated --asset");
-            let to = request.to.clone().expect("validated --to");
-            let amount = request.amount.expect("validated --amount");
+            let (asset, to, amount) =
+                match (request.token.clone(), request.to.clone(), request.amount) {
+                    (Some(asset), Some(to), Some(amount)) => (asset, to, amount),
+                    _ => exit_with(
+                        "missing required argument for `check` (see `agent-tx check --help`)"
+                            .into(),
+                    ),
+                };
             if let Err(e) = cmd_check(
                 &rpc,
                 &request.guard,
@@ -5434,15 +5362,6 @@ fn main() {
                 &passphrase,
                 reporter,
             ) {
-            let (asset, to, amount) =
-                match (request.token.clone(), request.to.clone(), request.amount) {
-                    (Some(asset), Some(to), Some(amount)) => (asset, to, amount),
-                    _ => exit_with(
-                        "missing required argument for `check` (see `agent-tx check --help`)"
-                            .into(),
-                    ),
-                };
-            if let Err(e) = cmd_check(&rpc, &request.guard, &asset, &to, amount, &passphrase) {
                 exit_with(e);
             }
         }

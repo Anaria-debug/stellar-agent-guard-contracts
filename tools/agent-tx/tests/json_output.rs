@@ -85,6 +85,10 @@ fn run_check(url: &str, json: bool) -> (String, String, Option<i32>) {
         "10",
         "--rpc-url",
         url,
+        // A custom endpoint needs an explicit passphrase; this is the testnet
+        // one, but the URL is not a preset so the object carries no `network`.
+        "--network-passphrase",
+        "Test SDF Network ; September 2015",
     ]);
     if json {
         command.arg("--json");
