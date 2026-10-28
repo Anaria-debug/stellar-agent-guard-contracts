@@ -287,7 +287,9 @@ fn prune_entries(
     if window_secs == 0 {
         return;
     }
-    let n = entries.len() as usize;
+    let Ok(n) = usize::try_from(entries.len()) else {
+        return;
+    };
     if n == 0 {
         return;
     }
@@ -298,13 +300,15 @@ fn prune_entries(
     let mut low = 0usize;
     let mut high = n;
     while low < high {
-        let mid = low + (high - low) / 2;
+        // Saturating arithmetic: the release profile keeps overflow checks, and a
+        // checked add would embed a panic string in the contract WASM.
+        let mid = low.saturating_add(high.saturating_sub(low) / 2);
         let Ok(index) = u32::try_from(mid) else {
             return;
         };
         if let Some(entry) = entries.get(index) {
             if entry.ts.saturating_add(window_secs) <= now {
-                low = mid + 1;
+                low = mid.saturating_add(1);
             } else {
                 high = mid;
             }
