@@ -1087,6 +1087,28 @@ mod tests {
     }
 
     #[test]
+    fn contract_address_recipient_allowlist_admits_via_transfer_from() {
+        // Same contract-address allowlist guarantee on the `transfer_from`
+        // path, where the recipient sits at args[2] rather than args[1].
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.recipients = vec![&env, addr(&env, 42)];
+        let mut l = Ledger::empty(&env);
+
+        let admitted = decide(
+            &env,
+            &sa,
+            Some(&p),
+            &alive(),
+            &mut l,
+            1000,
+            vec![&env, transfer_from_ctx(&env, 1, 9, 7, 42, 5)],
+        );
+        assert!(matches!(admitted.first().unwrap(), Decision::Allowed));
+    }
+
+    #[test]
     fn empty_blocked_recipients_list_is_no_op() {
         let env = Env::default();
         let sa = self_addr(&env);
